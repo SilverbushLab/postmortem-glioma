@@ -1,0 +1,290 @@
+---
+title: "sussman2024pHGG_DEG_analysis.RMD"
+output: html_document
+date: "2025-02-10"
+---
+
+
+# Setup
+```{r setup}
+library(clusterProfiler)
+
+root.dir <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Projects/Jackie_post-mortem/"
+suppressMessages(suppressWarnings(source(paste0(root.dir, "Code/", 'helper_functions.R'))))
+
+figures.dir <- paste0(root.dir, "Figures/", "Figure 2/")
+
+set.seed(123)
+```
+
+
+
+# Settings
+```{r}
+min.num.cells.pseudobulk <- 10
+
+denoise.labels <- list()
+denoise.labels[[1]] <- FALSE
+denoise.labels[[2]] <- "heat.shock.signature_postmortem.sensitive_postmortem.signature"
+```
+
+
+
+# DEGs per cell type, postmortem vs surgical from Sussman 2024
+```{r}
+timepoint.of.interest <- "Progressive (Autopsy)"
+downsample <- T
+if (downsample) {
+  downsample.label <- 100
+} else {
+  downsample.label <- FALSE
+}
+
+seurat.obj <- readRDS(paste0(root.dir, "ExternalData/", 'Sussman_2024/', 'SeuratObjsFromLevel3ByPatientFinal/', 'all.samples.merged.not.downsampled.seurat.obj.w.annotations.RDS'))
+
+seurat.obj <- subset(seurat.obj, subset = timepoint %in% c("Initial CNS Tumor", "Progressive (Autopsy)"))
+```
+
+
+
+# DEG analysis
+```{r}
+do.deg.analysis <- F
+
+if (do.deg.analysis) {
+  for (celltype.of.interest in sort(unique(seurat.obj$annotation.l2.w.qc))) {
+    
+    print(celltype.of.interest)
+    
+    seurat.obj.subset <- subset(seurat.obj, subset = annotation.l2.w.qc == celltype.of.interest)
+    seurat.obj.subset <- add.module.score(seurat.obj.subset, gene.signatures)
+    
+    # remove samples with less than min.num.cells.pseudobulk cell of cell type of interest
+    cell.counts <- table(seurat.obj.subset$sample.id)
+    keep.samples <- names(cell.counts[cell.counts >= min.num.cells.pseudobulk])
+    seurat.obj.subset <- subset(seurat.obj.subset, subset = sample.id %in% keep.samples)
+    
+    if (downsample) {
+      Idents(seurat.obj.subset) <- "sample.id"
+      seurat.obj.subset$downsample <- T
+      seurat.obj.subset <- subset(seurat.obj.subset, subset = downsample == T, downsample = downsample.label)
+    } 
+    
+    Idents(seurat.obj.subset) <- "timepoint"
+    
+    
+    for (i in 1:length(denoise.labels)) {
+      denoise.label <- denoise.labels[[i]]
+      print(denoise.label)
+      covariates <- setdiff(unlist(str_split(denoise.label, "_")), "FALSE")
+      print(covariates)
+      
+      if (length(covariates) == 0) {
+        markers <- FindMarkers(object = seurat.obj.subset, 
+                           ident.1 = "Progressive (Autopsy)", 
+                           ident.2 = "Initial CNS Tumor",
+                           test.use = "MAST")
+      } else {
+        markers <- FindMarkers(object = seurat.obj.subset, 
+                           ident.1 = "Progressive (Autopsy)", 
+                           ident.2 = "Initial CNS Tumor",
+                           test.use = "MAST",
+                           latent.vars = covariates)
+      }
+      
+      markers$gene <- rownames(markers)
+      
+      write.table(markers, paste0(root.dir, "Figures/", "Tables/", "DEGs/", celltype.of.interest, "_sussman2024_postmortem_vs_surgical_downsample=", downsample.label, "_denoise=", denoise.label, ".tsv"), sep = "\t", quote = F)
+    }
+  }
+}
+```
+
+
+
+# Figure 2: Volcano plots
+Start here after running DEG analysis in above chunk
+```{r}
+celltype.of.interest <- "Myeloid"
+downsample.label <- 100
+
+markers.before <- read.csv(paste0(root.dir, "Figures/", "Tables/", "DEGs/", celltype.of.interest, "_sussman2024_postmortem_vs_surgical_downsample=", downsample.label, "_denoise=", "FALSE", ".tsv"), sep = "\t")
+markers.after <- read.csv(paste0(root.dir, "Figures/", "Tables/", "DEGs/", celltype.of.interest, "_sussman2024_postmortem_vs_surgical_downsample=", downsample.label, "_denoise=", "heat.shock.signature_postmortem.sensitive_postmortem.signature", ".tsv"), sep = "\t")
+
+
+# test overlap with postmortem signatures
+markers.before.filter.genes <- markers.before %>% filter(p_val_adj < 0.05, avg_log2FC > 0.5) %>% pull(gene)
+universe.genes <- rownames(seurat.obj)
+
+results <- list()
+results <- c(
+    results,
+    list(geneSetOverlapRow(
+      "postmortem.signature",
+      "markers.before.filter.genes",
+      gene.signatures[["postmortem.signature"]],
+      markers.before.filter.genes,
+      universe.genes
+    )),
+    list(geneSetOverlapRow(
+      "postmortem.sensitive",
+      "markers.before.filter.genes",
+      gene.signatures[["postmortem.sensitive"]],
+      markers.before.filter.genes,
+      universe.genes
+    )),
+    list(geneSetOverlapRow(
+      "heat.shock.signature",
+      "markers.before.filter.genes",
+      gene.signatures[["heat.shock.signature"]],
+      markers.before.filter.genes,
+      universe.genes
+    ))
+  )
+overlap.table <- do.call(rbind, results)
+write.table(overlap.table, paste0(figures.dir, "postmortem_signatures_sussman2024_postmortem_vs_initial_degs_", celltype.of.interest, "_overlap_tests.csv"), sep = "\t", quote = F, col.names = TRUE, row.names = FALSE)
+
+
+stress.genes <- c("HSPA6", "MLKL", "SERPINH1", "HSP90AA1", "CASP1", "RIPK2", "SESN3")
+myeloid.biology <- c("C1QA", "APOE", "GPNMB", "IFI27", "TYROBP", "ISG15", "SLC40A1")
+
+for (denoise in c("before.denoise", "after.denoise")) {
+  if (denoise == "before.denoise") {
+    df <- markers.before
+    title <- "Before denoising"
+  } else {
+    df <- markers.after
+    title <- "After denoising"
+  }
+
+  df$gene.label <- sapply(df$gene, function(x) ifelse(x %in% c(myeloid.biology, stress.genes), x, ""))
+  df$highlight <- sapply(df$gene, function(x) case_when(
+    x %in% myeloid.biology ~ "Myeloid biology",
+    x %in% stress.genes ~ "Stress",
+    TRUE ~ "Other"
+  ))
+  df$highlight <- factor(df$highlight, levels = c("Myeloid biology", "Stress", "Other"))
+  df <- df %>% arrange(desc(highlight))
+  
+  p <- ggplot(df, aes(avg_log2FC, -log10(p_val_adj), label = gene.label)) +
+    geom_point(aes(fill = highlight), alpha = 0.6, shape = 21, color = "black") + 
+    geom_text_repel(aes(color = highlight), size = 6, max.overlaps = Inf) +
+    xlab("log2FC Progressive (Autopsy) vs Initial CNS Tumor") +
+    ylab("-log10 adjusted p-value") +
+    geom_hline(yintercept = -log10(0.05), color = "black") +
+    scale_fill_manual(breaks = c("Myeloid biology", "Stress", "Other"), values = c("blue", "red", "darkgrey")) +
+    scale_color_manual(breaks = c("Myeloid biology", "Stress", "Other"), values = c("blue", "red", "darkgrey")) +
+    labs(fill = "Gene category") +
+    guides(color = "none") +
+    guides(fill = guide_legend(override.aes = list(size = 4))) +
+    ggtitle(title)
+  pdf(paste0(figures.dir, celltype.of.interest, "_", denoise, "_postmortem_vs_initial_volcano_plot.pdf"), width = 12, height = 8)
+  print(p)
+  dev.off()
+}
+```
+
+
+
+
+# GO analysis
+```{r}
+downsample.label <- 100
+celltype.of.interest <- "Myeloid"
+markers.before <- read.csv(paste0(root.dir, "Figures/", "Tables/", "DEGs/", celltype.of.interest, "_sussman2024_postmortem_vs_surgical_downsample=", downsample.label, "_denoise=", "FALSE", ".tsv"), sep = "\t")
+markers.after <- read.csv(paste0(root.dir, "Figures/", "Tables/", "DEGs/", celltype.of.interest, "_sussman2024_postmortem_vs_surgical_downsample=", downsample.label, "_denoise=", "heat.shock.signature_postmortem.sensitive_postmortem.signature", ".tsv"), sep = "\t")
+
+
+stress_keywords <- c(
+  "heat",
+  "stress",
+  "protein folding",
+  "chaperone",
+  "inclusion body",
+  "proteostasis",
+  "refolding",
+  "mitochond",
+  "protein localization"
+)
+
+immune_keywords <- c(
+  "microglial",
+  "macrophage",
+  "phagocytosis",
+  "dendritic cell",
+  "tumor necrosis factor",
+  "TNF",
+  "immune",
+  "inflammatory",
+  "NOD",
+  "interferon",
+  "viral",
+  "interleukin-10"
+)
+
+
+for (denoise in c("before.denoise", "after.denoise")) {
+  if (denoise == "before.denoise") {
+    df <- markers.before
+     title <- "Before denoising"
+  } else {
+    df <- markers.after
+     title <- "After denoising"
+  }
+  
+  genes <- df %>% filter(p_val_adj < 0.05, avg_log2FC > 0.5) %>% pull(gene)
+  
+  go.enrich <- enrichGO(gene = genes,
+                        OrgDb = org.Hs.eg.db, 
+                        keyType = 'SYMBOL',
+                        readable = T,
+                        ont = "BP",
+                        pAdjustMethod = "fdr",
+                        pvalueCutoff = 0.05)
+  
+  go.enrich.df <- data.frame(go.enrich)
+  go.enrich.df <- go.enrich.df %>% filter(Count >= 5)
+  
+  
+  go.enrich.df <- go.enrich.df %>% arrange(desc(FoldEnrichment))
+  go.enrich.df <- go.enrich.df %>% head(20)
+  go.enrich.df <- go.enrich.df %>%
+    dplyr::mutate(
+      go_category = dplyr::case_when(
+        stringr::str_detect(tolower(Description),
+                            paste(stress_keywords, collapse = "|")) ~ "Stress",
+        stringr::str_detect(tolower(Description),
+                            paste(immune_keywords, collapse = "|")) ~ "Myeloid biology",
+        TRUE ~ "Other"
+      )
+    )
+  go.enrich.df$text.color <- sapply(go.enrich.df$go_category, function(x) case_when(
+    x == "Stress" ~ "red",
+    x == "Myeloid biology" ~ "blue",
+    TRUE ~ "darkgrey"
+  ))
+  print(max(go.enrich.df$Count))
+  
+  go.enrich.df$Description_short <- str_trunc(go.enrich.df$Description, width = 80)
+  go.enrich.df$Description_short <- factor(go.enrich.df$Description_short, levels = rev(go.enrich.df$Description_short))
+  go.enrich.df <- go.enrich.df %>% arrange(Description_short)
+  p <- ggplot(go.enrich.df, aes(x = FoldEnrichment, y = Description_short, size = Count, color = qvalue)) +
+    geom_point() +
+    scale_color_viridis_c(direction = -1) +
+    theme(axis.text.y = element_text(colour = go.enrich.df$text.color)) +
+    ylab("") +
+    ggtitle(title) +
+      scale_size(
+      breaks = c(5, 10, 15, 20),  
+      labels = c("5", "10", "15", "20"),
+      range = c(2, 8)        
+    )
+  
+  
+  pdf(paste0(figures.dir, celltype.of.interest, "_", denoise, "_postmortem_vs_initial_go_plot.pdf"), width = 16, height = 8)
+  print(p)
+  dev.off()
+}
+```
+
+

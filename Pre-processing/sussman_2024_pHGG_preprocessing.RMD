@@ -1,0 +1,349 @@
+---
+title: "sussman_2024_pHGG_preprocessing.RMD"
+output: html_document
+date: "2026-02-04"
+---
+
+
+
+# Setup
+```{r setup}
+root.dir <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Projects/Jackie_post-mortem/"
+suppressWarnings(source(paste0(root.dir, "Code/", 'helper_functions.R')))
+
+library(Seurat)
+library(ggplot2)
+library(tidyverse)
+library(pals)
+library(harmony)
+library(ggpubr)
+library(rstatix)
+library(RColorBrewer)
+library(readxl)
+library(DoubletFinder)
+
+data.dir <- paste0(root.dir, 'ExternalData/')
+results.dir <- paste0(root.dir, 'Results/')
+```
+
+
+
+
+# Level 4 (Seurat object): Get sample-level metadata by aggregating cell-level metadata
+```{r sussman 2024 metadata level 4}
+sussman.2024.level4 <- readRDS(paste0(data.dir, 'Sussman_2024/', 'Final_Cohort_All_snRNA-seq.RDS'))
+sussman.2024.level4$cell.barcode <- colnames(sussman.2024.level4)
+sussman.2024.level4.metadata <- sussman.2024.level4@meta.data
+dim(sussman.2024.level4.metadata)
+write.table(sussman.2024.level4.metadata, paste0(data.dir, 'Sussman_2024/', 'Final_Cohort_All_snRNA-seq_metadata.tsv'), sep = "\t", row.names=T, quote=F)
+
+sussman.2024.level4.sample.metadata <- sussman.2024.level4.metadata %>% group_by(sampleID, region, orig.ident, timepoint, molecularClass, patient_id) %>% summarize(num.cells.in.seurat.obj = n())
+write.table(sussman.2024.level4.sample.metadata, paste0(data.dir, 'Sussman_2024/', 'Final_Cohort_All_snRNA-seq_sample_metadata.tsv'), sep = "\t", row.names=F, quote=F)
+```
+
+
+
+# Create merged Seurat object from level 3 count matrices from HTAN
+```{r create seurat obj from count matrix}
+sussman.2024.sample.metadata <- read.csv(paste0(data.dir, 'Sussman_2024/', 'Final_Cohort_All_snRNA-seq_sample_metadata.tsv'), sep="\t")
+                                          
+count.data.dir <- paste0(data.dir, 'Sussman_2024/', 'Level3Data/')
+sample.ids <- list.dirs(count.data.dir, full.names = FALSE, recursive = FALSE)
+length(sample.ids)
+
+setdiff(sussman.2024.sample.metadata$orig.ident, sample.ids) # none
+setdiff(sample.ids, sussman.2024.sample.metadata$orig.ident) # extra samples from level 3 raw counts (maybe not included in published level 4 seurat object because low quality?)
+# output of above code: [1] "HTAN_pHGG_161_New_Reg1_snRNA"     "HTAN_pHGG_161_New_Reg1_snRNA_bak" "HTAN_pHGG_2594_Reg1_snRNA"        "HTAN_pHGG_2594_Reg2_snRNA"        "HTAN_pHGG_339_Reg1_snRNA"         "HTAN_pHGG_339_Reg2_snRNA"        
+# [7] "HTAN_pHGG_7545_Reg2_snRNA"   
+
+# For samples not in the level 4 metadata, use other samples with the same ID (different replicate) to get metadata
+# 339 not associated with a timepoint/patient (it's not in Seurat object) so it could be any timepoint
+# Checking the HTAN metadata, it looks like one region is associated with C547104 and another one is associated with C1060383
+# So leaving patient info blank but both are initial so adding it as initial timepoint
+
+seurat.obj.list <- list()
+for (sample.id in sample.ids) {
+  print(sample.id)
+  
+  counts <- Read10X(paste0(count.data.dir, sample.id))
+  seurat.obj <- CreateSeuratObject(counts = counts)
+  seurat.obj[["percent.mt"]] <- PercentageFeatureSet(seurat.obj, pattern = "^MT-")  
+  print(dim(seurat.obj))
+  
+  sample.metadata <- sussman.2024.sample.metadata %>% filter(orig.ident == sample.id)
+  if (nrow(sample.metadata) == 0) { # sample not in level 4 seurat object
+    
+    extracted.sampleIDs <- unlist(str_extract_all(sample.id, "\\d{3,4}"))
+    sampleID <- extracted.sampleIDs[length(extracted.sampleIDs)] # takes into account some sample.ids have 7316
+    sID <- paste0('7316-', sampleID)
+    
+    seurat.obj$sampleID <- sID # e.g. 7316-1057
+    
+    if (str_detect(sample.id, 'Reg')) {
+      region <- str_extract(sample.id, "Reg[12]")
+    } else {
+      region <- str_extract(sample.id, "R[12]")
+    }
+    
+    seurat.obj$region <- region
+    seurat.obj$orig.ident <- sample.id
+    
+    temp <- sussman.2024.sample.metadata %>% filter(sampleID == sID)
+    
+    if (sampleID == '339') {
+      seurat.obj$molecularClass <- "Unknown" #"HGG - NOS"
+      seurat.obj$patient_id <-"Unknown"  #"C70848"
+      seurat.obj$timepoint <- "Initial CNS Tumor"
+    } else {
+      stopifnot(nrow(temp) > 0)
+      seurat.obj$molecularClass <- unique(temp$molecularClass)
+      seurat.obj$patient_id <- unique(temp$patient_id)
+      seurat.obj$timepoint <- unique(temp$timepoint)
+    }
+    
+    seurat.obj$num.cells.in.seurat.obj <- NA
+  } else {
+    seurat.obj$sampleID <- sample.metadata$sampleID
+    seurat.obj$region <- sample.metadata$region
+    seurat.obj$orig.ident <- sample.metadata$orig.ident
+    seurat.obj$timepoint <- sample.metadata$timepoint
+    seurat.obj$molecularClass <- sample.metadata$molecularClass
+    seurat.obj$num.cells.in.seurat.obj <- sample.metadata$num.cells.in.seurat.obj
+    seurat.obj$patient_id <- sample.metadata$patient_id
+  }
+  Idents(seurat.obj) <- 'orig.ident'
+  
+  seurat.obj.list[[sample.id]] <- seurat.obj
+}
+
+sussman.2024.raw <- merge(seurat.obj.list[[1]], seurat.obj.list[2:length(seurat.obj.list)], add.cell.ids = names(seurat.obj.list))
+sussman.2024.raw[["RNA"]] <- JoinLayers(sussman.2024.raw[["RNA"]])
+sussman.2024.raw$sample.id <- sussman.2024.raw$orig.ident
+
+sussman.2024.raw$Timepoint <- sapply(sussman.2024.raw$timepoint, function(x) case_when(
+  x %in% c("Initial CNS Tumor", "Recurrence", "Progressive (Non-Autopsy)") ~ "Surgical",
+  x == "Progressive (Autopsy)" ~ "Postmortem"
+))
+
+sussman.2024.raw$cell.id <- colnames(sussman.2024.raw)
+
+all.samples.metadata.df <- sussman.2024.raw@meta.data
+write.table(all.samples.metadata.df, paste0(data.dir, 'Sussman_2024/', 'level3_all_cells_metadata.tsv'), row.names = F, quote = T, sep = '\t')
+saveRDS(sussman.2024.raw, paste0(data.dir, 'Sussman_2024/', 'SeuratObjsFromLevel3/', 'all.samples.merged.not.downsampled.seurat.obj.RDS'))
+print('done')
+```
+
+
+
+# Level 3 (raw counts): Get sample-level metadata by aggregating cell-level metadata
+```{r sussman 2024 metadata level 3}
+sussman.2024.level3.metadata <- read.csv(paste0(data.dir, 'Sussman_2024/', 'level3_all_cells_metadata.tsv'), sep = "\t")
+dim(sussman.2024.level3.metadata)
+sussman.2024.sample.metadata <- sussman.2024.level3.metadata %>% group_by(sampleID, region, orig.ident, timepoint, molecularClass, patient_id) %>% summarize(num.cells.in.raw.count.matrix = n())
+write.table(sussman.2024.sample.metadata, paste0(data.dir, 'Sussman_2024/', 'level3_sample_metadata.tsv'), sep = "\t", row.names=F, quote=F)
+```
+
+
+
+
+# Merge all samples and remove doublets
+```{r}
+seurat.obj <- readRDS(paste0(data.dir, 'Sussman_2024/', 'SeuratObjsFromLevel3/', 'all.samples.merged.not.downsampled.seurat.obj.RDS'))
+print("Initial raw number of cells:")
+
+sussman.2024.level4.metadata <- read.csv(paste0(data.dir, 'Sussman_2024/', 'Final_Cohort_All_snRNA-seq_metadata.tsv'), sep = "\t")
+sussman.2024.level4.metadata.select <- sussman.2024.level4.metadata %>% dplyr::select(TumorNormal, merged_cellType, orig.ident, cell.barcode)
+sussman.2024.level4.metadata.select$cell.id <- paste0(sussman.2024.level4.metadata.select$orig.ident, "_", sussman.2024.level4.metadata.select$cell.barcode)
+sussman.2024.level4.metadata.select$cell.id <-
+  str_replace(
+    sussman.2024.level4.metadata.select$cell.id,
+    "_\\d+$",
+    ""
+  )
+rownames(sussman.2024.level4.metadata.select) <- sussman.2024.level4.metadata.select$cell.id
+
+setdiff(rownames(sussman.2024.level4.metadata.select), colnames(seurat.obj)) # should be zero
+
+seurat.obj <- AddMetaData(seurat.obj, sussman.2024.level4.metadata.select) # add metadata from original Seurat object
+
+sample.not.used <- c("HTAN_pHGG_161_New_Reg1_snRNA", "HTAN_pHGG_161_New_Reg1_snRNA_bak", "HTAN_pHGG_2594_Reg1_snRNA", "HTAN_pHGG_2594_Reg2_snRNA", "HTAN_pHGG_339_Reg1_snRNA", "HTAN_pHGG_339_Reg2_snRNA", "HTAN_pHGG_7545_Reg2_snRNA")
+
+seurat.obj <- subset(seurat.obj, subset = sample.id %ni% sample.not.used)
+
+print("After removing samples not used:")
+print(dim(seurat.obj))
+
+# remove very low quality
+seurat.obj <- subset(seurat.obj, subset = (nCount_RNA >= 500) & (percent.mt <= 20))
+
+print("After removing very low quality:")
+print(dim(seurat.obj))
+seurat.obj <- NormalizeData(seurat.obj)
+
+n.dims.use <- 20
+seurat.obj.list <- list()
+for (sample.id.i in sort(unique(seurat.obj$sample.id))) {
+  print(sample.id.i)
+  sample.dir <- paste0(results.dir, "Sussman2024/", "qc/", sample.id.i, "/")
+  dir.create(sample.dir)
+  seurat.obj.sample <- subset(seurat.obj, subset = sample.id == sample.id.i)
+  print(dim(seurat.obj.sample))
+  seurat.obj.sample <- find.doublets(seurat.obj.sample, pcs.use.doublet.finder=1:n.dims.use, qc.output.dir = sample.dir)
+  seurat.obj.list[[sample.id.i]] <- seurat.obj.sample
+}
+seurat.obj <- merge(seurat.obj.list[[1]], seurat.obj.list[2:length(seurat.obj.list)])
+Sys.setenv('R_MAX_VSIZE' = 400000000000)
+rm(seurat.obj.list)
+seurat.obj[["RNA"]] <- JoinLayers(seurat.obj[["RNA"]])
+
+saveRDS(seurat.obj, paste0(data.dir, 'Sussman_2024/', 'SeuratObjsFromLevel3/', 'all.samples.merged.not.downsampled.very.low.quality.and.doublets.labeled.seurat.obj.RDS'))
+```
+
+
+
+# Annotate cluster-level cell types
+```{r}
+
+seurat.obj <- readRDS(paste0(data.dir, 'Sussman_2024/', 'SeuratObjsFromLevel3/', 'all.samples.merged.not.downsampled.very.low.quality.and.doublets.labeled.seurat.obj.RDS'))
+
+seurat.obj <- subset(seurat.obj, subset = doubFind_res == "Singlet")
+print("After removing doublets:")
+print(dim(seurat.obj))
+
+seurat.obj <- NormalizeData(seurat.obj)
+seurat.obj <- add.module.score(seurat.obj, gene.signatures)
+seurat.obj <- add.module.score(seurat.obj, brain_signatures)
+
+seurat.obj$timepoint.original <- seurat.obj$timepoint
+seurat.obj$timepoint <- sapply(seurat.obj$timepoint.original, function(x) ifelse(x %in% c("Recurrence", "Progressive (Non-Autopsy)"), "Recurrence/Progressive (Non-Autopsy)", x))
+
+seurat.obj <- FindVariableFeatures(seurat.obj)
+seurat.obj <- ScaleData(seurat.obj)
+
+seurat.obj <- RunPCA(seurat.obj, approx=F, seed.use = 42)
+ElbowPlot(seurat.obj, ndims=50)
+
+batch.correction <- F
+n.dims.use <- 30
+
+if (batch.correction) {
+  seurat.obj <- RunHarmony(seurat.obj, "patient_id")
+  reduction.use <- "harmony"
+} else {
+  reduction.use <- "pca"
+}
+
+seurat.obj <- FindNeighbors(seurat.obj, dims = 1:n.dims.use, nn.method = "rann", reduction = reduction.use)
+seurat.obj <- FindClusters(seurat.obj, resolution = 2, algorithm = 1, random.seed = 0, n.start = 10)
+seurat.obj <- RunUMAP(seurat.obj, dims = 1:n.dims.use, reduction = reduction.use)
+seurat.obj$seurat_clusters <- as.character(seurat.obj$seurat_clusters)
+seurat.obj$seurat_clusters <- factor(seurat.obj$seurat_clusters, levels = as.character(sort(unique(as.numeric(seurat.obj$seurat_clusters)))))
+
+
+# annotate based on clusters and gene expression
+cluster.information <- read_excel(paste0(results.dir, 'Sussman2024/', 'cluster_information.xlsx'), sheet=1)
+
+df <- cluster.information %>% filter(clean == 'before', patient == "all") 
+cluster.to.annotation.df <- df %>%
+  dplyr::select(-c(patient, clean)) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "annotation",
+    values_to = "cluster"
+  ) %>%
+  filter(!is.na(cluster)) %>%
+  separate_rows(cluster, sep = ",\\s*") %>%  # split clusters
+  mutate(cluster = as.character(cluster))
+
+
+seurat.obj$annotation.l2 <- sapply(seurat.obj$seurat_clusters, function(x) ifelse(x %in% cluster.to.annotation.df$cluster, cluster.to.annotation.df %>% filter(cluster == x) %>% pull(annotation), "Malignant cluster"))
+unique(seurat.obj$annotation.l2)
+seurat.obj$annotation.l1 <- sapply(seurat.obj$annotation.l2, function(x) case_when(
+  x %in% c("Oligodendrocytes", "OPC", "Astrocytes") ~ "Glial",
+  x %in% c("Lymphoid", "Myeloid", "Other immune") ~ "Immune",
+  x == "Malignant cluster" ~ "Malignant cluster",
+  x %in% c("Excitatory neurons", "Inhibitory neurons") ~ "Neurons",
+  x %in% c("Mural", "Endothelial") ~ "Vascular",
+))
+
+seurat.obj$low.quality.by.qc <- apply(seurat.obj@meta.data, 1, function(row) (as.numeric(row[['nCount_RNA']]) < nCount_RNA.cutoff.low) | (as.numeric(row[['nFeature_RNA']]) < nFeature_RNA.cutoff.low) | (as.numeric(row[['percent.mt']]) > percent.mt.cutoff))
+seurat.obj$annotation.l2.w.qc <- apply(seurat.obj@meta.data, 1, function(row) ifelse(row['low.quality.by.qc'] == TRUE, "Low quality", row['annotation.l2']))
+seurat.obj$annotation.l1.w.qc <- apply(seurat.obj@meta.data, 1, function(row) ifelse(row['low.quality.by.qc'] == TRUE, "Low quality", row['annotation.l1']))
+
+
+# UMAP
+p.sample.id <- DimPlot(seurat.obj, group.by = 'sample.id', shuffle=TRUE, label=F, raster=T) + NoAxes() + NoLegend()
+p.patient_id <- DimPlot(seurat.obj, group.by = 'patient_id', shuffle=TRUE, label=F, raster=T) + NoAxes() + patients.color.scale
+p.timepoint <- DimPlot(seurat.obj, group.by = 'timepoint', shuffle=TRUE, raster=T) + NoAxes() + timepoints.color.scale
+p.tumornormal <- DimPlot(seurat.obj, group.by='TumorNormal', shuffle=TRUE, raster=T) + NoAxes()
+p.clusters <- DimPlot(seurat.obj, group.by='seurat_clusters', shuffle=TRUE, label=T, raster=T, label.size=2) + NoAxes()
+p.merged.celltype <- DimPlot(seurat.obj, group.by='merged_cellType', shuffle=TRUE, raster=T) + NoAxes() + cell.type.color.scale
+p.annotation.l1 <- DimPlot(seurat.obj, group.by='annotation.l1', shuffle=TRUE, label=F, label.size=2, raster=T) + NoAxes() + cell.types.anotation_l1.w.quality.color.scale
+p.annotation.l1.w.qc <- DimPlot(seurat.obj, group.by='annotation.l1.w.qc', shuffle=TRUE, label=F, label.size=2, raster=T) + NoAxes() + cell.types.anotation_l1.w.quality.color.scale
+p.annotation.l2 <- DimPlot(seurat.obj, group.by='annotation.l2', shuffle=TRUE, label=F, label.size=2, raster=T) + NoAxes() + cell.types.anotation_l2.w.quality.color.scale
+p.annotation.l2.w.qc <- DimPlot(seurat.obj, group.by='annotation.l2.w.qc', shuffle=TRUE, label=F, label.size=2, raster=T) + NoAxes() + cell.types.anotation_l2.w.quality.color.scale
+
+p.percent.mt <- FeaturePlot(seurat.obj, features = 'percent.mt', order=T, raster=T) + NoAxes()
+p.ncount.rna <- FeaturePlot(seurat.obj, features = 'nCount_RNA', order=T, raster=T) + NoAxes()
+p.nfeature.rna <- FeaturePlot(seurat.obj, features = 'nFeature_RNA', order=T, raster=T) + NoAxes()
+p.postmortem.signature <- FeaturePlot(seurat.obj, features = c('postmortem.signature'), order=T, raster=T) + NoAxes()
+p.postmortem.sensitive <- FeaturePlot(seurat.obj, features = c('postmortem.sensitive'), order=T, raster=T) + NoAxes()
+p.heat.shock <- FeaturePlot(seurat.obj, features = c('heat.shock.signature'), order=T, raster=T) + NoAxes()
+p.postmortem.glial <- FeaturePlot(seurat.obj, features = c('postmortem.glial'), order=T, raster=T) + NoAxes()
+p.glial.factor <- FeaturePlot(seurat.obj, features = c('glial.factor'), order=T, raster=T) + NoAxes()
+p.immune.factor <- FeaturePlot(seurat.obj, features = c('immune.factor'), order=T, raster=T) + NoAxes()
+p.malignant.factor <- FeaturePlot(seurat.obj, features = c('malignant.factor'), order=T, raster=T) + NoAxes()
+p.neurons.factor <- FeaturePlot(seurat.obj, features = c('neurons.factor'), order=T, raster=T) + NoAxes()
+p.vascular.factor <- FeaturePlot(seurat.obj, features = c('vascular.factor'), order=T, raster=T) + NoAxes()
+
+p.astrocytes <- FeaturePlot(seurat.obj, features = c('Astrocytes'), order=T, raster=T) + NoAxes()
+p.myeloid <- FeaturePlot(seurat.obj, features = c('Myeloid'), order=T, raster=T) + NoAxes()
+p.neurons <- FeaturePlot(seurat.obj, features = c('Neurons'), order=T, raster=T) + NoAxes()
+p.oligodendrocytes <- FeaturePlot(seurat.obj, features = c('Oligodendrocytes'), order=T, raster=T) + NoAxes()
+p.opc <- FeaturePlot(seurat.obj, features = c('OPC'), order=T, raster=T) + NoAxes()
+p.vascular <- FeaturePlot(seurat.obj, features = c('Vascular'), order=T, raster=T) + NoAxes()
+
+gene.expression.color.gradient <- scale_colour_gradientn(limits=c(-3, 3), colours = rev(brewer.pal(n = 11, name = "RdBu")))
+min.cutoff.threshold <- -3
+max.cutoff.threshold <- 3
+
+p.ptprc <- FeaturePlot(seurat.obj, features = c('PTPRC'), order=T, min.cutoff = min.cutoff.threshold, max.cutoff = max.cutoff.threshold, raster=T) + NoAxes() + gene.expression.color.gradient
+p.itgam <- FeaturePlot(seurat.obj, features = c('ITGAM'), order=T, min.cutoff = min.cutoff.threshold, max.cutoff = max.cutoff.threshold, raster=T) + NoAxes() + gene.expression.color.gradient
+p.cd3e <- FeaturePlot(seurat.obj, features = c('CD3E'), order=T, min.cutoff = min.cutoff.threshold, max.cutoff = max.cutoff.threshold, raster=T) + NoAxes() + gene.expression.color.gradient
+p.cd247 <- FeaturePlot(seurat.obj, features = c('CD247'), order=T, min.cutoff = min.cutoff.threshold, max.cutoff = max.cutoff.threshold, raster=T) + NoAxes() + gene.expression.color.gradient
+p.cx3cr1 <- FeaturePlot(seurat.obj, features = c('CX3CR1'), order=T, min.cutoff = min.cutoff.threshold, max.cutoff = max.cutoff.threshold, raster=T) + NoAxes() + gene.expression.color.gradient
+p.egfr <- FeaturePlot(seurat.obj, features = c('EGFR'), order=T, min.cutoff = min.cutoff.threshold, max.cutoff = max.cutoff.threshold, raster=T) + NoAxes() + gene.expression.color.gradient
+p.sox2 <- FeaturePlot(seurat.obj, features = c('SOX2'), order=T, min.cutoff = min.cutoff.threshold, max.cutoff = max.cutoff.threshold, raster=T) + NoAxes() + gene.expression.color.gradient
+p.gfap <- FeaturePlot(seurat.obj, features = c('GFAP'), order=T, min.cutoff = min.cutoff.threshold, max.cutoff = max.cutoff.threshold, raster=T) + NoAxes() + gene.expression.color.gradient
+p.mog <- FeaturePlot(seurat.obj, features = c('MOG'), order=T, min.cutoff = min.cutoff.threshold, max.cutoff = max.cutoff.threshold, raster=T) + NoAxes() + gene.expression.color.gradient
+p.plp1 <- FeaturePlot(seurat.obj, features = c('PLP1'), order=T, min.cutoff = min.cutoff.threshold, max.cutoff = max.cutoff.threshold, raster=T) + NoAxes() + gene.expression.color.gradient
+p.pdgfra <- FeaturePlot(seurat.obj, features = c('PDGFRA'), order=T, min.cutoff = min.cutoff.threshold, max.cutoff = max.cutoff.threshold, raster=T) + NoAxes() + gene.expression.color.gradient
+p.olig2 <- FeaturePlot(seurat.obj, features = c('OLIG2'), order=T, min.cutoff = min.cutoff.threshold, max.cutoff = max.cutoff.threshold, raster=T) + NoAxes() + gene.expression.color.gradient
+p.sox10 <- FeaturePlot(seurat.obj, features = c('SOX10'), order=T, min.cutoff = min.cutoff.threshold, max.cutoff = max.cutoff.threshold, raster=T) + NoAxes() + gene.expression.color.gradient
+p.rbfox3 <- FeaturePlot(seurat.obj, features = c('RBFOX3'), order=T, min.cutoff = min.cutoff.threshold, max.cutoff = max.cutoff.threshold, raster=T) + NoAxes() + gene.expression.color.gradient
+p.slc17a7 <- FeaturePlot(seurat.obj, features = c('SLC17A7'), order=T, min.cutoff = min.cutoff.threshold, max.cutoff = max.cutoff.threshold, raster=T) + NoAxes() + gene.expression.color.gradient
+p.gad1 <- FeaturePlot(seurat.obj, features = c('GAD1'), order=T, min.cutoff = min.cutoff.threshold, max.cutoff = max.cutoff.threshold, raster=T) + NoAxes() + gene.expression.color.gradient
+p.cspg4 <- FeaturePlot(seurat.obj, features = c('CSPG4'), order=T, min.cutoff = min.cutoff.threshold, max.cutoff = max.cutoff.threshold, raster=T) + NoAxes() + gene.expression.color.gradient
+p.cldn5 <- FeaturePlot(seurat.obj, features = c('CLDN5'), order=T, min.cutoff = min.cutoff.threshold, max.cutoff = max.cutoff.threshold, raster=T) + NoAxes() + gene.expression.color.gradient
+p.acta2 <- FeaturePlot(seurat.obj, features = c('ACTA2'), order=T, min.cutoff = min.cutoff.threshold, max.cutoff = max.cutoff.threshold, raster=T) + NoAxes() + gene.expression.color.gradient
+
+p <- p.sample.id + p.patient_id + p.timepoint + p.tumornormal + p.clusters + p.merged.celltype + 
+  p.annotation.l1 + p.annotation.l1.w.qc + p.annotation.l2 + p.annotation.l2.w.qc + 
+  p.percent.mt + p.ncount.rna + p.nfeature.rna + p.postmortem.signature + p.postmortem.sensitive + p.heat.shock + p.postmortem.glial + 
+  p.glial.factor + p.immune.factor + p.malignant.factor + p.neurons.factor + p.vascular.factor +
+  p.astrocytes + p.myeloid + p.neurons + p.oligodendrocytes + p.opc + p.vascular +
+  p.ptprc + p.itgam + p.cd3e + p.cd247 + p.cx3cr1 + p.egfr + p.sox2 + p.gfap + p.mog + p.plp1 + p.pdgfra + p.olig2 + p.sox10 +
+  p.rbfox3 + p.slc17a7 + p.gad1 + p.cspg4 + p.cldn5 + p.acta2 
+
+pdf(paste0(results.dir, 'Sussman2024/', 'before.clean.all.samples.merged.not.downsampled_UMAP.pdf'), width=60, height=40)
+print(p)
+dev.off()
+
+
+p <- DotPlot(seurat.obj, group.by = "seurat_clusters", features = c("vascular.factor", "Vascular", "CSPG4", "CLDN5", "ACTA2", "immune.factor", "PTPRC", "Myeloid", "ITGAM", "CX3CR1", "CD3E", "CD247", "neurons.factor", "Neurons", "RBFOX3", "SLC17A7", "GAD1", "glial.factor", "Oligodendrocytes", "MOG", "PLP1", "OPC", "PDGFRA", "SOX10", "OLIG2", "Astrocytes", "GFAP", "malignant.factor", "EGFR", "SOX2"), cluster.idents = T) + coord_flip() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+pdf(paste0(results.dir, 'Sussman2024/', 'before.clean.all.samples.merged.not.downsampled_dotplot.pdf'), width=28, height=12)
+print(p)
+dev.off()
+
+saveRDS(seurat.obj, paste0(data.dir, 'Sussman_2024/', 'SeuratObjsFromLevel3ByPatientFinal/', 'all.samples.merged.not.downsampled.seurat.obj.w.annotations.RDS'))
+```

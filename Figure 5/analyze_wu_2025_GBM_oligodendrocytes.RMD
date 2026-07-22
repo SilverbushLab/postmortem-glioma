@@ -1,0 +1,823 @@
+---
+title: "analyze_wu_2025_GBM_oligodendrocytes.RMD"
+output: html_document
+date: "2026-06-01"
+---
+
+
+# Setup
+```{r}
+
+library(tidyverse)
+library(Seurat)
+library(ggpubr)
+library(corrplot)
+library(pals)
+library(RColorBrewer)
+library(GGally)
+
+root.dir <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Projects/Jackie_post-mortem/"
+
+suppressMessages(suppressWarnings(source(paste0(root.dir, "Code/", 'helper_functions.R'))))
+output.dir <- paste0(root.dir, "Results/", "Wu_2025_GBM/")
+
+figure.4.dir <- paste0(root.dir, "Figures/", "Figure 4/", "Supplemental/", "Wu_2025_GBM/")
+figure.5.dir <- paste0(root.dir, "Figures/", "Figure 5/", "Supplemental/", "Wu_2025_GBM/")
+```
+
+
+
+# Read in Wu et al., 2025 GBM
+```{r}
+snra.dir <- paste0(output.dir, "snrna/")
+oligo.dir <- paste0(output.dir, "snrna/", "oligodendrocytes/")
+
+seurat.obj <- readRDS(paste0(root.dir, "ExternalData/", "Wu_2025_GBM/", "GSE274987_gbm_regional_RNA.rds"))
+
+seurat.obj <- add.module.score(seurat.obj, oligo.gene.signatures)
+seurat.obj <- add.module.score(seurat.obj, fgf.gene.signatures)
+
+seurat.obj$Region <- factor(seurat.obj$Region, levels = c("TC", "TE", "PT"))
+seurat.obj@meta.data <- seurat.obj@meta.data %>% dplyr::mutate(Region.long = case_when(
+  Region == "TC" ~ "Tumor core",
+  Region == "TE" ~ "Tumor edge",
+  Region == "PT" ~ "Peritumoral",
+  TRUE ~ NA
+))
+seurat.obj$Region.long <- factor(seurat.obj$Region.long, levels = c("Tumor core", "Tumor edge", "Peritumoral"))
+
+seurat.obj$low.quality.by.qc <- apply(seurat.obj@meta.data, 1, function(row) (as.numeric(row[['nCount_RNA']]) < nCount_RNA.cutoff.low) | (as.numeric(row[['nFeature_RNA']]) < nFeature_RNA.cutoff.low) | (as.numeric(row[['Pct_mito']]) > percent.mt.cutoff))
+
+
+# Idents(seurat.obj)
+# colnames(seurat.obj@meta.data)
+# DimPlot(seurat.obj, label = T, shuffle = T)
+# DimPlot(seurat.obj, group.by = "CellClass_L1", label = T, shuffle = T)
+# DimPlot(seurat.obj, group.by = "CellClass_L2", label = T, shuffle = T)
+# DimPlot(seurat.obj, group.by = "CellClass_L3", label = T, shuffle = T)
+# DimPlot(seurat.obj, group.by = "Region", label = T, shuffle = T)
+# DimPlot(seurat.obj, group.by = "Sample", label = T, shuffle = T)
+# DimPlot(seurat.obj, group.by = "Batch", label = T, shuffle = T)
+# DimPlot(seurat.obj, group.by = "Patient", label = T, shuffle = T)
+# DimPlot(seurat.obj, group.by = "Platform", label = T, shuffle = T)
+# DimPlot(seurat.obj, group.by = "CCI_CellClass_L2", label = T, shuffle = T)
+# DimPlot(seurat.obj, group.by = "CellClass_L5_2", label = T, shuffle = T)
+# DimPlot(seurat.obj, group.by = "Confident_Annotation", label = T, shuffle = T)
+# DimPlot(seurat.obj, group.by = "is_malignant_confident", label = T, shuffle = T)
+# DimPlot(seurat.obj, group.by = "scVI_snn_res.0.5", label = T, shuffle = T)
+# FeaturePlot(seurat.obj, features = c("Pct_mito"), order = T)
+# FeaturePlot(seurat.obj, features = c("nCount_RNA"), order = T)
+# FeaturePlot(seurat.obj, features = c("nFeature_RNA"), order = T)
+# FeaturePlot(seurat.obj, features = c("reactive.oligo.general"), order = T)
+# FeaturePlot(seurat.obj, features = c("reactive.oligo.non.tumor"), order = T)
+# FeaturePlot(seurat.obj, features = c("reactive.oligo.specific"), order = T)
+```
+
+
+
+# OPC to Oligo proportion and reactive oligo expression
+```{r}
+# 1. Filter the object for only the two classes of interest
+sub_obj <- subset(x = seurat.obj, subset = CellClass_L1 %in% c("Oligodendrocyte", "OPC"))
+sub_obj <- subset(sub_obj, subset = Platform == "Multiome")
+
+# 2. Extract metadata and calculate proportions
+plot_data <- sub_obj@meta.data %>%
+  group_by(Region.long, Patient, CellClass_L1) %>%
+  tally() %>%
+  group_by(Region.long, Patient) %>%
+  mutate(proportion = n / sum(n))
+
+# 3. Create the stacked barplot with labels
+p <- ggplot(plot_data, aes(x = Region.long, y = proportion, fill = CellClass_L1)) +
+  geom_bar(stat = "identity", position = "stack") +
+  # Add the labels here
+  geom_text(
+    aes(label = paste0(n, " (", round(proportion * 100, 1), "%)")),
+    position = position_stack(vjust = 0.5),
+    size = 3.5,     # Adjust size as needed
+    color = "white", # White often looks better on dark bar colors
+    fontface = "bold"
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  theme_minimal() +
+  labs(
+    y = "Relative Proportion", 
+    x = "Region", 
+    fill = "Cell Type",
+    title = "Oligodendrocyte vs. OPC Distribution"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~Patient)
+
+# Save the plot
+pdf(paste0(snra.dir, "tumor.region_vs_OPC.Oligodendrocyte.proportion.pdf"), width = 18, height = 12)
+print(p)
+dev.off()
+
+
+figures.dir <- paste0(root.dir, "Figures/", "Figure 5/", "Oligo_OPC/")
+sub_obj <- add.module.score(sub_obj, oligo.gene.signatures)
+sub_obj$Timepoint <- sapply(sub_obj$Patient, function(x) ifelse(x == "6419", "Recurrent", "Primary"))
+unique(sub_obj$CellClass_L1)
+
+color_scale_use <- scale_color_manual(
+  breaks = c("Oligodendrocyte", "OPC"),
+  values = c("#A6D854", "#F0E442"),
+  guide = "none"
+)
+
+
+sub_obj$`Reactive oligo sig` <- sub_obj$reactive.oligo.general
+for (by_sample_use in c(T, F)) {
+  plot_gene_expression(sub_obj@meta.data %>% filter(Region == "TC"), 
+                         features = c("Reactive oligo sig"), 
+                         cell_type_col = "CellClass_L1",
+                         cell_type_levels = c("Oligodendrocyte", "OPC"),
+                         color_values = c("#A6D854", "#F0E442"),
+                         color_breaks = c("Oligodendrocyte", "OPC"),
+                         by_sample = by_sample_use, 
+                         plot_width = 8,
+                         plot_height = 8,
+                         min_cells = 0,
+                         mean_size = 3,
+                         output_path = paste0(figures.dir, "wu_2025_GBM_reactive.oligo.general_by_oligo.opc_sample_use=", by_sample_use, "_TC.pdf"))
+  
+  plot_gene_expression(sub_obj@meta.data %>% filter(Region == "TE"), 
+                         features = c("Reactive oligo sig"), 
+                         cell_type_col = "CellClass_L1",
+                         cell_type_levels = c("Oligodendrocyte", "OPC"),
+                         color_values = c("#A6D854", "#F0E442"),
+                         color_breaks = c("Oligodendrocyte", "OPC"),
+                         by_sample = by_sample_use, 
+                         plot_width = 8,
+                         plot_height = 8,
+                         min_cells = 0,
+                         mean_size = 3,
+                         output_path = paste0(figures.dir, "wu_2025_GBM_reactive.oligo.general_by_oligo.opc_sample_use=", by_sample_use, "_TE.pdf"))
+  
+  plot_gene_expression(sub_obj@meta.data %>% filter(Region == "PT"), 
+                         features = c("Reactive oligo sig"), 
+                         cell_type_col = "CellClass_L1",
+                         cell_type_levels = c("Oligodendrocyte", "OPC"),
+                         color_values = c("#A6D854", "#F0E442"),
+                         color_breaks = c("Oligodendrocyte", "OPC"),
+                         by_sample = by_sample_use, 
+                         plot_width = 8,
+                         plot_height = 8,
+                         min_cells = 0,
+                         mean_size = 3,
+                         output_path = paste0(figures.dir, "wu_2025_GBM_reactive.oligo.general_by_oligo.opc_sample_use=", by_sample_use, "_PT.pdf"))
+}
+```
+
+
+
+# Subset just oligodendrocytes
+```{r}
+seurat.obj.oligo <- subset(seurat.obj, subset = CellClass_L1 == "Oligodendrocyte")
+seurat.obj.oligo <- subset(seurat.obj.oligo, subset = Platform == "Multiome")
+
+unique(seurat.obj.oligo$Platform)
+seurat.obj.oligo$patient.region <- paste0(seurat.obj.oligo$Patient, " ", seurat.obj.oligo$Region)
+unique(seurat.obj.oligo$patient.region)
+
+seurat.obj.oligo <- NormalizeData(seurat.obj.oligo)
+seurat.obj.oligo <- add.module.score(seurat.obj.oligo, gene.signatures.gsea)
+seurat.obj.oligo <- add.module.score(seurat.obj.oligo, fgf.gene.signatures)
+seurat.obj.oligo <- add.module.score(seurat.obj.oligo, fgfr.gene.signatures)
+seurat.obj.oligo <- add.module.score(seurat.obj.oligo, oligo.gene.signatures)
+seurat.obj.oligo <- add.module.score(seurat.obj.oligo, mikolajewicz.signatures)
+seurat.obj.oligo <- add.module.score(seurat.obj.oligo, myelination.signatures)
+
+data <- FetchData(seurat.obj.oligo, vars = c("OLIG2", "SOX10", "CSPG4", "PDGFRA", "BCAS1", "ENPP6", "ASPA", "MOG", "MBP", "OPALIN", "PDGFRA", "PSMB8", "CDKN1A", "SERPINA3", "FGFR1", "FGFR2"))
+seurat.obj.oligo <- AddMetaData(seurat.obj.oligo, data)
+
+seurat.obj.oligo$Region <- factor(seurat.obj.oligo$Region, levels = c("TC", "TE", "PT"))
+levels(seurat.obj.oligo$Region) <- c("Tumor core", "Tumor edge", "Peritumoral")
+
+seurat.obj.oligo.original <- seurat.obj.oligo
+```
+
+
+
+# Region vs reactive.oligo.general and other genes/sigs
+```{r}
+seurat.obj.oligo <- subset(seurat.obj.oligo, subset = Platform == "Multiome")
+
+unique(seurat.obj.oligo$Platform)
+
+comparisons.use <- list(c("Tumor core", "Tumor edge"), c("Tumor edge", "Peritumoral"), c("Tumor core", "Peritumoral"))
+pathways.use <- c("HALLMARK_PI3K_AKT_MTOR_SIGNALING", "KEGG_MAPK_SIGNALING_PATHWAY", "BIOCARTA_PLC_PATHWAY", "HALLMARK_IL6_JAK_STAT3_SIGNALING")
+
+sample.df <- seurat.obj.oligo@meta.data %>%
+  group_by(Region, Sample) %>%
+  summarize(reactive.oligo.general = mean(reactive.oligo.general),
+            reactive.oligo.non.tumor = mean(reactive.oligo.non.tumor),
+            reactive.oligo.specific = mean(reactive.oligo.specific),
+            acute.demyelination = mean(acute.demyelination),
+            acute.remyelination = mean(acute.remyelination),
+            acute.de.re.myelination = mean(acute.de.re.myelination),
+            FGFR1 = mean(FGFR1),
+            FGFR2 = mean(FGFR2),
+            BCAS1 = mean(BCAS1),
+            ENPP6 = mean(ENPP6),
+            ASPA = mean(ASPA),
+            MBP = mean(MBP),
+            MOG = mean(MOG),
+            HALLMARK_PI3K_AKT_MTOR_SIGNALING = mean(HALLMARK_PI3K_AKT_MTOR_SIGNALING),
+            KEGG_MAPK_SIGNALING_PATHWAY = mean(KEGG_MAPK_SIGNALING_PATHWAY),
+            BIOCARTA_PLC_PATHWAY = mean(BIOCARTA_PLC_PATHWAY),
+            HALLMARK_IL6_JAK_STAT3_SIGNALING = mean(HALLMARK_IL6_JAK_STAT3_SIGNALING),
+            IFN_DAO = mean(IFN_DAO),
+            DAO1 = mean(DAO1),
+            DAO2 = mean(DAO2),
+            count = n()
+            ) %>%
+  ungroup()
+
+for (y in c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific", "acute.demyelination", "acute.remyelination", "acute.de.re.myelination", "FGFR1", "FGFR2", "BCAS1", "ENPP6", "MBP", "ASPA", "MOG", pathways.use)) {
+  
+  y.title <- case_when(
+    y %in% c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific") ~ "Reactive oligodendrocyte signature",
+    y == "acute.demyelination" ~ "Demyelination signature",
+    y == "acute.de.re.myelination" ~ "Remyelination signature",
+    TRUE ~ y
+  )
+  
+  if (y %in% c("MBP", "ASPA", "MOG")) {
+    alternative.use <- "less"
+  } else {
+    alternative.use <- "greater"
+  }
+  
+  if (y %in% c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific")) {
+    figures.dir <- figure.4.dir
+  } else {
+    figures.dir <- figure.5.dir
+  }
+  
+  do.boxplot(data = seurat.obj.oligo@meta.data, 
+             x.variable = "Region",
+             y.variable = y,
+             output.filepath = paste0(figures.dir, 'wu_2025_GBM_region_vs_', y, '.pdf'),
+             ylab.label = paste0(y.title, "\nin oligodendrocytes"),
+             comparisons = comparisons.use,
+             boxplot.fill.variable = "Region", 
+             fill.scale = NULL,
+             image.width = 8,
+             image.height = 8,
+             facet.by = NULL,
+             vars.to.regress = NULL,
+             alternative = alternative.use,
+           )
+  
+  do.boxplot(data = sample.df, 
+             x.variable = "Region",
+             y.variable = y,
+             output.filepath = paste0(figures.dir, 'wu_2025_GBM_region_vs_', y, '_by_sample.pdf'),
+             ylab.label = paste0(y.title, "\nin oligodendrocytes"),
+             comparisons = comparisons.use,
+             boxplot.fill.variable = "Region", 
+             fill.scale = NULL,
+             image.width = 8,
+             image.height = 8,
+             facet.by = NULL,
+             vars.to.regress = NULL,
+             alternative = alternative.use,
+             show.points = T,
+             outlier.shape = NA
+           )
+}
+
+
+
+figures.dir <- paste0(root.dir, "Figures/", "Figure 5/", "Supplemental/", "Wu_2025_GBM/")
+for (y in c("IFN_DAO", "DAO1", "DAO2")) {
+  
+  y.title <- y
+  do.boxplot(data = seurat.obj.oligo@meta.data, 
+             x.variable = "Region",
+             y.variable = y,
+             output.filepath = paste0(figures.dir, 'wu_2025_GBM_region_vs_', y, '.pdf'),
+             ylab.label = paste0(y.title, "\nin oligodendrocytes"),
+             comparisons = comparisons.use,
+             boxplot.fill.variable = "Region", 
+             fill.scale = NULL,
+             image.width = 8,
+             image.height = 8,
+             facet.by = NULL,
+             vars.to.regress = NULL,
+             alternative = "greater",
+           )
+  
+  do.boxplot(data = sample.df, 
+             x.variable = "Region",
+             y.variable = y,
+             output.filepath = paste0(figures.dir, 'wu_2025_GBM_region_vs_', y, '_by_sample.pdf'),
+             ylab.label = paste0(y.title, "\nin oligodendrocytes"),
+             comparisons = comparisons.use,
+             boxplot.fill.variable = "Region", 
+             fill.scale = NULL,
+             image.width = 8,
+             image.height = 8,
+             facet.by = NULL,
+             vars.to.regress = NULL,
+             alternative = "greater",
+             show.points = T,
+             outlier.shape = NA
+           )
+}
+```
+
+
+
+# Brad signatures
+```{r}
+figures.dir <- paste0(root.dir, "Figures/", "Figure 5/", "Supplemental/", "Wu_2025_GBM/")
+
+seurat.obj.oligo$`Reactive oligo sig` <- seurat.obj.oligo$reactive.oligo.general
+seurat.obj.oligo$Region <- seurat.obj.oligo$Region.long
+
+unique(seurat.obj.oligo$Platform)
+core.only <- T
+
+if (core.only) {
+  save.dir <- paste0(root.dir,  "Figures/", "Misc/", "FGF_FGFR/", "wu_2025_GBM_core_only/")
+} else {
+  save.dir <- paste0(root.dir, "Figures/", "Misc/", "FGF_FGFR/", "wu_2025_GBM/")
+}
+dir.create(save.dir)
+
+if (core.only) {
+  seurat.obj.oligo <- subset(seurat.obj.oligo, subset = Region.long %in% c("Tumor core"))
+} 
+
+vars.of.interest <- c("reactive.oligo.general", "IFN_DAO", "DAO1", "DAO2", "O2.Reactive.1", "O5.Reactive.II", "O7.Stress", "O3.Cycling", "acute.demyelination", "acute.de.re.myelination", "MBP", "ASPA", "BCAS1", "ENPP6", "PDGFRA", "PSMB8", "SERPINA3", "CDKN1A", "FGFR1", "FGFR2") # "ASPA", 
+vars.of.interest.subset <- c("Reactive oligo sig", "IFN_DAO", "DAO1", "DAO2")
+
+
+seurat.obj.oligo <- FindVariableFeatures(seurat.obj.oligo)
+seurat.obj.oligo <- ScaleData(seurat.obj.oligo)
+
+set.seed(123)
+seurat.obj.oligo <- RunPCA(seurat.obj.oligo)
+
+ElbowPlot(seurat.obj.oligo, ndims = 50)
+
+if (core.only) {
+  n.dims.use <- 10 
+} else {
+  n.dims.use <- 10 
+}
+
+seurat.obj.oligo <- FindNeighbors(seurat.obj.oligo, dims = 1:n.dims.use)
+seurat.obj.oligo <- FindClusters(seurat.obj.oligo, resolution = 1.2)
+seurat.obj.oligo <- RunUMAP(seurat.obj.oligo, dims = 1:n.dims.use)
+
+
+
+# 1. Custom function for upper triangle: Spearman Rho + Raw P-Value
+my_spearman <- function(data, mapping, ...) {
+  # Safely extract variable names as strings using rlang (comes with ggplot2)
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+  
+  # Calculate Spearman correlation and p-value
+  test <- cor.test(data[[x_name]], data[[y_name]], method = "spearman", exact = FALSE)
+  
+  rho <- round(test$estimate, 3)
+  p_val <- test$p.value
+  
+  # Format p-value: use scientific notation if it's highly significant
+  p_text <- format.p.value(p_val)
+  
+  lbl <- paste0("rho = ", rho, "\n", p_text)
+  
+  # Find midpoint of data for text placement
+  x_mid <- mean(range(data[[x_name]], na.rm = TRUE))
+  y_mid <- mean(range(data[[y_name]], na.rm = TRUE))
+  
+  ggplot(data = data, mapping = mapping) +
+    annotate("text", x = x_mid, y = y_mid, label = lbl, size = 4) +
+    theme_void()
+}
+
+# 2. Custom function for lower triangle (line of best fit only)
+my_smooth <- function(data, mapping, ...) {
+  ggplot(data = data, mapping = mapping) +
+    geom_smooth(method = "auto", color = "blue", ...)
+}
+
+# 3. Create the ggpairs plot using your Seurat metadata
+p <- ggpairs(
+  seurat.obj.oligo@meta.data[vars.of.interest],
+  lower = list(continuous = my_smooth),
+  upper = list(continuous = my_spearman)
+) +
+  theme_bw()
+
+# 4. Save to PDF
+pdf(paste0(save.dir, "oligos_signature_correlations.pdf"), width = 20, height = 20)
+print(p)
+dev.off()
+
+
+#DimPlot(seurat.obj.oligo, group.by = "Platform", shuffle = T, reduction = "umap", label=T) + NoLegend()
+
+p1 <- DimPlot(seurat.obj.oligo, group.by = "seurat_clusters", shuffle = T, label = T, reduction = "umap")
+p2 <- DimPlot(seurat.obj.oligo, group.by = "Platform", shuffle = T, reduction = "umap", label=F)
+p3 <- DimPlot(seurat.obj.oligo, group.by = "Patient", shuffle = T, reduction = "umap")
+p4 <- DimPlot(seurat.obj.oligo, group.by = "Sample", shuffle = T, reduction = "umap") + NoLegend()
+p5 <- DimPlot(seurat.obj.oligo, group.by = "Region", shuffle = T, reduction = "umap") 
+
+
+if (core.only) {
+  p <- p1
+} else {
+  p <- p5
+}
+for (f in vars.of.interest.subset) {
+  feature_data <- FetchData(seurat.obj.oligo, vars = f)[[1]]
+  
+  min_val <- quantile(feature_data, 0.01)
+  max_val <- quantile(feature_data, 0.99)
+  
+  p.f <- FeaturePlot(seurat.obj.oligo, features = f, order = TRUE, reduction = "umap") + 
+    scale_colour_gradientn(
+      colours = rev(brewer.pal(n = 11, name = "RdBu")),
+      limits = c(min_val, max_val),
+      oob = scales::squish
+    ) + umap.axes
+  p <- p + p.f
+}
+pdf(paste0(figures.dir, "wu_2025_GBM_fgf_signatures_featureplot_1_to_99_percentile_tumor.core=", core.only, ".pdf"), width = 24, height = 10)
+print(p)
+dev.off()
+
+
+
+if (core.only) {
+  p <- DotPlot(seurat.obj.oligo, features = vars.of.interest.subset, 
+             group.by = "seurat_clusters", scale = T)
+
+  # Clip avg.exp.scaled to q1–q99 per feature
+  p$data <- p$data %>%
+    group_by(features.plot) %>%
+    mutate(avg.exp.scaled = {
+      q_low  <- quantile(avg.exp.scaled, 0.01, na.rm = TRUE)
+      q_high <- quantile(avg.exp.scaled, 0.99, na.rm = TRUE)
+      pmin(pmax(avg.exp.scaled, q_low), q_high)
+    }) %>%
+    ungroup()
+  
+  p <- p + scale_color_viridis_c(option = "plasma") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+  pdf(paste0(figures.dir, "wu_2025_GBM_dotplot_seurat.clusters_vs_oligo.signatures_tumor.core.pdf"), width = 8, height = 8)
+  print(p)
+  dev.off()
+
+}
+
+
+
+p <- p1 + p2 + p3 + p4 + p5
+
+vars.plot <- vars.of.interest
+for (f in vars.plot) {
+  feature_data <- FetchData(seurat.obj.oligo, vars = f)[[1]]
+
+  p.f <- FeaturePlot(seurat.obj.oligo, features = f, order = TRUE, reduction = "umap") + 
+    scale_colour_gradientn(
+      colours = rev(brewer.pal(n = 11, name = "RdBu")),
+    )
+  p <- p + p.f
+}
+pdf(paste0(save.dir, "wu_2025_GBM_fgf_signatures_featureplot.pdf"), width = 24, height = 20)
+print(p)
+dev.off()
+
+
+
+p <- p1 + p2 + p3
+for (f in vars.plot) {
+  feature_data <- FetchData(seurat.obj.oligo, vars = f)[[1]]
+  
+  min_val <- quantile(feature_data, 0.01)
+  max_val <- quantile(feature_data, 0.99)
+  
+  p.f <- FeaturePlot(seurat.obj.oligo, features = f, order = TRUE, reduction = "umap") + 
+    scale_colour_gradientn(
+      colours = rev(brewer.pal(n = 11, name = "RdBu")),
+      limits = c(min_val, max_val),
+      oob = scales::squish
+    )
+  p <- p + p.f
+}
+pdf(paste0(save.dir, "wu_2025_GBM_fgf_signatures_featureplot_1_to_99_percentile.pdf"), width = 24, height = 20)
+print(p)
+dev.off()
+
+
+
+for (group.by.use in c("seurat_clusters", "Region.long")) {
+  p <- DotPlot(seurat.obj.oligo, features = vars.of.interest, group.by = group.by.use, scale = F) +
+    scale_color_viridis_c(option = "inferno") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+  pdf(paste0(save.dir, "fgf_signatures_dotplot_group.by=", group.by.use, ".pdf"), width = 16, height = 8)
+  print(p)
+  dev.off()
+  
+  p <- DotPlot(seurat.obj.oligo, features = vars.of.interest, group.by = group.by.use, scale = T) +
+    scale_color_viridis_c(option = "inferno") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+  pdf(paste0(save.dir, "fgf_signatures_dotplot_group.by=", group.by.use, "_scaled.pdf"), width = 16, height = 8)
+  print(p)
+  dev.off()
+}
+
+unique(seurat.obj.oligo$Platform)
+```
+
+
+
+# BCAS1 vs ASPA
+```{r}
+bcas1.cutoff <- median(seurat.obj.oligo$BCAS1)
+print(bcas1.cutoff)
+
+aspa.cutoff <- median(seurat.obj.oligo$ASPA)
+print(aspa.cutoff)
+
+seurat.obj.oligo$bcas1.annotation <- sapply(seurat.obj.oligo$BCAS1, function(x) ifelse(x > bcas1.cutoff, "BCAS1 high", "BCAS1 low"))
+seurat.obj.oligo$aspa.annotation <- sapply(seurat.obj.oligo$ASPA, function(x) ifelse(x > aspa.cutoff, "ASPA high", "ASPA low"))
+seurat.obj.oligo$oligo.annotation <- paste0(seurat.obj.oligo$bcas1.annotation, " ", seurat.obj.oligo$aspa.annotation)
+
+unique(seurat.obj.oligo$oligo.annotation)
+
+seurat.obj.oligo$oligo.annotation <- factor(seurat.obj.oligo$oligo.annotation, levels = c("BCAS1 low ASPA low", "BCAS1 high ASPA low", "BCAS1 high ASPA high", "BCAS1 low ASPA high"))
+seurat.obj.oligo$oligo.annotation <- sapply(seurat.obj.oligo$oligo.annotation, function(x) case_when(
+  x == "BCAS1 low ASPA low" ~ "Non-myelinating\n(BCAS1_lo ASPA_lo)",
+  x == "BCAS1 high ASPA low" ~ "Early myelinating\n(BCAS1_hi ASPA_lo)",
+  x == "BCAS1 high ASPA high" ~ "Intermediate myelinating\n(BCAS1_hi ASPA_hi)",
+  x == "BCAS1 low ASPA high" ~ "Late myelinating\n(BCAS1_lo ASPA_hi)"
+))
+
+oligo.groups <- c("Non-myelinating\n(BCAS1_lo ASPA_lo)", "Early myelinating\n(BCAS1_hi ASPA_lo)", 
+                                                 "Intermediate myelinating\n(BCAS1_hi ASPA_hi)", "Late myelinating\n(BCAS1_lo ASPA_hi)")
+seurat.obj.oligo$oligo.annotation <- factor(seurat.obj.oligo$oligo.annotation, 
+                                      levels = oligo.groups)
+
+oligo.cols <- c(
+  "Non-myelinating\n(BCAS1_lo ASPA_lo)" = "#E0E0E0",      # Light Grey
+  "Early myelinating\n(BCAS1_hi ASPA_lo)" = "#6BAED6",    # Light Blue
+  "Intermediate myelinating\n(BCAS1_hi ASPA_hi)" = "#2171B5", # Medium Blue
+  "Late myelinating\n(BCAS1_lo ASPA_hi)" = "#08306B"      # Dark Blue
+)
+
+DimPlot(seurat.obj.oligo, group.by = "bcas1.annotation")
+DimPlot(seurat.obj.oligo, group.by = "aspa.annotation")
+
+p <- DimPlot(seurat.obj.oligo, group.by = "oligo.annotation", cols = oligo.cols) + 
+  umap.axes +
+  ggtitle("Oligodendrocyte")
+pdf(paste0(oligo.dir, "dimplot_by_oligo_group.pdf"), width = 8, height = 6)
+print(p)
+dev.off()
+
+p <- plot_composition(
+    seurat.obj.oligo@meta.data,
+    x.var = "Region",  
+    x.levels = c("Tumor core", "Tumor edge", "Peritumoral"),
+    fill.var = "oligo.annotation",
+    fill.levels = oligo.groups,
+    fill.scale = scale_fill_manual(breaks = names(oligo.cols), values = as.character(oligo.cols)),
+    xlab = "Region",
+    legend.title = "Oligodendrocyte"
+)
+pdf(paste0(oligo.dir, "oligo_group_distribution_by_location.pdf"), width = 12, height = 8)
+print(p)
+dev.off()
+
+
+seurat.obj.oligo$sample.desc <- paste0(seurat.obj.oligo$Patient, " ", seurat.obj.oligo$Region)
+sample.desc.levels <- c("6237 Tumor core", "6237 Tumor edge", "6237 Peritumoral", 
+                        "6425 Tumor core", "6425 Tumor edge", "6425 Peritumoral",
+                        "6509 Tumor core", "6509 Tumor edge", "6509 Peritumoral",
+                        "6514 Tumor core",  "6514 Tumor edge", "6514 Peritumoral",
+                        "6419 Tumor core", "6419 Peritumoral", 
+                        "6467 Tumor core",  "6467 Peritumoral",
+                        "6245 Tumor edge", "6245 Peritumoral",
+                        "6234 Peritumoral")
+p <- plot_composition(
+    seurat.obj.oligo@meta.data,
+    x.var = "sample.desc",  
+    x.levels = sample.desc.levels,
+    fill.var = "oligo.annotation",
+    fill.levels = oligo.groups,
+    fill.scale = scale_fill_manual(breaks = names(oligo.cols), values = as.character(oligo.cols)),
+    xlab = "Sample",
+    legend.title = "Oligodendrocyte"
+)
+pdf(paste0(oligo.dir, "oligo_group_distribution_by_sample.pdf"), width = 18, height = 8)
+print(p)
+dev.off()
+```
+
+
+
+# Region of interest vs genes/signatures
+```{r}
+seurat.obj.oligo <- seurat.obj.oligo.original
+unique(seurat.obj.oligo$Platform)
+
+# region for genes/signatures of interest
+genes.of.interest <- c("OLIG2", "SOX10", "CSPG4", "PDGFRA", "BCAS1", "ENPP6", "ASPA", "MBP", "MOG", "FGFR1", "FGFR2")
+vars.of.interest <- c(names(oligo.gene.signatures), names(myelination.signatures), names(gene.signatures.gsea), names(fgf.gene.signatures), genes.of.interest)
+
+
+p <- VlnPlot(seurat.obj.oligo, group.by = "Region", features = vars.of.interest, stack = T, flip = T) + stat_summary(fun = mean, geom='point', size = 15, colour = "blue", shape = 95) + stat_summary(fun = median, geom='point', size = 15, colour = "black", shape = 95) + NoLegend() + ggtitle("Oligodendrocytes")
+pdf(paste0(oligo.dir, "tumor.region_vs_reactive.oligo.features_vlnplot.pdf"), width = 12, height = 20)
+print(p)
+dev.off()
+
+
+
+ggplot(seurat.obj.oligo@meta.data, aes(reactive.oligo.general, BCAS1)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "lm") +
+  stat_cor(method = "spearman") +
+  facet_wrap(~Patient + Region)
+
+
+comparisons <- list(c("Tumor core", "Tumor edge"), c("Tumor core", "Peritumoral"), c("Tumor edge", "Peritumoral"))
+
+for (y in vars.of.interest) {
+  
+  print(y)
+  
+  if (y %in% c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific", "ENPP6", "BCAS1", "ST6GALNAC3",
+               "acute.demyelination", "acute.remyelination", "acute.de.remyelination")) {
+    alternative <- "greater"
+  } else if (y %in% c("ASPA", "MOG", "MBP")) {
+    alternative <- "less"
+  } else {
+    alternative <- "two.sided"
+  }
+  
+  y.title <- case_when(
+    y %in% c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific") ~ "Reactive oligodendrocyte signature",
+    y == "acute.demyelination" ~ "Demyelination signature",
+    y == "acute.de.re.myelination" ~ "Remyelination signature",
+    TRUE ~ y
+  )
+  
+  if (y %in% c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific")) {
+    figures.dir <- figure.4.dir
+  } else {
+    figures.dir <- figure.5.dir
+  }
+  
+  d <- seurat.obj.oligo@meta.data
+  d$y <- d[[y]]
+  
+  stat.test <- d %>%
+      rstatix::wilcox_test(y ~ Region, comparisons = comparisons, alternative = alternative) %>%
+      rstatix::adjust_pvalue(method = "fdr") %>%
+      rstatix::add_significance("p.adj") %>%
+      rstatix::add_xy_position(x = "Region", 
+                               step.increase = 0.1,  # INCREASE THIS if they still overlap (e.g., try 0.15)
+                               y.trans = function(x) x * 1.0) # Lifts the initial bracket slightly above the highest data point)
+  stat.test$p.label <- format.p.value(stat.test$p.adj)
+  
+  p <- ggplot(d, aes(Region, .data[[y]], color = Region)) +
+    geom_violin() +
+    geom_boxplot(outlier.shape = NA, width = 0.1, alpha = 0.2, color = "grey") +
+    
+    stat_summary(
+      fun = "mean", 
+      geom = "point", 
+      shape = 18,          # 18 is a diamond shape
+      size = 3,            # Adjust size to your liking
+      color = "red",   # Distinct color so it doesn't blend into the boxplot
+      alpha = 0.8
+    ) +
+    
+    theme(legend.position="none") +
+    xlab("Region") +
+    ylab(y.title) +
+    stat_pvalue_manual(stat.test, label = "p.label", size = 6) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+    
+  pdf(paste0(figures.dir, "tumor_region_vs_", y, ".pdf"), width = 8, height = 6)
+  print(p)
+  dev.off()
+}
+
+
+# Keep patients with AT LEAST 2 regions
+patients.w.min.two.regions <- seurat.obj.oligo@meta.data %>% 
+  group_by(Patient) %>%
+  summarize(n.regions = n_distinct(Region)) %>%
+  filter(n.regions >= 2) %>%     
+  pull(Patient)
+
+for (y in vars.of.interest) {
+  
+  if (y %in% c("AC009063.2", "KIAA0355")) {
+    next
+  }
+  
+  if (y %in% c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific", "ENPP6", "BCAS1", "ST6GALNAC3",
+               "acute.demyelination", "acute.remyelination", "acute.de.remyelination")) {
+    alternative <- "greater"
+  } else if (y %in% c("ASPA", "MOG", "MBP")) {
+    alternative <- "less"
+  } else {
+    alternative <- "two.sided"
+  }
+  
+  y.title <- case_when(
+    y %in% c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific") ~ "Reactive oligodendrocyte signature",
+    y == "acute.demyelination" ~ "Demyelination signature",
+    y == "acute.de.re.myelination" ~ "Remyelination signature",
+    TRUE ~ y
+  )
+  
+  if (y %in% c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific")) {
+    figures.dir <- figure.4.dir
+  } else {
+    figures.dir <- figure.5.dir
+  }
+  
+  d <- seurat.obj.oligo@meta.data %>% filter(Patient %in% patients.w.min.two.regions)
+  d$y <- d[[y]]
+  
+  # -------------------------------------------------------------
+  # FIX: Identify and remove patients with zero variance in a region
+  # -------------------------------------------------------------
+  valid.patients <- d %>%
+    group_by(Patient, Region) %>%
+    # Calculate the variance or number of unique values per region per patient
+    summarize(n_unique = n_distinct(y, na.rm = TRUE), .groups = 'drop_last') %>%
+    # A group must have at least 2 unique values to be statistically testable
+    summarize(min_unique_across_regions = min(n_unique), .groups = 'drop') %>%
+    filter(min_unique_across_regions >= 2) %>%
+    pull(Patient)
+  
+  # Filter data to only include valid testable patients
+  d_filtered <- d %>% filter(Patient %in% valid.patients)
+  
+  # If no patients survive the filter for this gene, skip to the next gene
+  if (nrow(d_filtered) == 0) {
+    message(paste("Skipping gene/signature:", y, "- insufficient variance across patient regions."))
+    next
+  }
+  # -------------------------------------------------------------
+  
+  # 1. Compute stats dynamically (using d_filtered instead of d)
+  stat.test <- d_filtered %>%
+    group_by(Patient) %>%
+    rstatix::wilcox_test(y ~ Region, comparisons = NULL, alternative = alternative) %>%
+    rstatix::adjust_pvalue(method = "fdr") %>%
+    rstatix::add_significance("p.adj")
+  
+  # Note: You were calling add_xy_position twice in your original code. 
+  # You only need the second one with your custom step.increase and y.trans.
+  stat.test <- stat.test %>%
+    rstatix::add_xy_position(
+      x = "Region", 
+      data = d_filtered,            
+      formula = y ~ Region, 
+      step.increase = 0.1,  
+      y.trans = function(x) x * 1.0
+    )
+  stat.test$p.label <- format.p.value(stat.test$p.adj)
+  
+  p <- ggplot(d_filtered, aes(Region, .data[[y]], color = Region)) +
+    geom_violin() +
+    geom_boxplot(outlier.shape = NA, width = 0.1, alpha = 0.2, color = "grey") +
+    stat_summary(
+      fun = "mean", 
+      geom = "point", 
+      shape = 18,      
+      size = 3,            
+      color = "red",   
+      alpha = 0.8
+    ) +
+    theme(legend.position="none") +
+    xlab("Region") +
+    ylab(y.title) +
+    facet_wrap(~Patient) + 
+    stat_pvalue_manual(stat.test, label = "p.label", size = 6) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  pdf(paste0(figures.dir, "by_patient/", "tumor_region_vs_", y, "_by_patient.pdf"), width = 14, height = 10)
+  print(p)
+  dev.off()
+}
+```
+
+
+

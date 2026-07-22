@@ -1,0 +1,53 @@
+---
+title: "wang_2022_GBM_preprocessing.RMD"
+output: html_document
+date: "2026-02-04"
+---
+
+
+
+# Setup
+```{r}
+library(Seurat)
+library(anndata)
+library(stringr)
+library(readxl)
+library(tidyverse)
+
+root.dir <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Projects/Jackie_post-mortem/"
+```
+
+
+
+# Create Seurat Object
+```{r}
+ad <- read_h5ad(paste0(root.dir, "ExternalData/", "Wang_2022_longitudinal_GBM/", "from_wang_2023_reanalysis/", "SCSP0000480.h5ad"))
+
+counts <- as.matrix(ad$X)
+counts <- t(counts)
+seurat.obj <- CreateSeuratObject(counts = counts)
+
+# add metadata
+obs.df <- ad$obs
+obs.df$cell.barcode <- rownames(obs.df)
+obs.df$individual <- sapply(obs.df$cell.barcode, function(x) unlist(str_split(x, "_"))[1])
+obs.df$cell_type <- as.character(obs.df$cell_type)
+print(unique(obs.df$cell_type))
+
+# add sample-level metadata from supplemental table of original paper
+sample.metadata.df <- read_excel(paste0(root.dir, "ExternalData/", "Wang_2022_longitudinal_GBM/", "43018_2022_475_MOESM2_ESM.xlsx"), sheet = 2)
+sample.metadata.df <- sample.metadata.df %>% dplyr::filter(`snRNA-seq` == "Y")
+
+all.obs.df <- left_join(obs.df, sample.metadata.df, by = c("individual" = "ID"))
+
+seurat.obj <- AddMetaData(seurat.obj, all.obs.df)
+
+seurat.obj <- NormalizeData(seurat.obj)
+
+# percent mitochondrial genes
+seurat.obj[["percent.mt"]] <- PercentageFeatureSet(seurat.obj, pattern = "^MT-")
+
+saveRDS(seurat.obj, paste0(root.dir, "ProcessedData/", "Wang_2022_logitudinal_GBM/", "seurat_objects/", "wang.2022.longitudinal.GBM.seurat.obj.RDS"))
+```
+
+

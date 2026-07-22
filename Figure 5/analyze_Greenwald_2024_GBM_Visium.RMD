@@ -1,0 +1,1653 @@
+---
+title: "analyze_Greenwald_2024_GBM_Visium.RMD"
+output: html_document
+date: "2026-05-10"
+---
+
+
+
+# Setup
+```{r}
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+library(pals)
+library(ggplot2)
+library(ggpubr)
+library(rstatix)
+library(STutility)
+library(cowplot)
+library(ggrepel)
+library(corrplot)
+
+root.dir <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Projects/Jackie_post-mortem/"
+data.dir <- paste0(root.dir, "ExternalData/")
+processed.data.dir <- paste0(root.dir, "ProcessedData/")
+results.dir <- paste0(root.dir, "Results/")
+suppressMessages(suppressWarnings(source(paste0(root.dir, "Code/", 'helper_functions.R'))))
+
+oligo.jakel2019.signatures[["Oligo4"]] <- NULL # not enough genes
+```
+
+
+
+
+# General settings
+```{r}
+visium.metadata.df <- read.csv(paste0(data.dir, "Greenwald_2024_GBM_Spatial/", "Inputs/", "general/", "visium_metadata.csv"))
+samples <- sort(unique(visium.metadata.df$sample))
+print(samples)
+all.cell.types <- c(sort(unique(visium.metadata.df$mp)))
+print(all.cell.types)
+
+n.hop <- 2
+
+dir.create(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/"))
+dir.create(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/sample_level/"))
+```
+
+
+
+# Create merged object 
+```{r, include=FALSE}
+create.seurat.obj <- T
+
+if (create.seurat.obj) {
+  seurat.obj.list <- list()
+  
+  visium.metadata.df <- read.csv(paste0(data.dir, "Greenwald_2024_GBM_Spatial/", "Inputs/", "general/", "visium_metadata.csv"))
+  rownames(visium.metadata.df) <- paste0(visium.metadata.df$sample, "_", visium.metadata.df$spot_id, "_1")
+  samples <- sort(unique(visium.metadata.df$sample))
+  
+  for (sample.id in samples) {
+    print(sample.id)
+    
+    sample.dir <- paste0(data.dir, "Greenwald_2024_GBM_Spatial/", "Inputs/", "general/", "GBM_data/", sample.id, "/", "outs/")
+    infoTable <- data.frame(samples = paste0(sample.dir, "filtered_feature_bc_matrix.h5"),
+               spotfiles = paste0(sample.dir, "spatial/", "tissue_positions_list.csv"),
+               imgs = paste0(sample.dir, "spatial/", "tissue_hires_image.png"),
+               json = paste0(sample.dir, "spatial/", "scalefactors_json.json"))
+    
+    seurat.obj <- InputFromTable(infotable = infoTable, platform = "Visium")
+    seurat.obj <- LoadImages(seurat.obj, time.resolve = FALSE, verbose = TRUE)
+  
+    seurat.obj$sample.id <- sample.id
+    
+    # normalize data
+    seurat.obj <- NormalizeData(seurat.obj, scale.factor = 100000)
+    
+    # add percent.mt
+    seurat.obj[["percent.mt"]] <- PercentageFeatureSet(seurat.obj, pattern = "^MT-") 
+    
+    seurat.obj <- add.module.score(seurat.obj, gene.signatures)
+    seurat.obj <- add.module.score(seurat.obj, oligo.gene.signatures)
+    seurat.obj <- add.module.score(seurat.obj, oligo.jakel2019.signatures)
+    seurat.obj <- add.module.score(seurat.obj, myelination.signatures)
+    seurat.obj <- add.module.score(seurat.obj, gene.signatures.gsea)
+    
+    seurat.obj <- score.neftel(seurat.obj, signatures.dir="/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Shared_resources/Signatures/Neftel_GBM_cell_states/SingleCell_GBM/", assay.use = "RNA")
+
+    
+    seurat.obj.list[[sample.id]] <- seurat.obj
+  }
+  
+  print("Merging")
+  seurat.obj.merged <- MergeSTData(seurat.obj.list[[1]], seurat.obj.list[2:length(seurat.obj.list)], add.spot.ids = names(seurat.obj.list), merge.data = T)
+  
+  # add metadata
+  seurat.obj.merged <- AddMetaData(seurat.obj.merged, visium.metadata.df)
+  
+  seurat.obj.merged$ivygap <- factor(seurat.obj.merged$ivygap, levels = c("PAN", "MVP", "CT", "LE"))
+  
+  seurat.obj.merged$region <- sapply(seurat.obj.merged$sample, function(x) 
+    case_when(
+      grepl("ZH8811Abulk", x) ~ "1A_bulk",
+      grepl("ZH8811Bbulk", x) ~ "1B_bulk",
+      grepl("ZH8812bulk", x) ~ "2_bulk",
+      grepl("nec", x) ~ "nec",
+      grepl("T1", x) ~ "T1",
+      grepl("inf", x) ~ "inf",
+      grepl("bulk", x) ~ "bulk",
+      TRUE ~ NA
+    )
+  )
+  seurat.obj.merged$region <- factor(seurat.obj.merged$region, levels = c("nec", "T1", "inf", "bulk"))
+  seurat.obj.merged$tumor <- sapply(seurat.obj.merged$sample, function(x) str_replace(x, "nec|T1|inf|bulk", ""))
+  seurat.obj.merged$tumor <- sapply(seurat.obj.merged$tumor, function(x) ifelse(x %in% c("ZH8811Abulk", "ZH8811Bbulk", "ZH8812bulk"), "ZH881", x))
+  seurat.obj.merged$barcode <- colnames(seurat.obj.merged)
+  
+  
+  #seurat.obj.merged$oligo.like.up <- seurat.obj.merged$oligo.like # TODO need to rename in the future
+  seurat.obj.merged$mp <- sapply(seurat.obj.merged$mp, function(x) ifelse(is.na(x), "Low.quality", x))
+  
+  print(dim(seurat.obj.merged))
+  saveRDS(seurat.obj.merged, paste0(processed.data.dir, "Greenwald_2024_GBM/", "Greenwald_2024_GBM_seurat.obj.merged.RDS"))
+}
+```
+
+
+
+# Analyze spatial data
+```{r, include=FALSE}
+seurat.obj.merged <- readRDS(paste0(processed.data.dir, "Greenwald_2024_GBM/", "Greenwald_2024_GBM_seurat.obj.merged.RDS"))
+
+## QC and postmortem signatures
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "qc/", "background_by_sample.pdf"), width = 30, height = 30)
+ImagePlot(seurat.obj.merged, ncol = 5)
+dev.off()
+
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "qc/", "heat.shock.signature_by_sample.pdf"), width = 30, height = 30)
+ST.FeaturePlot(seurat.obj.merged, features = c("heat.shock.signature"), ncol = 5, pt.size = 1.5, label.by = "sample.id", palette = "Spectral")
+dev.off()
+
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "qc/", "postmortem.signature.signature_by_sample.pdf"), width = 30, height = 30)
+ST.FeaturePlot(seurat.obj.merged, features = c("postmortem.signature"), ncol = 5, pt.size = 1.5, label.by = "sample.id", palette = "Spectral")
+dev.off()
+
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "qc/", "postmortem.sensitive.signature_by_sample.pdf"), width = 30, height = 30)
+ST.FeaturePlot(seurat.obj.merged, features = c("postmortem.sensitive"), ncol = 5, pt.size = 1.5, label.by = "sample.id", palette = "Spectral")
+dev.off()
+
+
+
+# Signatures by mp (metaprogram)
+mps <- setdiff(sort(unique(seurat.obj.merged$mp)), "Low quality")
+mps.palette <- c(as.character(polychrome(length(mps) - 1)), "grey")
+names(mps.palette) <- mps
+#mps.color.scale <- scale_fill_manual(breaks = mps, values = mps.palette)
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "qc/", "mp_by_sample.pdf"), width = 30, height = 30)
+ST.FeaturePlot(seurat.obj.merged, features = "mp", ncol = 5, pt.size = 2, cols = mps.palette, label.by = "sample.id")
+dev.off()
+
+
+
+p <- VlnPlot(seurat.obj.merged, group.by = "mp", features = c("heat.shock.signature", "percent.mt", "postmortem.sensitive", "postmortem.signature", "postmortem.glial"), stack = T, flip = T, sort = F) + stat_summary(fun.y = mean, geom='point', size = 12, colour = "blue", shape = 95) + stat_summary(fun.y = median, geom='point', size = 12, colour = "black", shape = 95) + NoLegend()
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "qc/", "mp_vs_postmortem.signatures.pdf"), width = 10, height = 10)
+print(p)
+dev.off()
+
+
+p <- VlnPlot(seurat.obj.merged, group.by = "mp", features = c("malignant.factor", "neurons.factor", "vascular.factor", "glial.factor", "immune.factor"), stack = T, flip = T, sort = F) + stat_summary(fun.y = mean, geom='point', size = 12, colour = "blue", shape = 95) + stat_summary(fun.y = median, geom='point', size = 12, colour = "black", shape = 95) + NoLegend()
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "qc/", "mp_vs_celltype.factors.pdf"), width = 10, height = 10)
+print(p)
+dev.off()
+
+
+genes.of.interest <- c("SOX10", "OLIG2",  "PDGFRA", "BCAS1", "ASPA", "ENPP6", "OPALIN", "MBP", "MOG", "FGFR2", "FGFR1", "FGF1", "FGF2", "B2M", "HLA-A", "HLA-B", "HLA-C", "CD44", "VEGFA")
+p <- VlnPlot(seurat.obj.merged, group.by = "mp", features = c("heat.shock.signature", "percent.mt", "postmortem.sensitive", "postmortem.signature", "oligo.like", "reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific", genes.of.interest), stack = T, flip = T, sort = F) + stat_summary(fun.y = median, geom='point', size = 12, colour = "black", shape = 95) + NoLegend()
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "qc/", "mp_vs_signatures.pdf"), width = 14, height = 20)
+print(p)
+dev.off()
+
+
+
+
+
+for (y in c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific")) {
+  p <- ggplot(seurat.obj.merged@meta.data, aes(mp, .data[[y]], color = mp)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_point(position = position_jitter(width = 0.2), alpha = 0.1) +
+    facet_wrap(~sample.id) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+    scale_color_manual(breaks = mps, values = mps.palette)
+  pdf(paste0(results.dir, "Greenwald_2024_GBM/", "oligos/", "by_mp/", "mp_vs_", y, "_by_sample.pdf"), width = 18, height = 14)
+  print(p)
+  dev.off()
+}
+
+
+## Oligo signatures
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "oligos/", "reactive.oligo.signature.general_by_sample.pdf"), width = 30, height = 30)
+ST.FeaturePlot(seurat.obj.merged, features = c("reactive.oligo.general"), ncol = 5, pt.size = 1.5, label.by = "sample.id", palette = "Spectral")
+dev.off()
+
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "oligos/", "reactive.oligo.signature.non.tumor_by_sample.pdf"), width = 30, height = 30)
+ST.FeaturePlot(seurat.obj.merged, features = c("reactive.oligo.non.tumor"), ncol = 5, pt.size = 1.5, label.by = "sample.id", palette = "Spectral")
+dev.off()
+
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "oligos/", "reactive.oligo.signature.specific_by_sample.pdf"), width = 30, height = 30)
+ST.FeaturePlot(seurat.obj.merged, features = c("reactive.oligo.specific"), ncol = 5, pt.size = 1.5, label.by = "sample.id", palette = "Spectral")
+dev.off()
+
+
+## Genes of interest
+
+# remove genes with NA
+for (g in setdiff(genes.of.interest, c("SOX10", "OLIG2", "OPALIN", "MOG"))) {
+  pdf(paste0(results.dir, "Greenwald_2024_GBM/", "by_gene/", g, "_by_sample.pdf"), width = 30, height = 30)
+  ST.FeaturePlot(seurat.obj.merged, features = g, ncol = 5, pt.size = 1.5, label.by = "sample.id", palette = "Spectral")
+  dev.off()
+}
+
+
+## Jakel2019
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "oligos/", "jakel_2019/", "OPCs_by_sample.pdf"), width = 30, height = 30)
+ST.FeaturePlot(seurat.obj.merged, features = "OPCs", ncol = 5, pt.size = 1.5, label.by = "sample.id", palette = "Spectral")
+dev.off()
+
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "oligos/", "jakel_2019/", "COPs_by_sample.pdf"), width = 30, height = 30)
+ST.FeaturePlot(seurat.obj.merged, features = "COPs", ncol = 5, pt.size = 1.5, label.by = "sample.id", palette = "Spectral")
+dev.off()
+
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "oligos/", "jakel_2019/", "imOLG_by_sample.pdf"), width = 30, height = 30)
+ST.FeaturePlot(seurat.obj.merged, features = "imOLG", ncol = 5, pt.size = 1.5, label.by = "sample.id", palette = "Spectral")
+dev.off()
+
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "oligos/", "jakel_2019/", "Oligo1_by_sample.pdf"), width = 30, height = 30)
+ST.FeaturePlot(seurat.obj.merged, features = "Oligo1", ncol = 5, pt.size = 1.5, label.by = "sample.id", palette = "Spectral")
+dev.off()
+
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "oligos/", "jakel_2019/", "Oligo2_by_sample.pdf"), width = 30, height = 30)
+ST.FeaturePlot(seurat.obj.merged, features = "Oligo2", ncol = 5, pt.size = 1.5, label.by = "sample.id", palette = "Spectral")
+dev.off()
+
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "oligos/", "jakel_2019/", "Oligo3_by_sample.pdf"), width = 30, height = 30)
+ST.FeaturePlot(seurat.obj.merged, features = "Oligo3", ncol = 5, pt.size = 1.5, label.by = "sample.id", palette = "Spectral")
+dev.off()
+
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "oligos/", "jakel_2019/", "Oligo5_by_sample.pdf"), width = 30, height = 30)
+ST.FeaturePlot(seurat.obj.merged, features = "Oligo5", ncol = 5, pt.size = 1.5, label.by = "sample.id", palette = "Spectral")
+dev.off()
+
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "oligos/", "jakel_2019/", "Oligo6_by_sample.pdf"), width = 30, height = 30)
+ST.FeaturePlot(seurat.obj.merged, features = "Oligo6", ncol = 5, pt.size = 1.5, label.by = "sample.id", palette = "Spectral")
+dev.off()
+
+
+
+## Myelination
+for (f in names(myelination.signatures)) {
+  pdf(paste0(results.dir, "Greenwald_2024_GBM/", "myelination/", f, ".signature_by_sample.pdf"), width = 30, height = 30)
+  ST.FeaturePlot(seurat.obj.merged, features = f, ncol = 5, pt.size = 1.5, label.by = "sample.id", palette = "Spectral")
+  dev.off()
+}
+
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "myelination/", "myelin.genes_by_sample.pdf"), width = 30, height = 30)
+ST.FeaturePlot(seurat.obj.merged, features = c("myelin.genes"), ncol = 5, pt.size = 1.5, label.by = "sample.id", palette = "Spectral")
+dev.off()
+  
+
+
+
+##### only look at oligo spots #####
+oligo.df <- seurat.obj.merged@meta.data %>% filter(mp == "Oligo")
+
+
+## Signature by region
+oligo.w.region.df <- oligo.df %>% filter(!is.na(region))
+#my.comparisons <- list(c("nec", "T1"), c("nec", "inf"), c("T1", "inf")) # comparisons should be in order
+stat.test <- oligo.w.region.df %>% 
+  group_by(tumor) %>%
+  wilcox_test(reactive.oligo.general ~ region, alternative = "greater") %>% 
+  adjust_pvalue(method = "none") %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "region") 
+stat.test$pval.label <- apply(stat.test, 1, function(row) 
+  case_when(
+    row[["p.adj.signif"]] != "ns" ~ row[["p.adj.signif"]],
+    as.numeric(row[["p.adj"]]) < 0.1 ~ as.character(row[["p.adj"]]),
+    TRUE ~ NA
+  )
+)
+stat.test <- stat.test %>% filter(!is.na(pval.label))
+
+p <- ggplot(oligo.w.region.df, aes(region, reactive.oligo.general)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(alpha = 0.1, position = position_jitter()) + 
+  theme_bw() +
+  facet_wrap(~tumor) +
+  stat_pvalue_manual(stat.test, label = "pval.label")
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "oligos/", "oligos_only/", "region_vs_reactive.oligo.general_in_Oligo.mp.pdf"), width = 8, height = 8)
+print(p)
+dev.off()
+
+
+p <- ggplot(oligo.df, aes(layer, reactive.oligo.general)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(alpha = 0.1, position = position_jitter()) +
+  theme_bw() +
+  facet_wrap(~sample.id)
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "oligos/", "oligos_only/", "layer_vs_reactive.oligo.general_in_Oligo.mp.pdf"), width = 12, height = 12)
+print(p)
+dev.off()
+
+#my.comparisons <- list(c("PAN", "MVP"), c("PAN", "CT"), c("PAN", "LE"), c("MVP", "CT"), c("MVP", "LE"), c("CT", "LE"))
+# comparisons should be in order
+oligo.df$ivygap <- factor(oligo.df$ivygap, levels = c("LE", "CT", "MVP", "PAN"))
+stat.test <- oligo.df %>% 
+  group_by(sample.id) %>%
+  wilcox_test(reactive.oligo.general ~ ivygap, alternative = "less") %>% # comparisons = my.comparisons, 
+  adjust_pvalue(method = "none") %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "ivygap") 
+stat.test$pval.label <- apply(stat.test, 1, function(row) 
+  case_when(
+    row[["p.adj.signif"]] != "ns" ~ row[["p.adj.signif"]],
+    as.numeric(row[["p.adj"]]) < 0.1 ~ as.character(row[["p.adj"]]),
+    TRUE ~ NA
+  )
+)
+stat.test <- stat.test %>% filter(!is.na(pval.label))
+
+p <- ggplot(oligo.df, aes(ivygap, reactive.oligo.general)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(alpha = 0.1, position = position_jitter()) +
+  theme_bw() +
+  facet_wrap(~sample.id) +
+  stat_pvalue_manual(stat.test, label = "pval.label")
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "oligos/", "oligos_only/", "ivygap_vs_reactive.oligo.general_in_Oligo.mp.pdf"), width = 12, height = 12)
+print(p)
+dev.off()
+
+
+
+
+# FGF genes by mp
+# p <- VlnPlot(seurat.obj.merged, features = c("FGF1", "FGF2", "FGFR1", "FGFR2"), group.by = "mp", stack = T, flip = T)
+# pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "interactions/", "FGF_FGFR_expression_by_mp.pdf"), width = 10, height = 10)
+# print(p)
+# dev.off()
+```
+
+
+
+
+
+# Only oligodendrocytes
+
+```{r}
+seurat.obj.merged.oligo <- subset(seurat.obj.merged, subset = mp == "Oligo")
+
+
+## Oligo signatures
+
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "oligos/", "oligos_only/", "reactive.oligo.signature.general_by_sample.pdf"), width = 30, height = 30)
+ST.FeaturePlot(seurat.obj.merged.oligo, features = c("reactive.oligo.general"), ncol = 5, pt.size = 1.5, label.by = "sample.id", palette = "Spectral")
+dev.off()
+
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "oligos/", "oligos_only/", "reactive.oligo.signature.non.tumor_by_sample.pdf"), width = 30, height = 30)
+ST.FeaturePlot(seurat.obj.merged.oligo, features = c("reactive.oligo.non.tumor"), ncol = 5, pt.size = 1.5, label.by = "sample.id", palette = "Spectral")
+dev.off()
+
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "oligos/", "oligos_only/", "reactive.oligo.signature.specific_by_sample.pdf"), width = 30, height = 30)
+ST.FeaturePlot(seurat.obj.merged.oligo, features = c("reactive.oligo.specific"), ncol = 5, pt.size = 1.5, label.by = "sample.id", palette = "Spectral")
+dev.off()
+
+
+for (g in setdiff(genes.of.interest, c("SOX10", "OPALIN"))) {
+  pdf(paste0(results.dir, "Greenwald_2024_GBM/", "oligos/", "oligos_only/", g, "_by_sample.pdf"), width = 30, height = 30)
+  ST.FeaturePlot(seurat.obj.merged.oligo, features = c(g), ncol = 5, pt.size = 1.5, label.by = "sample.id", palette = "Spectral")
+  dev.off()
+}
+```
+
+
+
+# Fraction of cell types in neighborhood - sample level
+```{r, include=FALSE}
+
+all.samples.neighborhood.df <- data.frame()
+for (sample.id.use in samples) {
+  print(sample.id.use)
+  
+  # subsetting doesn't work for some reason so I have to recreate each sample object
+  sample.dir <- paste0(data.dir, "Greenwald_2024_GBM_Spatial/", "Inputs/", "general/", "GBM_data/", sample.id.use, "/", "outs/")
+  infoTable <- data.frame(samples = paste0(sample.dir, "filtered_feature_bc_matrix.h5"),
+             spotfiles = paste0(sample.dir, "spatial/", "tissue_positions_list.csv"),
+             imgs = paste0(sample.dir, "spatial/", "tissue_hires_image.png"),
+             json = paste0(sample.dir, "spatial/", "scalefactors_json.json"))
+  
+  seurat.obj <- InputFromTable(infotable = infoTable, platform = "Visium")
+  seurat.obj <- LoadImages(seurat.obj, time.resolve = FALSE, verbose = TRUE)
+  
+  # add metadata for sample
+  visium.metadata.df.sample <- visium.metadata.df %>% filter(sample == sample.id.use)
+  rownames(visium.metadata.df.sample) <- paste0(visium.metadata.df.sample$spot_id, "_1")
+  
+  seurat.obj <- AddMetaData(seurat.obj, visium.metadata.df.sample)
+  seurat.obj$mp <- seurat.obj$mp %>% sapply(function(x) ifelse(is.na(x), "Low quality", x))
+  
+  if (!("Oligo" %in% unique(seurat.obj$mp))) {
+    print("No oligos")
+    next
+  }
+  
+  seurat.obj <- SetIdent(seurat.obj, value = "mp")
+  
+  # neighbors (1-hop)
+  seurat.obj <- RegionNeighbours(seurat.obj, id = "Oligo", keep.within.id = T, verbose = T)
+  seurat.obj$nbs_Oligo <- sapply(seurat.obj$nbs_Oligo, function(x) case_when(
+    is.na(x) ~ "Other",
+    x == "nbs_Oligo" ~ "nbs_Oligo",
+    TRUE ~ "Other")
+  )
+  #table(seurat.obj$nbs_Oligo)
+  
+  # neighbors of neighbors (2-hop)
+  Idents(seurat.obj) <- "nbs_Oligo"
+  seurat.obj <- RegionNeighbours(seurat.obj, id = "nbs_Oligo", keep.within.id = T, verbose = T)
+  seurat.obj$nbs_nbs_Oligo <- sapply(seurat.obj$nbs_nbs_Oligo, function(x) case_when(
+    is.na(x) ~ "Other",
+    x == "nbs_nbs_Oligo" ~ "nbs_nbs_Oligo",
+    TRUE ~ "Other")
+  )
+  #table(seurat.obj$nbs_nbs_Oligo)
+  
+  #  3-hop
+  Idents(seurat.obj) <- "nbs_nbs_Oligo"
+  seurat.obj <- RegionNeighbours(seurat.obj, id = "nbs_nbs_Oligo", keep.within.id = T, verbose = T)
+  seurat.obj$nbs_nbs_nbs_Oligo <- sapply(seurat.obj$nbs_nbs_nbs_Oligo, function(x) case_when(
+    is.na(x) ~ "Other",
+    x == "nbs_nbs_nbs_Oligo" ~ "nbs_nbs_nbs_Oligo",
+    TRUE ~ "Other")
+  )
+  #table(seurat.obj$nbs_nbs_nbs_Oligo)
+  
+  seurat.obj$neighbor.annotation <- apply(seurat.obj@meta.data, 1, function(row) case_when(
+    row[["mp"]] == "Oligo" ~ "Oligo",
+    row[["nbs_Oligo"]] == "nbs_Oligo" ~ "nbs_Oligo",
+    row[["nbs_nbs_Oligo"]] == "nbs_nbs_Oligo" ~ "nbs_nbs_Oligo",
+    row[["nbs_nbs_nbs_Oligo"]] == "nbs_nbs_nbs_Oligo" ~ "nbs_nbs_nbs_Oligo",
+    TRUE ~ "Other"
+  ))
+
+  # plot oligos and neighbors
+  #FeatureOverlay(seurat.obj, features = "neighbor.annotation", sampleids = 1, cols = c("lightgrey", "blue", "green", "yellow", "red"), pt.size = 2)
+  
+  #oligos <- seurat.obj@meta.data %>% filter(neighbor.annotation %in% c("Oligo")) 
+  
+  if (n.hop == 1) {
+    oligo.nbs <- seurat.obj@meta.data %>% filter(neighbor.annotation %in% c("nbs_Oligo")) 
+  } else if (n.hop == 2) {
+    oligo.nbs <- seurat.obj@meta.data %>% filter(neighbor.annotation %in% c("nbs_Oligo", "nbs_nbs_Oligo"))
+  } else if (n.hop == 3) {
+    oligo.nbs <- seurat.obj@meta.data %>% filter(neighbor.annotation %in% c("nbs_Oligo", "nbs_nbs_Oligo", "nbs_nbs_nbs_Oligo"))
+  }
+  
+  neighbors.df <- data.frame(table(oligo.nbs$mp))
+  colnames(neighbors.df) <- c("celltype", "nbs_freq")
+  neighbors.df <- neighbors.df %>% filter(celltype != "Low quality") # remove low quality
+  
+  # add non-existant cell types in neighborhood with value 0
+  for (x in setdiff(all.cell.types, neighbors.df$celltype)) {
+    neighbors.df <- rbind(neighbors.df, data.frame(celltype = x, nbs_freq = 0))
+  }
+  num.neighbors <- sum(neighbors.df$nbs_freq)
+  neighbors.df$fraction.nbs <- round(neighbors.df$nbs_freq / sum(neighbors.df$nbs_freq), 3)
+  neighbors.df$nbs_freq = NULL
+  neighbors.df <- neighbors.df %>% pivot_wider(names_from = celltype, values_from = fraction.nbs)
+  neighbors.df$sample.id <- sample.id.use
+  neighbors.df$num.neighbors <- num.neighbors
+  
+  all.samples.neighborhood.df <- rbind(all.samples.neighborhood.df, neighbors.df)
+}
+
+write.table(all.samples.neighborhood.df, paste0(results.dir, "Greenwald_2024_GBM/", "spatial_analysis/", "n.hop=", n.hop, "_all.samples.neighborhood.df.tsv"), sep = "\t", quote = F, row.names = F)
+
+
+
+# combine neighrbohood data with signature enrichments in oligos
+seurat.obj.merged <- readRDS(paste0(processed.data.dir, "Greenwald_2024_GBM/", "Greenwald_2024_GBM_seurat.obj.merged.RDS"))
+seurat.obj.oligo <- subset(seurat.obj.merged, subset = mp == "Oligo")
+
+oligo.df <- seurat.obj.oligo@meta.data %>% 
+  group_by(sample.id) %>% 
+  dplyr::summarize(mean.reactive.oligo.general = mean(reactive.oligo.general),
+                   mean.reactive.oligo.non.tumor = mean(reactive.oligo.non.tumor),
+                   mean.reactive.oligo.specific = mean(reactive.oligo.specific),
+                   mean.hypoxia.signature = mean(hypoxia.signature),
+                   mean.apoptosis.signature = mean(apoptosis.signature),
+                   mean.acute.demyelination = mean(acute.demyelination),
+                   mean.acute.remyelination = mean(acute.remyelination)) %>%
+  ungroup()
+
+all.samples.neighborhood.original.df <- read.csv(paste0(results.dir, "Greenwald_2024_GBM/", "spatial_analysis/", "n.hop=", n.hop, "_all.samples.neighborhood.df.tsv"), sep = "\t")
+all.samples.neighborhood.df <- all.samples.neighborhood.original.df %>% filter(num.neighbors >= 10)
+all.samples.neighborhood.df$num.neighbors <- NULL
+all.samples.neighborhood.df <- all.samples.neighborhood.df %>% inner_join(oligo.df, by = "sample.id")
+
+
+
+data <- all.samples.neighborhood.df
+data$sample.id <- NULL
+data <- data[complete.cases(data), ] # remove rows with NAs
+data <- data[, colSums(data != 0) > 0] # remove columns with all zero
+
+cor.table <- cor(data)
+col_range <- colorRampPalette(c("blue", "white", "red"))(200)
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "sample_level/", "corrplot.pdf"), width = 10, height = 10)
+p <- corrplot(cor.table, 
+              order = "hclust", 
+              title="all samples",
+              mar = c(1, 1, 1, 1),
+              type = "full",
+              method = "color",
+              col = col_range,
+              tl.col = "black",
+              tl.srt = 45)
+dev.off()
+```
+
+
+
+
+# Fraction of cell types in neighborhood - cell level
+```{r, include=FALSE}
+malignant.mps <- c("AC", "Prolif.Metab", "OPC", "MES.Hyp", "MES.Ast", "MES", "Chromatin.Reg", "NPC")
+all.cell.types <- c(setdiff(all.cell.types, malignant.mps), "FGFpos GBM", "FGFneg GBM")
+
+
+compute.cell.level.neighborhood <- T
+
+if (compute.cell.level.neighborhood) {
+  
+  for (sample.id in samples) {
+    print(sample.id)
+    
+    sample.dir <- paste0(data.dir, "Greenwald_2024_GBM_Spatial/", "Inputs/", "general/", "GBM_data/", sample.id, "/", "outs/")
+    infoTable <- data.frame(samples = paste0(sample.dir, "filtered_feature_bc_matrix.h5"), 
+               spotfiles = paste0(sample.dir, "spatial/", "tissue_positions_list.csv"),
+               imgs = paste0(sample.dir, "spatial/", "tissue_hires_image.png"),
+               json = paste0(sample.dir, "spatial/", "scalefactors_json.json"))
+  
+    seurat.obj <- InputFromTable(infotable = infoTable, platform =  "Visium")
+    seurat.obj <- LoadImages(seurat.obj, time.resolve = FALSE, verbose = TRUE)
+    
+    visium.metadata.df.sample <- visium.metadata.df %>% filter(sample == sample.id)
+    rownames(visium.metadata.df.sample) <- paste0(visium.metadata.df.sample$spot_id, "_1")
+    
+    seurat.obj <- AddMetaData(seurat.obj, visium.metadata.df.sample)
+    
+    seurat.obj <- NormalizeData(seurat.obj)
+    data <- FetchData(seurat.obj, vars = c("FGF1", "FGF2"))
+    seurat.obj <- AddMetaData(seurat.obj, data)
+    
+    unique(seurat.obj$mp)
+    seurat.obj@meta.data <- seurat.obj@meta.data %>% mutate(mp = ifelse(mp %in% malignant.mps, ifelse(FGF1 + FGF2 > 0, "FGFpos GBM", "FGFneg GBM"), mp))
+    
+    if (!("Oligo" %in% unique(seurat.obj$mp))) {
+      print("No oligos")
+      next
+    }
+    
+    seurat.obj$mp <- seurat.obj$mp %>% sapply(function(x) ifelse(is.na(x), "Low quality", x))
+    seurat.obj$barcode <- colnames(seurat.obj)
+    Idents(seurat.obj) <- "barcode"
+    
+    oligo.barcodes <- seurat.obj@meta.data %>% filter(mp == "Oligo") %>% pull(barcode)
+    #oligo.barcodes <- sample(oligo.barcodes, min(length(oligo.barcodes), 50)) # sample to test
+    
+    seurat.obj.original <- seurat.obj
+    neighbors.df <- data.frame()
+  
+    for (barcode in oligo.barcodes) {
+      
+      seurat.obj <- seurat.obj.original
+      
+      # find direct neighbors of oligo spot (nhop = 1)
+      seurat.obj <- RegionNeighbours(seurat.obj, id = barcode, keep.within.id = T, verbose = F)
+      #table(seurat.obj@meta.data[[paste0("nbs_", barcode)]])
+      seurat.obj@meta.data[["nbs"]] <- sapply(seurat.obj@meta.data[[paste0("nbs_", barcode)]], function(x) case_when(
+        is.na(x) ~ "other",
+        x == paste0("nbs_", barcode) ~ "nbs",
+        TRUE ~ "other"
+      ))
+      #table(seurat.obj@meta.data[["nbs"]])
+      
+      #FeatureOverlay(seurat.obj, features = paste0("nbs_", barcode), sampleids = 1, pt.size = 2)
+      
+      # neighbors of neighbors (nhop = 2)
+      Idents(seurat.obj) <- "nbs"
+      seurat.obj <- RegionNeighbours(seurat.obj, id = "nbs", keep.within.id = T, verbose = F)
+      seurat.obj@meta.data[["nbs_nbs"]] <- sapply(seurat.obj@meta.data[["nbs_nbs"]], function(x) case_when(
+        is.na(x) ~ "other",
+        x == "nbs_nbs" ~ "nbs_nbs",
+        TRUE ~ "other"
+      ))
+      #table(seurat.obj@meta.data[["nbs_nbs"]])
+      
+      # nhop = 3
+      Idents(seurat.obj) <- "nbs_nbs"
+      seurat.obj <- RegionNeighbours(seurat.obj, id = "nbs_nbs", keep.within.id = T, verbose = F)
+      #table(seurat.obj@meta.data[["nbs_nbs_nbs"]])
+      seurat.obj@meta.data[["nbs_nbs_nbs"]] <- sapply(seurat.obj@meta.data[["nbs_nbs_nbs"]], function(x) case_when(
+        is.na(x) ~ "other",
+        x == "nbs_nbs_nbs" ~ "nbs_nbs_nbs",
+        TRUE ~ "other"
+      ))
+      #table(seurat.obj@meta.data[["nbs_nbs_nbs"]])
+      
+      
+      seurat.obj$neighbor.annotation <- apply(seurat.obj@meta.data, 1, function(row) case_when(
+        row[["barcode"]] == barcode ~ "barcode",
+        row[["nbs"]] == "nbs" ~ "nbs",
+        row[["nbs_nbs"]] == "nbs_nbs" ~ "nbs_nbs",
+        row[["nbs_nbs_nbs"]] == "nbs_nbs_nbs" ~ "nbs_nbs_nbs",
+        TRUE ~ "other"
+      ))
+      
+      # run below to QC specific oligo spot
+      #FeatureOverlay(seurat.obj, features = "neighbor.annotation", sampleids = 1, cols = c("lightgrey", "blue", "green", "yellow", "red"), pt.size = 2)
+      
+      if (n.hop == 1) {
+        oligo.barcode.nbs <- seurat.obj@meta.data %>% filter(neighbor.annotation %in% c("nbs")) 
+      } else if (n.hop == 2) {
+        oligo.barcode.nbs <- seurat.obj@meta.data %>% filter(neighbor.annotation %in% c("nbs", "nbs_nbs")) 
+      } else if (n.hop == 3) {
+        oligo.barcode.nbs <- seurat.obj@meta.data %>% filter(neighbor.annotation %in% c("nbs", "nbs_nbs", "nbs_nbs_nbs")) 
+      }
+      
+      barcode.nbs.df <- data.frame(table(oligo.barcode.nbs$mp))
+      
+      if (nrow(barcode.nbs.df) == 0) {
+        print("No neighbors, next")
+        next
+      }
+      
+      # filter low quality
+      barcode.nbs.df <- barcode.nbs.df %>% filter(Var1 != "Low quality")
+  
+      if (nrow(barcode.nbs.df) == 0) {
+        print("No high-quality neighbors, next")
+        next
+      }
+      
+      num.neighbors <- sum(barcode.nbs.df$Freq)
+      
+      for (x in setdiff(all.cell.types, barcode.nbs.df$Var1)) {
+        barcode.nbs.df <- rbind(barcode.nbs.df, data.frame(Var1 = x, Freq = 0))
+      }
+      
+      barcode.nbs.df$fraction <- round(barcode.nbs.df$Freq / num.neighbors, 3)
+      
+      barcode.nbs.df$barcode <- barcode
+      barcode.nbs.wider.df <- barcode.nbs.df %>% pivot_wider(id_cols = barcode, names_from = Var1, values_from = fraction)
+      barcode.nbs.wider.df$n.neighbors <- num.neighbors
+      
+      neighbors.df <- rbind(neighbors.df, barcode.nbs.wider.df)
+    }
+    
+    neighbors.df <- data.frame(neighbors.df)
+    neighbors.df$sample.id <- sample.id
+    
+    write.table(neighbors.df, paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", sample.id, "_neighborhood.tsv"), sep = "\t", row.names = T, col.names = T, quote = F)
+  }
+  
+  
+  # add neighbor info to seurat object
+  seurat.obj.merged <- readRDS(paste0(processed.data.dir, "Greenwald_2024_GBM/", "Greenwald_2024_GBM_seurat.obj.merged.RDS"))
+  
+  all.cell.types <- sort(unique(seurat.obj.merged$mp))
+  samples <- sort(unique(seurat.obj.merged$sample.id))
+  print(samples)
+  
+  seurat.obj.list <- list()
+  
+  for (sample.id.use in samples) {
+    print(sample.id.use)
+    
+    seurat.obj <- subset(seurat.obj.merged, subset = sample == sample.id.use)
+   
+    if ("Oligo" %ni% unique(seurat.obj$mp)) {
+      print("No oligodendrocytes")
+      next
+    }
+    
+    neighborhood.df <- read.csv(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", sample.id.use, "_neighborhood.tsv"), sep = "\t")
+    rownames(neighborhood.df) <- paste0(sample.id.use, "_", neighborhood.df$barcode)
+    seurat.obj <- AddMetaData(seurat.obj, neighborhood.df)
+    
+    seurat.obj.subset <- subset(seurat.obj, subset = mp == "Oligo")
+    
+    seurat.obj.subset <- add.module.score(seurat.obj.subset, gene.signatures)
+    seurat.obj.subset <- add.module.score(seurat.obj.subset, oligo.gene.signatures)
+    seurat.obj.subset <- add.module.score(seurat.obj.subset, oligo.jakel2019.signatures)
+    seurat.obj.subset <- add.module.score(seurat.obj.subset, myelination.signatures)
+    seurat.obj.subset <- add.module.score(seurat.obj.subset, gene.signatures.gsea)
+    seurat.obj.subset <- add.module.score(seurat.obj.subset, fgfr.gene.signatures)
+    
+    
+    seurat.obj.list[[sample.id.use]] <- seurat.obj.subset
+  }
+  
+  
+  seurat.obj.merged.neigborhood <- merge(seurat.obj.list[[1]], seurat.obj.list[2:length(seurat.obj.list)])
+  saveRDS(seurat.obj.merged.neigborhood, paste0(processed.data.dir, "Greenwald_2024_GBM/", "Greenwald_2024_GBM_oligodendrocytes.merged.w.neighborhood.metadata_n.hop=", n.hop, ".RDS"))
+  dim(seurat.obj.merged.neigborhood)
+}
+```
+
+
+
+# Linear model
+```{r}
+library(lme4)
+library(lmerTest)
+
+n.hop <- 3
+seurat.obj.merged.neigborhood <- readRDS(paste0(processed.data.dir, "Greenwald_2024_GBM/", "Greenwald_2024_GBM_oligodendrocytes.merged.w.neighborhood.metadata_n.hop=", n.hop, ".RDS"))
+seurat.obj.merged.neigborhood$filter <- is.na(seurat.obj.merged.neigborhood$Mac)
+table(seurat.obj.merged.neigborhood$filter)
+seurat.obj.merged.neigborhood <- subset(seurat.obj.merged.neigborhood, subset = filter == FALSE) # I think the neighborhood was low quality or no neighbors, TODO investigate
+dim(seurat.obj.merged.neigborhood)
+
+if (n.hop == 1) {
+  seurat.obj.merged.neigborhood <- subset(seurat.obj.merged.neigborhood, subset = n.neighbors >= 3)
+} else if (n.hop == 2) {
+  seurat.obj.merged.neigborhood <- subset(seurat.obj.merged.neigborhood, subset = n.neighbors >= 9)
+} else if (n.hop == 3) {
+  seurat.obj.merged.neigborhood <- subset(seurat.obj.merged.neigborhood, subset = n.neighbors >= 10)
+}
+
+dim(seurat.obj.merged.neigborhood)
+
+# oligo.df <- seurat.obj.merged.neigborhood@meta.data %>%
+#   filter(mp == "Oligo") %>%
+#   filter(!is.na(reactive.oligo.general)) %>%
+#   group_by(sample.id) %>%
+#   mutate(
+#     y = as.numeric(scale(reactive.oligo.general)),
+#     mes_z = as.numeric(scale(MES)),
+#     mac_z = as.numeric(scale(Mac)),
+#     hyp_z = as.numeric(scale(hypoxia.signature)) # spot-level hypoxia
+#   ) %>%
+#   ungroup()
+
+oligo.df <- seurat.obj.merged.neigborhood@meta.data %>%
+  filter(mp == "Oligo") %>%
+  filter(!is.na(reactive.oligo.general)) %>%
+  group_by(sample.id) %>%
+  mutate(
+    y = as.numeric(reactive.oligo.general),
+    mes = as.numeric(MES),
+    mac = as.numeric(Mac),
+    vasc = as.numeric(Vasc),
+    hyp = as.numeric(hypoxia.signature) # spot-level hypoxia
+  ) %>%
+  ungroup()
+
+
+model <- lmer(
+  y ~ mes * mac + vasc + hyp + (1 | sample.id),
+  data = oligo.df
+)
+
+summary(model)
+
+
+model <- lmer(
+  y ~ mes + mac + vasc + hyp + (1 | sample.id),
+  data = oligo.df
+)
+
+summary(model)
+```
+
+
+
+
+# Analyze neighborhood
+```{r}
+seurat.obj.merged.neigborhood <- readRDS(paste0(processed.data.dir, "Greenwald_2024_GBM/", "Greenwald_2024_GBM_oligodendrocytes.merged.w.neighborhood.metadata_n.hop=", n.hop, ".RDS"))
+seurat.obj.merged.neigborhood$filter <- is.na(seurat.obj.merged.neigborhood$Mac)
+table(seurat.obj.merged.neigborhood$filter)
+seurat.obj.merged.neigborhood <- subset(seurat.obj.merged.neigborhood, subset = filter == FALSE) # I think the neighborhood was low quality or no neighbors, TODO investigate
+dim(seurat.obj.merged.neigborhood)
+
+if (n.hop == 1) {
+  seurat.obj.merged.neigborhood <- subset(seurat.obj.merged.neigborhood, subset = n.neighbors >= 3)
+} else if (n.hop == 2) {
+  seurat.obj.merged.neigborhood <- subset(seurat.obj.merged.neigborhood, subset = n.neighbors >= 9)
+} else if (n.hop == 3) {
+  seurat.obj.merged.neigborhood <- subset(seurat.obj.merged.neigborhood, subset = n.neighbors >= 10)
+}
+
+dim(seurat.obj.merged.neigborhood)
+
+# Downsample
+
+# scale reactive oligo signature by sample in order to pool multiple samples together
+new.meta.data <- seurat.obj.merged.neigborhood@meta.data %>%
+  group_by(sample.id) %>%
+  mutate(reactive.oligo.general.scaled = reactive.oligo.general,
+         reactive.oligo.non.tumor.scaled = reactive.oligo.non.tumor,
+         reactive.oligo.specific.scaled = reactive.oligo.specific) %>%
+  ungroup() %>%
+  as.data.frame()
+rownames(new.meta.data) <- rownames(seurat.obj.merged.neigborhood@meta.data)
+seurat.obj.merged.neigborhood@meta.data <- new.meta.data
+
+
+
+
+# # scale reactive oligo signature by sample in order to pool multiple samples together
+# new.meta.data <- seurat.obj.merged.neigborhood@meta.data %>%
+#   group_by(sample.id) %>%
+#   mutate(reactive.oligo.general.scaled = as.numeric(scale(reactive.oligo.general)),
+#          reactive.oligo.non.tumor.scaled = as.numeric(scale(reactive.oligo.non.tumor)),
+#          reactive.oligo.specific.scaled = as.numeric(scale(reactive.oligo.specific))) %>%
+#   ungroup() %>%
+#   as.data.frame()
+# rownames(new.meta.data) <- rownames(seurat.obj.merged.neigborhood@meta.data)
+# seurat.obj.merged.neigborhood@meta.data <- new.meta.data
+
+
+
+seurat.obj.merged.neigborhood$ivygap <- factor(seurat.obj.merged.neigborhood$ivygap, levels = c("LE", "CT", "MVP", "PAN"))
+p <- ggplot(seurat.obj.merged.neigborhood@meta.data, aes(ivygap, reactive.oligo.general)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(alpha = 0.1, position = position_jitter(width = 0.2)) +
+  theme_bw() +
+  facet_wrap(~sample.id) +
+  stat_compare_means()
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "ivygap_vs_reactive.oligo.general_by_sample.id.pdf"), width = 20, height = 20)
+print(p)
+dev.off()
+
+
+seurat.obj.merged.neigborhood$total.Mac <- seurat.obj.merged.neigborhood$Mac + seurat.obj.merged.neigborhood$Inflammatory.Mac
+seurat.obj.merged.neigborhood$total.Mac.any <- seurat.obj.merged.neigborhood$Mac + seurat.obj.merged.neigborhood$Inflammatory.Mac
+seurat.obj.merged.neigborhood$total.MES <- seurat.obj.merged.neigborhood$MES + seurat.obj.merged.neigborhood$MES.Hyp
+seurat.obj.merged.neigborhood$total.MES.any <- seurat.obj.merged.neigborhood$MES + seurat.obj.merged.neigborhood$MES.Hyp + seurat.obj.merged.neigborhood$MES.Ast
+seurat.obj.merged.neigborhood$total.tumor <- seurat.obj.merged.neigborhood$MES + seurat.obj.merged.neigborhood$MES.Hyp + seurat.obj.merged.neigborhood$MES.Ast + seurat.obj.merged.neigborhood$AC + seurat.obj.merged.neigborhood$OPC + seurat.obj.merged.neigborhood$NPC + seurat.obj.merged.neigborhood$Chromatin.Reg + seurat.obj.merged.neigborhood$Prolif.Metab 
+seurat.obj.merged.neigborhood$any.tumor <- seurat.obj.merged.neigborhood$total.tumor > 0
+
+hist(seurat.obj.merged.neigborhood$total.Mac)
+hist(seurat.obj.merged.neigborhood$total.MES)
+
+mac.cutoff <- 0.1
+mes.cutoff <- 0.1
+
+seurat.obj.merged.neigborhood$neighborhood.annotation <- apply(seurat.obj.merged.neigborhood@meta.data, 1, function(row) case_when(
+  #as.numeric(row["total.tumor"]) == 0 ~ "No tumor",
+  as.numeric(row["total.MES"]) <= mes.cutoff && as.numeric(row["total.Mac"]) <= mac.cutoff ~ "None",
+  as.numeric(row["total.MES"]) > mes.cutoff && as.numeric(row["total.Mac"]) <= mac.cutoff ~ "MES only",
+  as.numeric(row["total.MES"]) <= mes.cutoff && as.numeric(row["total.Mac"]) > mac.cutoff ~ "Mac only", #   as.numeric(row["total.MES"]) > 0.2 && as.numeric(row["total.Mac"]) > 0.2 ~ "Both high",
+  as.numeric(row["total.MES"]) > mes.cutoff && as.numeric(row["total.Mac"]) > mac.cutoff ~ "Both",
+  TRUE ~ "Other"
+))
+
+seurat.obj.merged.neigborhood$neighborhood.annotation <- factor(seurat.obj.merged.neigborhood$neighborhood.annotation, levels = c("None", "Mac only", "MES only", "Both"))
+
+
+
+## Genes of interest
+features.data <- FetchData(seurat.obj.merged.neigborhood, vars = c("rna_OLIG2", "rna_SOX10", "rna_MBP", "rna_MOG", "rna_ASPA", "rna_BCAS1", "rna_PDGFRA", "rna_OPALIN", "rna_ENPP6", "rna_FGF2", "rna_FGF1", "rna_FGFR2", "rna_FGFR1", "rna_CD44", "rna_VEGFA", "rna_HLA-A", "rna_B2M",  "rna_KLK6", "rna_MKI67"))
+features.data[is.na(features.data)] <- 0
+seurat.obj.merged.neigborhood <- AddMetaData(seurat.obj.merged.neigborhood, features.data)
+
+
+
+
+##### reactive.oligo.general #####
+hypoxia.cutoff <- median(seurat.obj.merged.neigborhood$hypoxia.signature)
+seurat.obj.merged.neigborhood$hypoxia.level <- sapply(seurat.obj.merged.neigborhood$hypoxia.signature, function(x) ifelse(x > hypoxia.cutoff, "High", "Low"))
+
+
+for (y in c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific")) {
+  
+  print(y)
+  
+  y.min <- min(seurat.obj.merged.neigborhood@meta.data[[y]]) - 0.01
+  y.max <- max(seurat.obj.merged.neigborhood@meta.data[[y]]) + 0.01
+  
+  # split by hypoxia level
+  plot.list <- c()
+  for (s.id in sort(unique(seurat.obj.merged.neigborhood$sample.id))) {
+    for (hyp.level in c("Low", "High")) {
+      
+      temp <- seurat.obj.merged.neigborhood@meta.data %>% filter(sample.id == s.id, hypoxia.level == hyp.level)
+      if (nrow(temp) == 0) {
+        next
+      }
+      seurat.obj.merged.neigborhood.subset <- subset(seurat.obj.merged.neigborhood, subset = sample.id == s.id & hypoxia.level == hyp.level)
+      p <- ggplot(seurat.obj.merged.neigborhood.subset@meta.data, aes(neighborhood.annotation, .data[[y]], color = hypoxia.level)) + 
+        geom_boxplot(outlier.shape = NA) +
+        geom_point(alpha = 0.5, position = position_jitter(width = 0.2)) +
+        theme_bw() +
+        stat_compare_means(method = "kruskal.test", label.y.npc = "bottom") +
+        stat_compare_means(ref.group = "None", method.args = list(alternative = "greater"), label = "p.format") +
+        theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1), legend.position = "none") +
+        xlab("Neighborhood") +
+        ylab(y) + 
+        ggtitle(s.id, subtitle = paste0("Hypoxia level = ", hyp.level)) +
+        scale_color_manual(breaks = c("Low", "High"), values = c("#2E86AB", "#C0392B")) +
+        ylim(c(y.min, y.max))
+      plot.list[[paste(s.id, hyp.level)]] <- p
+    }
+  }
+  p <- plot_grid(plotlist = plot.list)
+  pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "neighborhood_vs_", y, "_by_hypoxia.level.pdf"), width = 30, height = 30)
+  print(p)
+  dev.off()
+  
+  
+  # not split by hypoxia level
+  plot.list <- c()
+  for (s.id in sort(unique(seurat.obj.merged.neigborhood$sample.id))) {
+    
+    temp <- seurat.obj.merged.neigborhood@meta.data %>% filter(sample.id == s.id)
+    if (nrow(temp) == 0) {
+      next
+    }
+    seurat.obj.merged.neigborhood.subset <- subset(seurat.obj.merged.neigborhood, subset = sample.id == s.id)
+    p <- ggplot(seurat.obj.merged.neigborhood.subset@meta.data, aes(neighborhood.annotation, .data[[y]])) + 
+      geom_boxplot(outlier.shape = NA) +
+      geom_point(alpha = 0.5, position = position_jitter(width = 0.2), fill = "#B76EB8", shape = 21) +
+      theme_bw() +
+      stat_compare_means(method = "kruskal.test", label.y.npc = "bottom") +
+      stat_compare_means(ref.group = "None", method.args = list(alternative = "greater"), label = "p.format") +
+      theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1), legend.position = "none") +
+      xlab("Neighborhood") +
+      ylab(y) + 
+      ggtitle(s.id) +
+      ylim(c(y.min, y.max))
+    plot.list[[paste(s.id, hyp.level)]] <- p
+  }
+  p <- plot_grid(plotlist = plot.list)
+  pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "neighborhood_vs_", y, ".pdf"), width = 30, height = 30)
+  print(p)
+  dev.off()
+}
+
+
+
+# Todo hypoxia vs signature
+
+
+
+
+
+##### demyelination #####
+y.min <- min(seurat.obj.merged.neigborhood@meta.data[["acute.demyelination"]]) - 0.01
+y.max <- max(seurat.obj.merged.neigborhood@meta.data[["acute.demyelination"]]) + 0.01
+  
+# split by hypoxia level
+plot.list <- c()
+for (s.id in sort(unique(seurat.obj.merged.neigborhood$sample.id))) {
+  for (hyp.level in c("Low", "High")) {
+    print(s.id)
+    print(hyp.level)
+    
+    temp <- seurat.obj.merged.neigborhood@meta.data %>% filter(sample.id == s.id, hypoxia.level == hyp.level)
+    if (nrow(temp) == 0) {
+      next
+    }
+    seurat.obj.merged.neigborhood.subset <- subset(seurat.obj.merged.neigborhood, subset = sample.id == s.id & hypoxia.level == hyp.level)
+    p <- ggplot(seurat.obj.merged.neigborhood.subset@meta.data, aes(neighborhood.annotation, acute.demyelination, color = hypoxia.level)) + 
+      geom_boxplot(outlier.shape = NA) +
+      geom_point(alpha = 0.5, position = position_jitter(width = 0.2)) +
+      theme_bw() +
+      stat_compare_means(method = "kruskal.test") +
+      theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1), legend.position = "none") +
+      xlab("Neighborhood") +
+      ylab("Demyelination signature") + 
+      ggtitle(s.id, subtitle = paste0("Hypoxia level = ", hyp.level)) +
+      scale_color_manual(breaks = c("Low", "High"), values = c("#2E86AB", "#C0392B")) +
+      ylim(c(y.min, y.max))
+    plot.list[[paste(s.id, hyp.level)]] <- p
+  }
+}
+p <- plot_grid(plotlist = plot.list)
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "neighborhood_vs_demyelination.signature_by_hypoxia.level.pdf"), width = 24, height = 24)
+print(p)
+dev.off()
+
+
+# not split by hypoxia level
+plot.list <- c()
+for (s.id in sort(unique(seurat.obj.merged.neigborhood$sample.id))) {
+  print(s.id)
+  
+  temp <- seurat.obj.merged.neigborhood@meta.data %>% filter(sample.id == s.id)
+  if (nrow(temp) == 0) {
+    next
+  }
+  seurat.obj.merged.neigborhood.subset <- subset(seurat.obj.merged.neigborhood, subset = sample.id == s.id)
+  p <- ggplot(seurat.obj.merged.neigborhood.subset@meta.data, aes(neighborhood.annotation, acute.demyelination)) + 
+    geom_boxplot(outlier.shape = NA) +
+    geom_point(alpha = 0.6, position = position_jitter(width = 0.2), fill = "#B76EB8", shape = 21) +
+    theme_bw() +
+    stat_compare_means(method = "kruskal.test") +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1), legend.position = "none") +
+    xlab("Neighborhood") +
+    ylab("Demyelination signature") + 
+    ggtitle(s.id) +
+    ylim(c(y.min, y.max))
+  plot.list[[paste(s.id, hyp.level)]] <- p
+}
+p <- plot_grid(plotlist = plot.list)
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "neighborhood_vs_demyelination.signature.pdf"), width = 20, height = 20)
+print(p)
+dev.off()
+
+```
+
+
+
+
+
+
+# Combining all samples
+```{r}
+
+Idents(seurat.obj.merged.neigborhood) <- "sample.id"
+seurat.obj.merged.neigborhood$downsample <- T
+set.seed(123)
+seurat.obj.merged.neigborhood <- subset(seurat.obj.merged.neigborhood, subset = downsample == T, downsample = 30)
+
+dir.create(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "markers/"))
+dir.create(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "markers/", "corrplot/"))
+
+## Oligo state markers
+
+# genes that have too much dropout, binary expression if > 0 or = 0
+seurat.obj.merged.neigborhood$ASPA.pos <- seurat.obj.merged.neigborhood$rna_ASPA > 0
+df <- seurat.obj.merged.neigborhood@meta.data %>% 
+  group_by(sample.id, any.tumor, ASPA.pos) %>% 
+  summarise(count = n()) %>%
+  mutate(fraction.ASPA.pos = count / sum(count))
+p <- ggplot(df, aes(any.tumor, fraction.ASPA.pos, fill = ASPA.pos)) +
+  geom_bar(position = "stack", stat = "identity") + 
+  theme_bw() +
+  facet_wrap(~sample.id)
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "markers/", "any.tumor_vs_ASPA.pos_by_sample.pdf"), width = 12, height = 10)
+print(p)
+dev.off()
+
+
+# genes that have too much dropout, binary expression if > 0 or = 0
+df <- seurat.obj.merged.neigborhood@meta.data %>% 
+  group_by(any.tumor, ASPA.pos) %>% 
+  summarise(count = n()) %>%
+  mutate(fraction.ASPA.pos = count / sum(count))
+p <- ggplot(df, aes(any.tumor, fraction.ASPA.pos, fill = ASPA.pos)) +
+  geom_bar(position = "stack", stat = "identity") + 
+  theme_bw()
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "markers/", "any.tumor_vs_ASPA.pos.pdf"), width = 8, height = 5)
+print(p)
+dev.off()
+
+
+p <- ggplot(seurat.obj.merged.neigborhood@meta.data, aes(any.tumor, rna_ASPA)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.2), alpha = 0.1) +
+  theme_bw() +
+  stat_compare_means(method.args = list(alternative = "less"), ref.group = "FALSE") +
+  facet_wrap(~sample.id)
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "markers/", "any.tumor_vs_MBP_by_sample.pdf"), width = 14, height = 14)
+print(p)
+dev.off()
+  
+p <- ggplot(seurat.obj.merged.neigborhood@meta.data, aes(any.tumor, rna_MBP)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.2)) +
+  theme_bw() +
+  stat_compare_means(method.args = list(alternative = "less"), ref.group = "FALSE")
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "markers/", "any.tumor_vs_MBP.pdf"), width = 8, height = 5)
+print(p)
+dev.off()
+
+
+
+## Correlations of variables
+meta <- seurat.obj.merged.neigborhood@meta.data
+numeric_meta <- meta[, sapply(meta, is.numeric)]
+numeric_meta <- numeric_meta[, setdiff(colnames(numeric_meta), "Low.quality")]
+
+#cor_matrix <- cor(numeric_meta, use = "pairwise.complete.obs", method = "spearman")
+
+cor_results <- Hmisc::rcorr(as.matrix(numeric_meta), type = "spearman")
+
+cor_matrix <- cor_results$r      # correlation coefficients
+p_matrix   <- cor_results$P      # p-values
+
+col_range <- colorRampPalette(c("blue", "white", "red"))(200)
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "markers/", "corrplot/", "corrplot_all.pdf"), width = 20, height = 20)
+p <- corrplot(cor_matrix, 
+              order = "hclust", 
+              title="all samples",
+              mar = c(1, 1, 1, 1),
+              type = "full",
+              method = "color",
+              col = col_range,
+              tl.col = "black",
+              tl.srt = 45,
+              tl.cex = 0.6,
+              addrect=6)
+dev.off()
+
+cor_matrix.df <- data.frame(cor_matrix)
+cor_matrix.df %>% dplyr::select(reactive.oligo.specific) %>% arrange(desc(reactive.oligo.specific))
+
+p_matrix.df <- data.frame(p_matrix)
+p_matrix.df %>% dplyr::select(reactive.oligo.specific) %>% arrange(reactive.oligo.specific)
+
+
+
+# just neighborhood vars
+meta <- seurat.obj.merged.neigborhood@meta.data
+vars.of.interest <- c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific", setdiff(all.cell.types, "Low.quality"))
+
+setdiff(vars.of.interest, colnames(meta))
+
+numeric_meta <- meta[, vars.of.interest]
+numeric_meta <- numeric_meta[, sapply(numeric_meta, is.numeric)]
+numeric_meta <- numeric_meta[, colSums(numeric_meta != 0) > 0]
+
+cor_results <- Hmisc::rcorr(as.matrix(numeric_meta), type = "spearman")
+
+cor_matrix <- cor_results$r      # correlation coefficients
+p_matrix   <- cor_results$P      # p-values
+
+col_range <- colorRampPalette(c("blue", "white", "red"))(200)
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "markers/", "corrplot/", "corrplot_neighborhood.pdf"), width = 10, height = 10)
+p <- corrplot(cor_matrix, 
+              order = "hclust", 
+              title="all samples",
+              mar = c(1, 1, 1, 1),
+              type = "full",
+              method = "color",
+              col = col_range,
+              tl.col = "black",
+              tl.srt = 45,
+              tl.cex = 0.6,
+              addrect=6)
+dev.off()
+  
+
+
+
+
+meta <- seurat.obj.merged.neigborhood@meta.data
+
+# vars.of.interest <- c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific", names(oligo.jakel2019.signatures), "acute.demyelination", "acute.remyelination", setdiff(all.cell.types, "Low.quality"), "myelin.genes", "total.tumor", "n.neighbors", "nCount_RNA", "nFeature_RNA", "percent.mt", "mes1_sig.22", "mes2_sig.23", "ac_sig.21", "npc1_sig.24", "npc2_sig.25", "opc_sig.26", "rna_FGF1", "rna_FGF2", "rna_FGFR1", "rna_FGFR2", "rna_MBP", "rna_MOG", "rna_B2M", "rna_HLA-A", "rna_CD44", "rna_VEGFA", "rna_MKI67", "rna_ASPA", "rna_BCAS1", "rna_PDGFRA", "rna_SOX10", "rna_OLIG2", "rna_ENPP6", "rna_OPALIN") # names(gene.signatures.gsea)
+
+vars.of.interest <- c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific", names(oligo.jakel2019.signatures), names(myelination.signatures), names(gene.signatures.gsea), setdiff(all.cell.types, "Low.quality"), "mes1_sig.22", "mes2_sig.23", "ac_sig.21", "npc1_sig.24", "npc2_sig.25", "opc_sig.26", "rna_FGF1", "rna_FGF2", "rna_FGFR1", "rna_FGFR2", "rna_MBP", "rna_MOG", "rna_B2M", "rna_HLA-A", "rna_CD44", "rna_VEGFA", "rna_MKI67", "rna_ASPA", "rna_BCAS1", "rna_PDGFRA", "rna_SOX10", "rna_OLIG2", "rna_ENPP6", "rna_OPALIN") 
+
+
+setdiff(vars.of.interest, colnames(meta))
+
+numeric_meta <- meta[, vars.of.interest]
+numeric_meta <- numeric_meta[, sapply(numeric_meta, is.numeric)]
+numeric_meta <- numeric_meta[, colSums(numeric_meta != 0) > 0]
+
+cor_results <- Hmisc::rcorr(as.matrix(numeric_meta), type = "spearman")
+
+cor_matrix <- cor_results$r      # correlation coefficients
+p_matrix   <- cor_results$P      # p-values
+
+col_range <- colorRampPalette(c("blue", "white", "red"))(200)
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "markers/", "corrplot/", "corrplot_priority.pdf"), width = 10, height = 10)
+p <- corrplot(cor_matrix, 
+              order = "hclust", 
+              title="all samples",
+              mar = c(1, 1, 1, 1),
+              type = "full",
+              method = "color",
+              col = col_range,
+              tl.col = "black",
+              tl.srt = 45,
+              tl.cex = 0.6,
+              addrect=6)
+dev.off()
+  
+  
+
+# select variables
+for (y in c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific")) {
+  meta <- seurat.obj.merged.neigborhood@meta.data
+  
+  numeric_meta <- meta[, vars.of.interest]
+  numeric_meta <- numeric_meta[, colSums(numeric_meta != 0) > 0]
+  
+  #cor_matrix <- cor(numeric_meta, use = "pairwise.complete.obs", method = "spearman")
+  
+  
+  
+  # "AC"               "Chromatin.Reg"    "Inflammatory.Mac" "Mac"              "MES"              "MES.Ast"          "MES.Hyp"          "Neuron"           "NPC"              "Oligo"           
+  # "OPC"              "Prolif.Metab"     "Reactive.Ast"     "Vasc"   
+  
+  cor_results <- Hmisc::rcorr(as.matrix(numeric_meta), type = "spearman")
+  
+  cor_matrix <- cor_results$r      # correlation coefficients
+  p_matrix   <- cor_results$P      # p-values
+  
+  col_range <- colorRampPalette(c("blue", "white", "red"))(200)
+  pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "markers/", "corrplot/", "corrplot_w_", y, ".pdf"), width = 10, height = 10)
+  p <- corrplot(cor_matrix, 
+                order = "hclust", 
+                title="all samples",
+                mar = c(1, 1, 1, 1),
+                type = "full",
+                method = "color",
+                col = col_range,
+                tl.col = "black",
+                tl.srt = 45,
+                tl.cex = 0.6,
+                addrect=5)
+  dev.off()
+}
+
+
+seurat.obj.merged.neigborhood$org2 <- factor(seurat.obj.merged.neigborhood$org2, levels = c("dis_norm", "st_norm", "Intermediate", "dis_mal", "st_mal"))
+#for (y in c("reactive.oligo.general.scaled", "reactive.oligo.non.tumor.scaled", "reactive.oligo.specific.scaled")) {
+for (y in c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific")) {
+  
+  seurat.obj.merged.neigborhood$y <- seurat.obj.merged.neigborhood@meta.data[[y]]
+  
+  stat.test <- seurat.obj.merged.neigborhood@meta.data %>%
+    wilcox_test(y ~ neighborhood.annotation, ref.group = "None", alternative = "less") %>%
+    adjust_pvalue(method = "fdr") %>%
+    add_significance("p.adj") %>%
+    add_xy_position(x = "neighborhood.annotation") 
+
+  p <- ggplot(seurat.obj.merged.neigborhood@meta.data, aes(neighborhood.annotation, y)) + 
+    geom_boxplot(outlier.shape = NA) +
+    geom_point(alpha = 0.6, position = position_jitter(width = 0.2), fill = "#B76EB8", shape = 21) +
+    theme_bw() +
+    xlab("Neighborhood") +
+    ylab("Reactive oligodendrocyte signature") +
+    stat_pvalue_manual(stat.test, label = "p.adj")
+  pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "neighborhood_vs_", y, "_combined.pdf"), width = 8, height = 5)
+  print(p)
+  dev.off()
+  
+  p <- ggplot(seurat.obj.merged.neigborhood@meta.data, aes(org2, y)) + 
+    geom_boxplot(outlier.shape = NA) +
+    geom_point(alpha = 0.6, position = position_jitter(width = 0.2), fill = "#B76EB8", shape = 21) +
+    theme_bw() +
+    stat_compare_means(ref.group = "dis_norm", label = "p.format") +
+    stat_compare_means(method = "kruskal.test") +
+    ylab(y)
+  pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", "org2_vs_", y, "_combined.pdf"), width = 8, height = 5)
+  print(p)
+  dev.off()
+  
+  p <- ggplot(seurat.obj.merged.neigborhood@meta.data, aes(ivygap, y)) + 
+    geom_boxplot(outlier.shape = NA) +
+    geom_point(alpha = 0.6, position = position_jitter(width = 0.2), fill = "#B76EB8", shape = 21) +
+    theme_bw() +
+    stat_compare_means(ref.group = "LE", label = "p.format") +
+    stat_compare_means(method = "kruskal.test") +
+    ylab(y)
+  pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", "org2_vs_", y, "_combined.pdf"), width = 8, height = 5)
+  print(p)
+  dev.off()
+  
+}
+
+
+## by hypoxia
+hypoxia.cutoff <- median(seurat.obj.merged.neigborhood$hypoxia.signature)
+seurat.obj.merged.neigborhood$hypoxia.level <- sapply(seurat.obj.merged.neigborhood$hypoxia.signature, function(x) ifelse(x > hypoxia.cutoff, "High", "Low"))
+
+#for (y in c("reactive.oligo.general.scaled", "reactive.oligo.non.tumor.scaled", "reactive.oligo.specific.scaled")) {
+for (y in c("reactive.oligo.general")) {
+  
+  for (hypoxia.level.use in c("Low", "High")) {
+    seurat.obj.merged.neigborhood.subset <- subset(seurat.obj.merged.neigborhood, subset = hypoxia.level == hypoxia.level.use)
+    seurat.obj.merged.neigborhood.subset$y <- seurat.obj.merged.neigborhood.subset@meta.data[[y]]
+  
+    stat.test <- seurat.obj.merged.neigborhood.subset@meta.data %>%
+      wilcox_test(y ~ neighborhood.annotation, ref.group = "None", alternative = "less") %>%
+      adjust_pvalue(method = "fdr") %>%
+      add_significance("p.adj") %>%
+      add_xy_position(x = "neighborhood.annotation") 
+  
+    p <- ggplot(seurat.obj.merged.neigborhood.subset@meta.data, aes(neighborhood.annotation, y)) + 
+      geom_boxplot(outlier.shape = NA) +
+      geom_point(alpha = 0.6, position = position_jitter(width = 0.2), fill = "#B76EB8", shape = 21) +
+      theme_bw() +
+      xlab("Neighborhood") +
+      ylab("Reactive oligodendrocyte signature") +
+      stat_pvalue_manual(stat.test, label = "p.adj") +
+      ggtitle(paste0("Hypoxia = ", hypoxia.level.use)) +
+      ylim(c(-0.3, 0.7))
+    pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "neighborhood_vs_", y, "_combined_hypoxia.level=", hypoxia.level.use, ".pdf"), width = 8, height = 5)
+    print(p)
+    dev.off()
+  }
+}
+
+p <- ggplot(seurat.obj.merged.neigborhood@meta.data, aes(hypoxia.signature, reactive.oligo.general.scaled)) +
+  geom_point(alpha = 0.6, fill = "#B76EB8", shape = 21) +
+  stat_cor(method = "pearson") +
+  theme_bw() +
+  geom_smooth(method="lm")
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "hypoxia.signature_vs_reactive.oligo.general.scaled_combined.pdf"), width = 7, height = 5)
+print(p)
+dev.off()
+
+p <- ggplot(seurat.obj.merged.neigborhood@meta.data, aes(hypoxia.signature, reactive.oligo.general)) +
+  geom_point(alpha = 0.6, fill = "#B76EB8", shape = 21) +
+  stat_cor(method = "pearson") +
+  theme_bw() +
+  geom_smooth(method="lm") +
+  facet_wrap(~sample.id)
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "hypoxia.signature_vs_reactive.oligo.general.scaled_combined_by_sample.pdf"), width = 20, height = 20)
+print(p)
+dev.off()
+
+
+
+
+# demyelination signature
+stat.test <- seurat.obj.merged.neigborhood@meta.data %>%
+  wilcox_test(acute.demyelination ~ neighborhood.annotation, ref.group = "None", alternative = "greater") %>%
+  adjust_pvalue(method = "fdr") %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "neighborhood.annotation") 
+
+p <- ggplot(seurat.obj.merged.neigborhood@meta.data, aes(neighborhood.annotation, acute.demyelination)) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(alpha = 0.6, position = position_jitter(width = 0.2), fill = "#B76EB8", shape = 21) +
+  theme_bw() +
+  xlab("Neighborhood") +
+  ylab("Demyelination signature") +
+  stat_pvalue_manual(stat.test, label = "p.adj")
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "neighborhood_vs_demyelination.signature_combined.pdf"), width = 8, height = 5)
+print(p)
+dev.off()
+
+
+p <- ggplot(seurat.obj.merged.neigborhood@meta.data, aes(org2, acute.demyelination)) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(alpha = 0.6, position = position_jitter(width = 0.2), fill = "#B76EB8", shape = 21) +
+  theme_bw() +
+  stat_compare_means(method = "kruskal.test") +
+  xlab("Neighborhood") +
+  ylab("Demyelination signature")
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", "org2_vs_demyelination.signature_combined.pdf"), width = 8, height = 5)
+print(p)
+dev.off()
+
+
+
+
+
+# corrplot - spot level, all samples
+dir.create(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "corrplots/"))
+dir.create(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "models/"))
+
+
+data <- seurat.obj.merged.neigborhood@meta.data
+data <- data %>% dplyr::select(reactive.oligo.general, inflammatory.signature, hypoxia.signature, all_of(setdiff(all.cell.types, "Low.quality")))
+data <- data[complete.cases(data), ] # remove rows with NAs
+data <- data[, colSums(data != 0) > 0] # remove columns with all zero
+
+data <- data %>%
+  dplyr::rename(`Reactive oligodendrocyte signature` = reactive.oligo.general,
+         `Hypoxia signature` = hypoxia.signature,
+         `Inflammatory signature` = inflammatory.signature)
+
+# correlation plot
+res <- Hmisc::rcorr(as.matrix(data), type = "pearson")
+cor.table <- res$r
+p.mat     <- res$P
+p.mat[is.na(p.mat)] <- 1
+  
+col_range <- colorRampPalette(c("blue", "white", "red"))(200)
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "corrplots/", "all.samples.spot.level_corrplot.pdf"), width = 10, height = 10)
+corrplot(
+  cor.table,
+  order = "hclust",
+  hclust.method = "average",
+  type = "upper",
+  method = "color",
+  col = col_range,
+  tl.col = "black",
+  tl.srt = 45,
+  p.mat = p.mat,
+  sig.level = c(0.001, 0.01, 0.05),
+  insig = "label_sig",
+  pch.col = "black",
+  pch.cex = 1.2
+)
+text(x = 21, y = 10, labels = "Pearson's correlation", 
+ srt = 270, xpd = TRUE, cex = 1.2)
+dev.off()
+  
+
+
+
+##### TODO check if there's info before or after treatment #####
+# From Alissa: aug 12, 2025, email
+#All of the samples are from the initial resection with the exception of one of the IDH mutant samples which was a recurrence (BWH24).
+df <- seurat.obj.merged.neigborhood@meta.data
+df$sample.id <- factor(df$sample.id, levels = sort(unique(df$sample.id))) 
+
+
+# sample level analysis
+for (sample.id.use in unique(df$sample.id)) {
+  print(sample.id.use)
+  data <- df %>% filter(sample.id == sample.id.use)
+  data <- data %>% dplyr::select(reactive.oligo.general, inflammatory.signature, hypoxia.signature, all_of(setdiff(all.cell.types, "Low.quality")))
+  data$sample.id <- NULL
+  data <- data[complete.cases(data), ] # remove rows with NAs
+  data <- data[, colSums(data != 0) > 0] # remove columns with all zero
+  
+  
+  # correlation plot
+  cor.table <- cor(data)
+  col_range <- colorRampPalette(c("blue", "white", "red"))(200)
+  pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "corrplots/", sample.id.use, "_corrplot.pdf"), width = 10, height = 10)
+  p <- corrplot(cor.table, 
+                order = "hclust", 
+                title=sample.id.use,
+                mar = c(1, 1, 1, 1),
+                type = "full",
+                method = "color",
+                col = col_range,
+                tl.col = "black",
+                tl.srt = 45)
+  dev.off()
+}
+
+stop()
+```
+
+
+
+# Ligand-receptor
+```{r}
+n.hop <- 1
+seurat.obj.merged <- readRDS(paste0(processed.data.dir, "Greenwald_2024_GBM/", "Greenwald_2024_GBM_seurat.obj.merged.RDS"))
+seurat.obj.merged.oligo <- readRDS(paste0(processed.data.dir, "Greenwald_2024_GBM/", "Greenwald_2024_GBM_oligodendrocytes.merged.w.neighborhood.metadata_n.hop=", n.hop, ".RDS"))
+
+
+if (n.hop == 1) {
+  seurat.obj.merged.oligo <- subset(seurat.obj.merged.oligo, subset = n.neighbors >= 3)
+} else if (n.hop == 2) {
+  seurat.obj.merged.oligo <- subset(seurat.obj.merged.oligo, subset = n.neighbors >= 9)
+}
+
+all.cell.types <- sort(unique(seurat.obj.merged$mp))
+
+
+
+# add ligand receptor data
+features.data <- FetchData(seurat.obj.merged, vars = c("FGFR1", "FGFR2", "FGF2", "CD47", "SIRPA", "CD44"))
+seurat.obj.merged <- AddMetaData(seurat.obj.merged, features.data)
+seurat.obj.merged.oligo <- AddMetaData(seurat.obj.merged.oligo, features.data)
+
+
+seurat.obj.merged.oligo$MES.total <- seurat.obj.merged.oligo$MES + seurat.obj.merged.oligo$MES.Ast  + seurat.obj.merged.oligo$MES.Hyp
+mes.threshold <- 0
+seurat.obj.merged.oligo$MES.level <- sapply(seurat.obj.merged.oligo$MES.total, function(x) ifelse(x <= mes.threshold, "Low", "High"))
+seurat.obj.merged.oligo$MES.level <- factor(seurat.obj.merged.oligo$MES.level, levels = c("Low", "High"))
+
+# TODO x = FGF2 expressing MES
+# sample level FGF2 mes vs FGFR2 in oligodendrocytes
+
+# ligand receptor expression
+p <- ggplot(seurat.obj.merged.oligo@meta.data, aes(MES.level, FGFR2)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(alpha = 0.2, position=position_jitter()) +
+  theme_bw() +
+  facet_wrap(~sample.id) +
+  stat_compare_means() +
+  ylab("FGFR2 in oligodendrocytes")
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "interactions/", "FGFR2_expression_by_mes_threshold=", mes.threshold, ".pdf"), width = 14, height = 14)
+print(p)
+dev.off()
+
+# binarize FGFR2 - or +
+
+
+# mes level vs FGFR2 expression
+p <- ggplot(seurat.obj.merged.oligo@meta.data, aes(MES.total, FGFR2)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method='lm') +
+  theme_bw() +
+  facet_wrap(~sample.id)
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "interactions/", "FGFR2_expression_by_mes_fraction.pdf"), width = 14, height = 14)
+print(p)
+dev.off()
+
+
+p <- ggplot(seurat.obj.merged.oligo@meta.data, aes(oligo.like, FGFR2)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method='lm') +
+  theme_bw() +
+  facet_wrap(~sample.id)
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "interactions/", "reactive.oligo.sig_vs_FGFR2.expression.pdf"), width = 14, height = 14)
+print(p)
+dev.off() 
+
+  
+# to do split by sample
+p <- VlnPlot(seurat.obj.merged, features = c("FGF1", "FGF2", "FGFR1", "FGFR2"), group.by = "mp", stack = T, flip = T)
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "interactions/", "FGF_FGFR_expression_by_mp.pdf"), width = 10, height = 10)
+print(p)
+dev.off()
+
+
+# ligand receptor expression spatial
+seurat.obj.oligo.mes <- SubsetSTData(seurat.obj.merged, expression = mp %in% c("Oligo", "MES", "MES.Ast", "MES.Hyp"))
+#seurat.obj.oligo.mes <- SubsetSTData(seurat.obj.merged, expression = mp %in% unique(seurat.obj.merged$mp))
+seurat.obj.oligo.mes$ligand.receptor.expression <- apply(seurat.obj.oligo.mes@meta.data, 1, function(row) case_when(
+  row['mp'] == "Oligo" ~ as.numeric(row['FGFR2']),
+  row['mp'] %in% c("MES", "MES.Ast", "MES.Hyp") ~ -as.numeric(row['FGF2']),
+  TRUE ~ NA
+))
+
+hist(seurat.obj.oligo.mes$ligand.receptor.expression)
+
+feature.color.scale <- scale_fill_gradient2(
+  low = "blue", 
+  mid = "white", 
+  high = "red",
+  midpoint = 0,
+  limits = c(-4, 4),
+  na.value = "grey70"
+)
+
+# red is FGFR2, blue is FGF2, grey is not oligo or mes
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "interactions/", "FGF2_MES_to_FGFR2_Oligo.pdf"), width = 20, height = 20)
+ST.FeaturePlot(seurat.obj.oligo.mes, features = "ligand.receptor.expression", ncol = 5, min.cutoff = -4, max.cutoff = 4, pt.size = 1, label.by = "sample.id") + feature.color.scale
+dev.off()
+
+
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "interactions/", "FGF2_SpatialFeaturePlot.pdf"), width = 20, height = 20)
+ST.FeaturePlot(seurat.obj.merged, features = "FGF2", cols = c("grey90", "blue"), ncol = 5, min.cutoff = -4, max.cutoff = 4, pt.size = 1, label.by = "sample.id")
+dev.off() # change FGF2 to blue
+
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "interactions/", "FGFR2_SpatialFeaturePlot.pdf"), width = 20, height = 20)
+ST.FeaturePlot(seurat.obj.merged, features = "FGFR2", cols = c("grey90", "red"), ncol = 5, min.cutoff = -4, max.cutoff = 4, pt.size = 1, label.by = "sample.id")
+dev.off()
+
+# correlation of fgf2 and fgfr2
+p <- ggplot(seurat.obj.merged@meta.data, aes(FGF2, FGFR2)) +
+  geom_point(alpha = 0.5) +
+  facet_wrap(~sample.id) +
+  theme_bw()
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "interactions/", "FGF2_FGFR2_correlation.pdf"), width = 10, height = 10)
+print(p)
+dev.off()
+
+# correlation of fgf2 and fgfr1
+p <- ggplot(seurat.obj.merged@meta.data, aes(FGF2, FGFR1)) +
+  geom_point(alpha = 0.5) +
+  facet_wrap(~sample.id) +
+  theme_bw()
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "neighborhood_analysis/", n.hop, "_hop/", "interactions/", "FGF2_FGFR1_correlation.pdf"), width = 10, height = 10)
+print(p)
+dev.off()
+```
+
+
+
+
+# CODEX
+```{r}
+codex.cells <- readRDS(paste0(data.dir, "Greenwald_2024_GBM_Spatial/", "Inputs/", "Codex/", "cells_table.RDS"))
+dim(codex.cells)
+table(codex.cells$cell_type_final)
+
+codex.cells.oligos <- codex.cells %>% filter(cell_type_final == "oligo")
+table(codex.cells.oligos$malignant)
+
+
+codex.markers <- readRDS(paste0(data.dir, "Greenwald_2024_GBM_Spatial/", "Inputs/", "Codex/", "marker.RDS"))
+codex.markers
+
+
+intersect(reactive.oligo.filter.df$gene, codex.markers)
+
+
+codex.matrix <- readRDS(paste0(data.dir, "Greenwald_2024_GBM_Spatial/", "Inputs/", "Codex/", "mat_norm.RDS"))
+dim(codex.matrix)
+rownames(codex.matrix)
+new.colnames <- sapply(colnames(codex.matrix), function(x) str_replace(x, "ZH811", "ZH881")) # probably a typo because doesn't match codex.cells
+colnames(codex.matrix) <- new.colnames
+
+length(intersect(colnames(codex.matrix), codex.cells$cell_name))
+
+
+codex.matrix.oligos <- codex.matrix[, codex.cells.oligos$cell_name]
+dim(codex.matrix.oligos)
+
+
+codex.expression.df <- codex.matrix.oligos %>% t() %>% data.frame()
+codex.expression.df$cell_name <- rownames(codex.expression.df)
+
+oligo.df <- inner_join(codex.expression.df, codex.cells.oligos, by = "cell_name")
+colnames(oligo.df)
+
+#"cell_name"        "centroid_x"       "centroid_y"       "cell_type_final" 
+# "cell_type_visium" "cell_id"          "ivygap"           "sample"           "region"           "cell_type_figure" "spot_name"        "cell_type_tidy"   "layer"            "malignant"  
+
+
+oligo.df$region <- factor(oligo.df$region, levels = c("bulk", "NEC", "T1", "INF"))
+unique(oligo.df$ivygap)
+oligo.df$ivygap <- factor(oligo.df$ivygap, levels = c("LE", "infiltrating", "cellular_tumor", "MVP", "necrosis", "unspecified"))
+
+
+p <- ggplot(oligo.df %>% filter(ivygap != "unspecified"), aes(ivygap, PLP1)) +
+  geom_boxplot() + 
+  theme_bw() +
+  stat_compare_means(ref.group = "infiltrating", method.args = list(alternative = "less"))
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "codex/", "ivygap_vs_PLP1.pdf"), width = 7, height = 5)
+print(p)
+dev.off()
+
+
+p <- ggplot(oligo.df %>% filter(ivygap != "unspecified"), aes(ivygap, PLP1)) +
+  geom_boxplot() + 
+  theme_bw() +
+  facet_wrap(~sample) +
+  stat_compare_means(ref.group = "infiltrating", method.args = list(alternative = "less"))
+pdf(paste0(results.dir, "Greenwald_2024_GBM/", "codex/", "ivygap_vs_PLP1_by_sample.pdf"), width = 24, height = 12)
+print(p)
+dev.off()
+
+
+ggplot(oligo.df, aes(sample, PLP1)) +
+  geom_boxplot() + 
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+

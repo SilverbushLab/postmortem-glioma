@@ -1,0 +1,2466 @@
+---
+title: "analyze_visiumHD_data_segmented.RMD"
+output: html_document
+date: "2026-07-06"
+---
+
+
+
+# Setup
+```{r}
+library(infercnv)
+library(RColorBrewer)
+library(readxl)
+library(sf)
+library(corrplot)
+library(png) 
+library(grid)
+library(terra)
+library(FNN)
+library(ComplexHeatmap)
+library(mclust)
+library(aricode)
+library(fastCNV)
+library(fastCNVdata)
+
+
+root.dir <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Projects/Jackie_post-mortem/"
+suppressWarnings(source(paste0(root.dir, "Code/", 'helper_functions.R')))
+
+raw.data.dir <- paste0(root.dir, "RawData/", "spaceranger_output/")
+processed.data.dir <- paste0(root.dir, "ProcessedData/", "my_data/", "autopsy/")
+results.dir <- paste0(root.dir, "Results/", "my_data/", "autopsy/", "visium/")
+
+sample.id <- "P2_S1"
+
+if (sample.id == "P2_S1") {
+  microns_per_pixel <- 0.5034168114587909
+} else if (sample.id == "P1_A5") {
+  microns_per_pixel <- 0.5033895166215644
+} else if (sample.id == "P2_S8") {
+  microns_per_pixel <- 0.503392923917596
+} else if (sample.id == "P2_S11") {
+  microns_per_pixel <- 0.5034411112485763
+}
+
+
+filter <- T
+denoise <- F
+denoise.vars.to.regress <- c("heat.shock.signature", "postmortem.sensitive", "postmortem.signature")
+denoise.vars.to.regress <- sort(denoise.vars.to.regress)
+
+if (denoise) {
+  denoise.label <- paste0(denoise.vars.to.regress, collapse = "_")
+} else {
+  denoise.label <- FALSE
+}
+
+output.dir <- paste0(results.dir, sample.id, "/")
+dir.create(output.dir)
+
+output.dir <- paste0(output.dir, sample.id, "_denoise.", denoise.label, "_filter.", filter, "/")
+dir.create(output.dir)
+dir.create(paste0(output.dir, "qc/"))
+dir.create(paste0(output.dir, "oligos/"))
+dir.create(paste0(output.dir, "markers/"))
+dir.create(paste0(output.dir, "inferCNV/"))
+dir.create(paste0(output.dir, "malignant/"))
+dir.create(paste0(output.dir, "clusters/"))
+dir.create(paste0(output.dir, "ligand_receptor/"))
+dir.create(paste0(output.dir, "seurat_objs/"))
+dir.create(paste0(output.dir, "segmented/"))
+dir.create(paste0(output.dir, "segmented/", "qc/"))
+dir.create(paste0(output.dir, "segmented/", "oligos/"))
+dir.create(paste0(output.dir, "segmented/", "spatial/"))
+dir.create(paste0(output.dir, "segmented/", "spatial/", "oligos_only/"))
+dir.create(paste0(output.dir, "segmented/", "spatial/", "interactions/"))
+dir.create(paste0(output.dir, "segmented/", "spatial/", "by_gene/"))
+dir.create(paste0(output.dir, "segmented/", "by_cluster/"))
+dir.create(paste0(output.dir, "segmented/", "by_gene/"))
+dir.create(paste0(output.dir, "segmented/", "spatial/", "features/"))
+dir.create(paste0(output.dir, "seurat_objs/"))
+
+
+oligo.jakel2019.signatures[["Oligo4"]] <- NULL # not enough genes
+
+set.seed(123)
+
+if (sample.id %in% c("P1_A5", "P2_S1")) {
+  visium.data.dir <- paste0(raw.data.dir, "HTS_SO187/")
+} else {
+  visium.data.dir <- paste0(raw.data.dir, "HTS_SO231/")
+}
+
+spatial.featureplot.scale.fill <- scale_fill_viridis_c(option = "inferno")
+spatial.featureplot.scale.color <- scale_color_viridis_c(option = "inferno")
+
+radius.use.spatial <- 100
+```
+
+
+
+# Read in Seurat data
+```{r}
+counts <- Read10X(paste0(visium.data.dir, sample.id, "_Visium_HD", "/", "segmented_outputs/", "filtered_feature_cell_matrix/"))
+seurat.obj <- CreateSeuratObject(counts = counts)
+seurat.obj$sample.id <- sample.id
+
+
+##### update segmented object with size and coordinates of cell/nucleus #####
+cell_segmentations <- st_read(paste0(visium.data.dir, sample.id, "_Visium_HD", "/", "segmented_outputs/", "cell_segmentations.geojson"))
+cell_segmentations$seurat_cell_id <- sprintf(
+  "cellid_%09d-1",
+  as.integer(cell_segmentations$cell_id)
+)
+
+
+
+nucleus_segmentations <- st_read(paste0(visium.data.dir, sample.id, "_Visium_HD", "/", "segmented_outputs/", "nucleus_segmentations.geojson"))
+nucleus_segmentations$seurat_cell_id <- sprintf(
+  "cellid_%09d-1",
+  as.integer(nucleus_segmentations$cell_id)
+)
+
+centroids <- st_point_on_surface(nucleus_segmentations)
+coords <- st_coordinates(centroids)
+
+
+centroid_df <- data.frame(
+  cell_id = nucleus_segmentations$seurat_cell_id,
+  nucleus.x = coords[,1],
+  nucleus.y = coords[,2]
+)
+rownames(centroid_df) <- centroid_df$cell_id
+
+centroid_df$x.microns <- centroid_df$nucleus.x * microns_per_pixel
+centroid_df$y.microns <- centroid_df$nucleus.y * microns_per_pixel
+
+seurat.obj <- AddMetaData(seurat.obj, centroid_df)
+seurat.obj$x <- seurat.obj$nucleus.x
+seurat.obj$y <- seurat.obj$nucleus.y
+
+```
+
+
+
+# Segmented data analysis
+```{r}
+seurat.obj <- NormalizeData(seurat.obj)
+
+seurat.obj[["percent.mt"]] <- PercentageFeatureSet(seurat.obj, pattern = "^MT-")
+p <- VlnPlot(seurat.obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, group.by = "sample.id", pt.size = 0)
+pdf(paste0(output.dir, "qc/", "violin_plot.pdf"), width = 14, height = 7)
+print(p)
+dev.off()
+
+
+# filter out very low quality
+seurat.obj$filter.out <- apply(seurat.obj@meta.data, 1, function(row)
+                               (as.numeric(row[["nCount_RNA"]]) == 0) | (as.numeric(row[["nFeature_RNA"]]) == 0))
+seurat.obj$filter.out <- apply(seurat.obj@meta.data, 1, function(row) (as.numeric(row[["percent.mt"]]) > 20) | (as.numeric(row[["nCount_RNA"]]) < 20))
+
+
+# define low quality
+#seurat.obj$low.quality.by.qc <- apply(seurat.obj@meta.data, 1, function(row) (as.numeric(row[["percent.mt"]]) > 20) | (as.numeric(row[["nCount_RNA"]]) < 20))
+
+
+if (sample.id == "P2_S8") {
+  #seurat.obj$low.quality.by.qc <- apply(seurat.obj@meta.data, 1, function(row) (as.numeric(row[["percent.mt"]]) > 10) | (as.numeric(row[["nCount_RNA"]]) < 150) | (as.numeric(row[["nFeature_RNA"]]) < 75)) 
+  seurat.obj$low.quality.by.qc <- apply(seurat.obj@meta.data, 1, function(row) (as.numeric(row[["percent.mt"]]) > 10) | (as.numeric(row[["nCount_RNA"]]) < 100) | (as.numeric(row[["nFeature_RNA"]]) < 50)) 
+} else {
+  seurat.obj$low.quality.by.qc <- apply(seurat.obj@meta.data, 1, function(row) (as.numeric(row[["percent.mt"]]) > 10) | (as.numeric(row[["nCount_RNA"]]) < 100) | (as.numeric(row[["nFeature_RNA"]]) < 50)) 
+}
+
+dim(seurat.obj)  
+
+if (filter) {
+  seurat.obj <- subset(seurat.obj, subset = low.quality.by.qc == FALSE)
+}
+
+print(dim(seurat.obj))
+
+
+seurat.obj <- add.module.score(seurat.obj, gene.signatures)
+seurat.obj <- add.module.score(seurat.obj, oligo.gene.signatures)
+seurat.obj <- add.module.score(seurat.obj, oligo.jakel2019.signatures)
+seurat.obj <- add.module.score(seurat.obj, celltype.signatures)
+seurat.obj <- add.module.score(seurat.obj, myelination.signatures)
+seurat.obj <- add.module.score(seurat.obj, gene.signatures.gsea)
+
+
+seurat.obj <- FindVariableFeatures(seurat.obj, nfeatures = 2000)
+VariableFeaturePlot(seurat.obj)
+
+if (denoise) {
+  seurat.obj <- ScaleData(seurat.obj, vars.to.regress = denoise.vars.to.regress)
+} else {
+  seurat.obj <- ScaleData(seurat.obj)
+}
+
+
+
+set.seed(123)
+seurat.obj <- RunPCA(seurat.obj, approx = T)
+p <- ElbowPlot(seurat.obj, ndims = 50)
+pdf(paste0(output.dir, "segmented/", "qc/", "elbow_plot.pdf"), width = 12, height = 7)
+print(p)
+dev.off()
+
+
+if (filter) {
+  if (sample.id == "P1_A5") {
+    n.dims <- 20
+    clustering.res <- 2
+    n.neighbors.umap <- 30
+    min.dist.umap <- 0.3
+  } else if (sample.id == "P2_S1") {
+    n.dims <- 20
+    clustering.res <- 2
+    n.neighbors.umap <- 30
+    min.dist.umap <- 0.3
+  } else if (sample.id == "P2_S8") {
+    n.dims <- 20
+    clustering.res <- 2
+    n.neighbors.umap <- 30
+    min.dist.umap <- 0.3
+  } else if (sample.id == "P2_S11") {
+    n.dims <- 20
+    clustering.res <- 2
+    n.neighbors.umap <- 30
+    min.dist.umap <- 0.3
+  }
+} else {
+  if (sample.id == "P1_A5") {
+    n.dims <- 20
+    clustering.res <- 2
+    n.neighbors.umap <- 30
+    min.dist.umap <- 0.3
+  } else if (sample.id == "P2_S1") {
+    n.dims <- 20
+    clustering.res <- 2
+    n.neighbors.umap <- 30
+    min.dist.umap <- 0.3
+  } else if (sample.id == "P2_S8") {
+    n.dims <- 7
+    clustering.res <- 2
+    n.neighbors.umap <- 30
+    min.dist.umap <- 0.3
+  } else if (sample.id == "P2_S11") {
+    n.dims <- 20
+    clustering.res <- 2
+    n.neighbors.umap <- 30
+    min.dist.umap <- 0.3
+  }
+}
+
+
+
+seurat.obj.original <- seurat.obj
+
+
+seurat.obj <- FindNeighbors(seurat.obj, dims = 1:n.dims, nn.method = "rann")
+seurat.obj <- FindClusters(seurat.obj, resolution = clustering.res)
+seurat.obj$seurat_clusters <- as.character(seurat.obj$seurat_clusters)
+
+
+seurat.obj <- RunUMAP(seurat.obj, dims = 1:n.dims, n.neighbors = n.neighbors.umap, min.dist = min.dist.umap)
+
+
+DimPlot(seurat.obj, group.by = "seurat_clusters", label = T) + 
+  FeaturePlot(seurat.obj, features = c("CDK4", "MDM2", "g2m.signature"), order = T)
+
+
+p.clusters <- DimPlot(seurat.obj, group.by = "seurat_clusters", label = T, shuffle = T)
+
+
+
+
+# QC
+p.quality <- DimPlot(seurat.obj, group.by = "low.quality.by.qc", shuffle = T)
+p.percent.mt <- FeaturePlot(seurat.obj, features = "percent.mt", order = T)
+p.ncount.rna <- FeaturePlot(seurat.obj, features = "nCount_RNA", order = T)
+p.nfeature.rna <- FeaturePlot(seurat.obj, features = "nFeature_RNA", order = T)
+p.postmortem.signature <- FeaturePlot(seurat.obj, features = "postmortem.signature", order = T)
+p.heat.shock.signature <- FeaturePlot(seurat.obj, features = "heat.shock.signature", order = T)
+p.postmortem.sensitive <- FeaturePlot(seurat.obj, features = "postmortem.sensitive", order = T)
+p <- p.clusters + p.quality + p.percent.mt + p.ncount.rna + p.nfeature.rna + p.postmortem.signature + p.heat.shock.signature + p.postmortem.sensitive
+pdf(paste0(output.dir, "segmented/", "qc/", "qc.signatures_UMAP.pdf"), width = 18, height = 12)
+print(p)
+dev.off()
+
+
+# QC by cluster
+p <- VlnPlot(seurat.obj, features = c("percent.mt", "nCount_RNA", "nFeature_RNA", "CDK4", "MDM2"), flip = T, stack = T) + stat_summary(fun.y = median, geom='point', size = 12, colour = "black", shape = 95) + NoLegend()
+pdf(paste0(output.dir, "segmented/", "qc/", "qc.signatures_by_cluster.pdf"), width = 12, height = 12)
+print(p)
+dev.off()
+
+
+
+# by cluster
+p <- VlnPlot(seurat.obj, features = c("myelin.genes", "Oligodendrocytes", "reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific", "FGFR1", "FGFR2", "MBP", "B2M", "SERPINA3", "percent.mt", "nCount_RNA", "nFeature_RNA", "CDK4", "MDM2", "EGFR"), flip = T, stack = T) + stat_summary(fun.y = median, geom='point', size = 12, colour = "black", shape = 95) + NoLegend()
+pdf(paste0(output.dir, "segmented/", "signatures_by_cluster.pdf"), width = 12, height = 20)
+print(p)
+dev.off()
+
+
+
+# reactive oligo signatures
+p.myelin <- FeaturePlot(seurat.obj, features = c("myelin.genes"), order = T)
+p.reactive.oligo.general <- FeaturePlot(seurat.obj, features = c("reactive.oligo.general"), order = T)
+p.reactive.oligo.non.tumor <- FeaturePlot(seurat.obj, features = c("reactive.oligo.non.tumor"), order = T)
+p.reactive.oligo.specific <- FeaturePlot(seurat.obj, features = c("reactive.oligo.specific"), order = T)
+
+p.acute.demyelination <- FeaturePlot(seurat.obj, features = c("acute.demyelination"), order = T)
+p.acute.remyelination <- FeaturePlot(seurat.obj, features = c("acute.remyelination"), order = T)
+p.acute.de.re.myelination <- FeaturePlot(seurat.obj, features = c("acute.de.re.myelination"), order = T)
+
+p.olig2 <- FeaturePlot(seurat.obj, features = c("OLIG2"), order = T)
+p.sox10 <- FeaturePlot(seurat.obj, features = c("SOX10"), order = T)
+p.pdgfra <- FeaturePlot(seurat.obj, features = c("PDGFRA"), order = T)
+p.aspa <- FeaturePlot(seurat.obj, features = c("ASPA"), order = T)
+p.mbp <- FeaturePlot(seurat.obj, features = c("MBP"), order = T)
+p.mog <- FeaturePlot(seurat.obj, features = c("MOG"), order = T)
+p.opalin <- FeaturePlot(seurat.obj, features = c("OPALIN"), order = T)
+p.enpp6 <- FeaturePlot(seurat.obj, features = c("ENPP6"), order = T)
+
+p.fgf1 <- FeaturePlot(seurat.obj, features = c("FGF1"), order = T)
+p.fgf2 <- FeaturePlot(seurat.obj, features = c("FGF2"), order = T)
+p.fgfr1 <- FeaturePlot(seurat.obj, features = c("FGFR1"), order = T)
+p.fgfr2 <- FeaturePlot(seurat.obj, features = c("FGFR2"), order = T)
+p.b2m <- FeaturePlot(seurat.obj, features = c("B2M"), order = T)
+p.cd44 <- FeaturePlot(seurat.obj, features = c("CD44"), order = T)
+p.vegfa <- FeaturePlot(seurat.obj, features = c("VEGFA"), order = T)
+
+p.cdk4 <- FeaturePlot(seurat.obj, features = c("CDK4"), order = T)
+p.mdm2 <- FeaturePlot(seurat.obj, features = c("MDM2"), order = T)
+# # no HLA genes
+# for (g in rownames(seurat.obj)) {
+#   if (startsWith(g, "HLA")) {
+#     print(g)
+#   }
+# }
+
+p <- p.clusters + p.myelin + p.reactive.oligo.general + p.reactive.oligo.non.tumor + p.reactive.oligo.specific + 
+  p.acute.demyelination + p.acute.remyelination + p.acute.de.re.myelination + 
+  p.olig2 + p.sox10 + p.pdgfra + p.aspa + p.mbp + p.mog + p.opalin + p.enpp6 +
+  p.fgf1 + p.fgf2 + p.fgfr1 + p.fgfr2 + p.b2m + p.cd44 + p.vegfa + p.cdk4 + p.mdm2
+pdf(paste0(output.dir, "segmented/", "reactive.oligo.signatures.pdf"), width = 36, height = 24)
+print(p)
+dev.off()
+
+
+# cell type signatures
+p <- p.clusters
+for (sig in names(celltype.signatures)) {
+  p <- p + FeaturePlot(seurat.obj, features = c(sig), order = T)
+}
+p <- p + FeaturePlot(seurat.obj, features = "CDK4", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "MDM2", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "EGFR", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "GFAP", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "CDKN2A", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "PTPRC", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "ITGAM", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "IL7R", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "COL3A1", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "PDGFRA", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "MOG", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "MBP", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "OLIG2", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "SOX10", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "PDGFRA", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "RBFOX3", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "SLC17A7", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "GAD1", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "CLDN5", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "VEGFA", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "g2m.signature", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "nCount_RNA", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "nFeature_RNA", order = T)
+p <- p + FeaturePlot(seurat.obj, features = "percent.mt", order = T)
+pdf(paste0(output.dir, "segmented/", "celltype.signatures.pdf"), width = 36, height = 30)
+print(p)
+dev.off()
+
+
+
+celltype.features <- c(names(celltype.signatures), "CDK4", "MDM2", "EGFR", "GFAP", "CDKN2A", "PTPRC", "ITGAM", "IL7R", "COL3A1", "PDGFRA", "MOG", "MBP", "OLIG2", "SOX10", "PDGFRA", "RBFOX3", "SLC17A7", "GAD1", "CLDN5", "VEGFA", "MYRF")
+data <- FetchData(seurat.obj, vars = celltype.features)
+seurat.obj <- AddMetaData(seurat.obj, data)
+
+
+# Check which genes actually have expression variation
+valid.features <- celltype.features[celltype.features %in% rownames(seurat.obj)]
+
+# Further filter to genes that aren't 'flat' (all zeros/same value)
+# This calculates the variance for each gene across all cells
+var.features <- apply(GetAssayData(seurat.obj, slot = "data")[valid.features, ], 1, var)
+final.features <- names(var.features[var.features > 0])
+
+# Re-run the plot with final.features
+p <- VlnPlot(seurat.obj, 
+             features = final.features, 
+             group.by = "seurat_clusters", 
+             flip = TRUE, 
+             stack = TRUE) + NoLegend() + stat_summary(fun.y = median, geom='point', size = 12, colour = "black", shape = 95) + stat_summary(fun.y = mean, geom='point', size = 12, colour = "blue", shape = 95)
+pdf(paste0(output.dir, "segmented/", "by_cluster/", "seurat_clusters_vs_celltype.markers_vlnplot.pdf"), width = 16, height = 12)
+print(p)
+dev.off()
+
+
+# jakel 2019 signatures
+p <- p.clusters
+for (sig in names(oligo.jakel2019.signatures)) {
+  p <- p + FeaturePlot(seurat.obj, features = c(sig), order = T)
+}
+pdf(paste0(output.dir, "segmented/", "jakel2019.signatures.pdf"), width = 20, height = 20)
+print(p)
+dev.off()
+
+
+saveRDS(seurat.obj, paste0(output.dir, "seurat_objs/", "segmented.seurat.obj.RDS"))
+```
+
+
+
+# DEGs by clusters
+```{r}
+find.markers <- T
+
+if (find.markers) {
+  #seurat.obj <- readRDS(paste0(output.dir, "seurat_objs/", "segmented.seurat.obj.RDS"))
+  Idents(seurat.obj) <- "seurat_clusters"
+  markers <- FindAllMarkers(seurat.obj)
+  write.table(markers, paste0(output.dir, "segmented/", "by_cluster/", "seurat_clusters_markers.tsv"), row.names = F, sep = "\t", quote = F)
+  
+  markers <- read.csv(paste0(output.dir, "segmented/", "by_cluster/", "seurat_clusters_markers.tsv"), sep = "\t")
+  markers.filter <- markers %>% filter(p_val_adj < 0.05, avg_log2FC > 0.5) %>% arrange(desc(avg_log2FC))
+  
+  for (i in sort(unique(markers.filter$cluster))) {
+    print(paste0("cluster ", i))
+    markers.filter %>% filter(cluster == i) %>% head(100) %>% pull(gene) %>% paste(collapse = " ") %>% print()
+  }
+}
+```
+
+
+
+# Read in H&E image
+```{r}
+seurat.obj <- readRDS(paste0(output.dir, "seurat_objs/", "segmented.seurat.obj.RDS"))
+
+
+# capture area of Visium HD
+x.min <- range(seurat.obj$x)[1]
+x.max <- range(seurat.obj$x)[2]
+y.min <- range(seurat.obj$y)[1]
+y.max <- range(seurat.obj$y)[2]
+
+#r <- rast(paste0(visium.data.dir, sample.id, "_Visium_HD", "/", "spatial/", "tissue_hires_image.png"))
+#r <- rast(paste0(visium.data.dir, sample.id, "_Visium_HD", "/", "spatial/", "tissue_lowres_image.png"))
+
+
+if (sample.id == "P2_S1") {
+  he.dir <- paste0(root.dir, "RawData/", "visium_images/", "P1_A5_P2_S1/", "HE/")
+  r <- rast(paste0(he.dir, "HTS_SO187_08_P2_S1_Visium_HD_Lane_2.tif"))
+} else if (sample.id == "P1_A5") {
+  he.dir <- paste0(root.dir, "RawData/", "visium_images/", "P1_A5_P2_S1/", "HE/")
+  r <- rast(paste0(he.dir, "HTS_SO187_07_P1_A5_Visium_HD_Lane_2.tif"))
+} else if (sample.id == "P2_S8") {
+  he.dir <- paste0(root.dir, "RawData/", "visium_images/",  "P2_S11_P2_S8/", "HE/")
+  r <- rast(paste0(he.dir, "HTS_SO231_01_Visium_HD_P2_S8_S1_L001_HE.tif"))
+} else if (sample.id == "P2_S11") {
+  he.dir <- paste0(root.dir, "RawData/", "visium_images/",  "P2_S11_P2_S8/", "HE/")
+  r <- rast(paste0(he.dir, "HTS_SO231_02_Visium_HD_P2_S11_S2_L001_HE.tif"))
+}
+
+# crop to Visium HD capture area
+crop_ext <- ext(
+  x.min, x.max,
+  y.min, y.max
+)
+
+r_crop <- crop(r, crop_ext)
+r_df <- as.data.frame(r_crop, xy = TRUE)
+colnames(r_df)[1:5] <- c("x", "y", "r", "g", "b")
+r_df %>% head()
+r_df <- na.omit(r_df)
+range(r_df$x)
+
+r_small <- aggregate(r, fact = 4, fun = mean)
+r_small_crop <- crop(r_small, crop_ext)
+r_small_df <- as.data.frame(r_small_crop, xy = TRUE)
+colnames(r_small_df)[1:5] <- c("x", "y", "r", "g", "b")
+r_small_df %>% head()
+
+range(r_small_df$x)
+
+save.tiff <- F
+if (save.tiff) {
+  r_flipped <- flip(r_crop, direction = "vertical")
+  terra::writeRaster(r_flipped, paste0(he.dir, sample.id, "_HE_cropped.tif"), 
+                     overwrite = TRUE,
+                     datatype = "INT1U", 
+                     gdal = c("COMPRESS=LZW", "TILING=YES"))
+}
+
+```
+
+
+
+# Read inferCNV results
+start here after clustering pipeline
+```{r}
+use.infercnv.results <- T
+
+if (use.infercnv.results) {
+  if (sample.id == "P2_S8") {
+    df <- read.csv(paste0(output.dir, "inferCNV/", "P2_S8_subset=5.20_fastCNV_result.tsv"), sep = "\t")
+    malignant.cnv.clusters <- c("8")
+    malignant.cells <- df %>% filter(cnv_clusters %in% malignant.cnv.clusters) %>% pull(cell_id)
+  } else if (sample.id == "P2_S1") {
+    df <- read.csv(paste0(output.dir, "inferCNV/", "P2_S1_subset=11.12.13.14.15.16.17.18.20.21.23.25.26.27.29.30.31.32.6.7.8_fastCNV_result.tsv"), sep = "\t")
+    malignant.cnv.clusters <- c("2") # c("2", "4")
+    malignant.cells <- df %>% filter(cnv_clusters %in% malignant.cnv.clusters) %>% pull(cell_id)
+  } else if (sample.id == "P2_S11") {
+    df <- read.csv(paste0(output.dir, "inferCNV/", "P2_S11_subset=17.30.12.21.9.8.29_fastCNV_result.tsv"), sep = "\t")
+    malignant.cnv.clusters <- c("2", "3")
+    malignant.cells <- df %>% filter(cnv_clusters %in% malignant.cnv.clusters) %>% pull(cell_id)
+  } else if (sample.id == "P1_A5") {
+    df <- read.csv(paste0(output.dir, "inferCNV/", "P1_A5_subset=5.3.23.15.22.12.14.19.20.6.9.13_fastCNV_result.tsv"), sep = "\t")
+    malignant.cnv.clusters <- c("3", "4")
+    malignant.cells <- df %>% filter(cnv_clusters %in% malignant.cnv.clusters) %>% pull(cell_id)
+  }
+  
+} else {
+  malignant.cells <- c()
+}
+```
+
+
+
+# Spatial by cluster
+```{r}
+seurat_clusters <- sort(unique(seurat.obj$seurat_clusters))
+seurat_clusters.color.scale <- scale_color_manual(breaks = seurat_clusters, values = as.character(polychrome(length(seurat_clusters))))
+p <- ggplot() + 
+  geom_raster(
+    data = r_small_df,
+    aes(
+      x = x * microns_per_pixel,
+      y = y * microns_per_pixel,
+      fill = rgb(r, g, b, maxColorValue = 255)
+    )
+  ) +
+  scale_fill_identity() +
+  geom_point(data=seurat.obj@meta.data, 
+             aes(x * microns_per_pixel, 
+                 y * microns_per_pixel, 
+                 color = seurat_clusters), 
+             size = 0.2, alpha = 1) +
+  labs(color = "Cell type") +
+  guides(color = guide_legend(override.aes = list(size = 5))) +
+  scale_y_reverse() +
+  xlab("x (microns)") +
+  ylab("y (microns)") +
+pdf(paste0(output.dir, "segmented/", "spatial/", "spatialplot_by_cluster.pdf"), width = 11, height = 8)
+print(p)
+dev.off()
+```
+
+
+
+# Annotate clusters (segmented)
+```{r}
+cluster.info.df <- read_excel(paste0(root.dir, "RawData/", "autopsy_sample_information.xlsx"), sheet = 4) %>% filter(`Sample ID` == sample.id) %>% filter(Denoise == denoise.label, Filter == filter)
+
+
+astro.clusters <- cluster.info.df %>% pull(Astrocytes) %>% str_split(", ") %>% unlist()
+oligo.clusters <- cluster.info.df %>% pull(Oligodendrocytes) %>% str_split(", ") %>% unlist()
+opc.clusters <- cluster.info.df %>% pull(OPC) %>% str_split(", ") %>% unlist()
+neuron.clusters <- cluster.info.df %>% pull(`Neurons`) %>% str_split(", ") %>% unlist()
+myeloid.clusters <- cluster.info.df %>% pull(Myeloid) %>% str_split(", ") %>% unlist()
+lymphoid.clusters <- cluster.info.df %>% pull(Lymphoid) %>% str_split(", ") %>% unlist()
+vascular.clusters <- cluster.info.df %>% pull(Vascular) %>% str_split(", ") %>% unlist()
+malignant.clusters <- cluster.info.df %>% pull(`Malignant Clusters`) %>% str_split(", ") %>% unlist()
+
+other.annotations.list <- list()
+other.annotations <- cluster.info.df %>% pull(Other) %>% str_split("\r\n") %>% unlist()
+for (other.annotation in other.annotations) {
+  temp <- str_split(other.annotation, ": ") %>% unlist()
+  clusters <- str_split(temp[2], ", ") %>% unlist()
+  for (clust in clusters) {
+    clust <- as.character(clust)
+    other.annotations.list[[clust]] <- temp[1]
+  }
+}
+other.clusters <- names(other.annotations.list)
+all.clusters <- c(astro.clusters, oligo.clusters, opc.clusters, neuron.clusters, myeloid.clusters, lymphoid.clusters, vascular.clusters, malignant.clusters, other.clusters)
+setdiff(unique(seurat.obj$seurat_clusters), all.clusters)
+
+seurat.obj@meta.data <- seurat.obj@meta.data %>% dplyr::mutate(celltype.by.cluster = case_when(
+  cell_id %in% malignant.cells ~ "Malignant cluster",
+  seurat_clusters %in% astro.clusters ~ "Astrocytes",
+  seurat_clusters %in% oligo.clusters ~ "Oligodendrocytes",
+  seurat_clusters %in% opc.clusters ~ "OPC",
+  seurat_clusters %in% neuron.clusters ~ "Neurons",
+  seurat_clusters %in% myeloid.clusters ~ "Myeloid",
+  seurat_clusters %in% lymphoid.clusters ~ "Lymphoid",
+  seurat_clusters %in% vascular.clusters ~ "Vascular",
+  seurat_clusters %in% malignant.clusters ~ "Malignant cluster",
+  TRUE ~ ""
+))
+
+
+
+seurat.obj@meta.data <- seurat.obj@meta.data %>% dplyr::mutate(celltype.by.cluster.fine = case_when(
+  cell_id %in% malignant.cells ~ "Malignant CNV",
+  seurat_clusters %in% other.clusters ~ as.character(other.annotations.list[as.character(seurat_clusters)]),
+  TRUE ~ celltype.by.cluster
+))
+
+# Use Other when there is no other label for a cluster
+seurat.obj$celltype.by.cluster <- apply(seurat.obj@meta.data, 1, function(row) ifelse(row[["celltype.by.cluster"]] == "", row[["celltype.by.cluster.fine"]], row[["celltype.by.cluster"]]))
+
+
+malignant <- subset(seurat.obj, subset = celltype.by.cluster == "Malignant cluster")
+malignant <- score.neftel(malignant)
+malignant.metadata <- malignant@meta.data %>% dplyr::select("ac_sig.21", "mes1_sig.22", "mes2_sig.23", "npc1_sig.24", "npc2_sig.25", "opc_sig.26", "ac_sig", "opc_sig", "mes_sig", "npc_sig", "stemness", "neftel_x", "neftel_y", "neftel_type")
+seurat.obj <- AddMetaData(seurat.obj, malignant.metadata)
+
+seurat.obj$celltype <- apply(seurat.obj@meta.data, 1, function(row) ifelse(!is.na(row[["neftel_type"]]), row[["neftel_type"]], row[["celltype.by.cluster"]]))
+seurat.obj$celltype.by.cluster.fine <- apply(seurat.obj@meta.data, 1, function(row) ifelse(!is.na(row[["neftel_type"]]), row[["neftel_type"]], row[["celltype.by.cluster.fine"]]))
+
+table(seurat.obj$celltype)
+
+# split by seurat cluster
+seurat.obj@meta.data <- seurat.obj@meta.data %>% 
+  dplyr::mutate(
+    celltype.by.cluster.split = case_when(
+      cell_id %in% malignant.cells ~ "Malignant CNV",
+      celltype.by.cluster == "Malignant cluster" ~ neftel_type,
+      TRUE ~ paste0(celltype.by.cluster, "_", seurat_clusters)
+    )
+  )
+
+unique(seurat.obj$celltype.by.cluster.split)
+DimPlot(seurat.obj, group.by = "celltype.by.cluster.split", shuffle = T, label = T)
+
+
+
+
+##### spatial plot by cell type #####
+celltypes <- sort(unique(seurat.obj$celltype))
+celltypes.color.scale <- scale_color_manual(breaks = celltypes, values = as.character(polychrome(length(celltypes))))
+celltypes.fill.scale <- scale_fill_manual(breaks = celltypes, values = as.character(polychrome(length(celltypes))))
+
+celltypes.fine <- sort(unique(seurat.obj$celltype.by.cluster.fine))
+celltypes.fine.color.scale <- scale_color_manual(breaks = celltypes.fine, values = as.character(polychrome(length(celltypes.fine))))
+celltypes.fine.fill.scale <- scale_fill_manual(breaks = celltypes.fine, values = as.character(polychrome(length(celltypes.fine))))
+
+celltypes.split <- sort(unique(seurat.obj$celltype.by.cluster.split))
+celltypes.split.color.scale <- scale_color_manual(breaks = celltypes.split, values = as.character(polychrome(length(celltypes.split))))
+celltypes.split.fill.scale <- scale_fill_manual(breaks = celltypes.split, values = as.character(polychrome(length(celltypes.split))))
+
+for (y in c("celltype", "celltype.by.cluster.fine", "celltype.by.cluster.split")) {
+  
+  if (y == "celltype") {
+    color.scale.use <- celltypes.color.scale
+  } else if (y == "celltype.by.cluster.fine") {
+    color.scale.use <- celltypes.fine.color.scale
+  } else {
+    color.scale.use <- celltypes.split.color.scale
+  }
+  
+  if (y == "celltype") {
+    color.labs.use <- "Cell type"
+  } else {
+    color.labs.use <- y
+  }
+  
+  p <- ggplot() +
+    geom_raster(
+      data = r_small_df,
+      aes(
+        x = x * microns_per_pixel,
+        y = y * microns_per_pixel,
+        fill = rgb(r, g, b, maxColorValue = 255)
+      )
+    ) +
+    scale_fill_identity() +
+    geom_point(
+      data = seurat.obj@meta.data,
+      aes(x = x * microns_per_pixel, 
+          y = y * microns_per_pixel, 
+          color = .data[[y]]),
+      size = 0.2,
+      alpha = 0.9
+    ) +
+    color.scale.use +
+    guides(color = guide_legend(override.aes = list(size = 5))) +
+    coord_equal(expand = FALSE) +
+    scale_y_reverse() +
+    xlab("x (microns)") +
+    ylab("y (microns)") +
+    labs(color = color.labs.use)
+  
+  pdf(paste0(output.dir, "segmented/", "spatial/", "spatialplot_by_", y, ".pdf"), width = 11, height = 8)
+  print(p)
+  dev.off()
+
+}
+
+
+
+
+# UMAP by celltype including neftel
+p1 <- DimPlot(seurat.obj, group.by = "seurat_clusters", label = T, shuffle = T)
+p2 <- DimPlot(seurat.obj, group.by = "celltype", label = T, shuffle = T)
+p3 <- DimPlot(seurat.obj, group.by = "celltype.by.cluster.fine", label = T, shuffle = T)
+p4 <- DimPlot(seurat.obj, group.by = "celltype.by.cluster.split", label = T, shuffle = T)
+p <- p1 + p2 + p3 + p4
+pdf(paste0(output.dir, "segmented/", "celltype_umap.pdf"), width = 22, height = 16)
+print(p)
+dev.off()
+
+
+# cell type vs markers vlnplot (TODO make this a dot plot)
+celltype.features <- c(names(celltype.signatures), "CDK4", "MDM2", "EGFR", "GFAP", "CDKN2A", "PTPRC", "ITGAM", "IL7R", "COL3A1", "PDGFRA", "MOG", "MBP", "OLIG2", "SOX10", "PDGFRA", "RBFOX3", "SLC17A7", "GAD1", "CLDN5", "VEGFA")
+
+# Check which genes actually have expression variation
+valid.features <- celltype.features[celltype.features %in% rownames(seurat.obj)]
+
+# Further filter to genes that aren't 'flat' (all zeros/same value)
+# This calculates the variance for each gene across all cells
+var.features <- apply(GetAssayData(seurat.obj, slot = "data")[valid.features, ], 1, var)
+final.features <- names(var.features[var.features > 0])
+final.features <- unique(final.features)
+
+p <- VlnPlot(seurat.obj, features = final.features, group.by = "celltype", flip = T, stack = T) + NoLegend() + stat_summary(fun.y = median, geom='point', size = 12, colour = "black", shape = 95) + stat_summary(fun.y = mean, geom='point', size = 12, colour = "blue", shape = 95)
+pdf(paste0(output.dir, "segmented/", "celltype_vs_celltype.markers_vlnplot.pdf"), width = 12, height = 12)
+print(p)
+dev.off()
+
+p <- DotPlot(seurat.obj, features = final.features, group.by = "celltype", cluster.idents = F) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+pdf(paste0(output.dir, "segmented/", "celltype_vs_celltype.markers_dotplot.pdf"), width = 10, height = 8)
+print(p)
+dev.off()
+
+p <- DotPlot(seurat.obj, features = final.features, group.by = "celltype.by.cluster.split", cluster.idents = F) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+pdf(paste0(output.dir, "segmented/", "celltype.by.cluster.split_vs_celltype.markers_dotplot.pdf"), width = 10, height = 8)
+print(p)
+dev.off()
+
+
+# cell type composition
+fraction.celltype.df <- seurat.obj@meta.data %>%
+  group_by(celltype) %>%
+  summarize(count = n()) %>%
+  mutate(fraction = count / sum(count), percent = 100 * (count / sum(count)))
+fraction.celltype.df$celltype.count <- paste0(fraction.celltype.df$celltype, "\n(", fraction.celltype.df$count, ")")
+p <- ggplot(fraction.celltype.df, aes(celltype.count, percent, fill = celltype)) +
+  geom_bar(stat = "identity") + 
+  celltypes.fill.scale + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1), legend.position = "none") +
+  ggtitle(sample.id) +
+  ylab("Percent (%)") +
+  xlab("Cell type")
+pdf(paste0(output.dir, "segmented/", "celltype_vs_fraction.pdf"), width = 12, height = 8)
+print(p)
+dev.off()
+
+
+seurat.obj@meta.data <- seurat.obj@meta.data %>% 
+  dplyr::mutate(celltype.refined = case_when(
+      celltype == "Oligodendrocytes" & MYRF > 0 ~ "Oligodendrocyte_MYRF",
+      TRUE ~ celltype.by.cluster.split
+    )
+  )
+table(seurat.obj$celltype.refined)
+
+
+saveRDS(seurat.obj, paste0(output.dir, "seurat_objs/", "segmented.seurat.obj.w.annotations.RDS"))
+
+write.table(seurat.obj@meta.data, paste0(output.dir, "seurat_objs/", "segmented.seurat.obj.w.annotations.metadata.tsv"), sep = "\t", quote = F, col.names = T, row.names = F)
+
+#seurat.obj <- readRDS(paste0(output.dir, "seurat_objs/", "segmented.seurat.obj.w.annotations.RDS"))
+
+
+save.geojson <- T
+
+if (save.geojson) {
+  
+  # save annotations as geojson
+  library(sf)
+  library(dplyr)
+  library(jsonlite)
+  library(geojsonsf)
+  library(tibble)
+  
+  # -----------------------------
+  # User settings
+  # -----------------------------
+  
+  celltype_col <- "celltype.refined"
+  
+  output_gz <- paste0(
+    output.dir,
+    "seurat_objs/",
+    "cell_segmentations_qupath_classes_combined.geojson.gz"
+  )
+  
+  # -----------------------------
+  # 1. Create combined cell type + cluster annotation
+  # -----------------------------
+  
+  print(table(seurat.obj$celltype.by.cluster.split))
+  
+  # -----------------------------
+  # 2. Extract Seurat metadata
+  # -----------------------------
+  
+  meta <- seurat.obj@meta.data %>%
+    rownames_to_column("seurat_cell_id")
+  
+  # -----------------------------
+  # 3. Join Seurat annotations onto cell segmentation sf object
+  # -----------------------------
+  
+  gdf <- cell_segmentations %>%
+    left_join(
+      meta %>%
+        select(seurat_cell_id, class_name = all_of(celltype_col)),
+      by = "seurat_cell_id"
+    ) %>%
+    filter(!is.na(class_name))
+  
+  print(table(gdf$class_name))
+  
+  # QuPath expects image/pixel coordinates, not geographic CRS
+  sf::st_crs(gdf) <- NA
+  
+  # -----------------------------
+  # 4. Clean geometries before grouping
+  # -----------------------------
+  
+  # Remove empty geometries
+  gdf <- gdf %>%
+    filter(!sf::st_is_empty(geometry))
+  
+  # Repair invalid polygons
+  gdf <- sf::st_make_valid(gdf)
+  
+  # If repair creates geometry collections, keep only polygonal pieces
+  gdf <- sf::st_collection_extract(gdf, "POLYGON")
+  
+  # Remove any empty geometries created during repair/extraction
+  gdf <- gdf %>%
+    filter(!sf::st_is_empty(geometry))
+  
+  # Optional aggressive fallback for self-crossing geometries
+  # This usually helps with "edge crosses edge" errors
+  gdf$geometry <- sf::st_buffer(gdf$geometry, 0)
+  
+  # Repair again after buffer
+  gdf <- sf::st_make_valid(gdf)
+  gdf <- sf::st_collection_extract(gdf, "POLYGON")
+  
+  gdf <- gdf %>%
+    filter(!sf::st_is_empty(geometry))
+  
+  bad <- which(!sf::st_is_valid(gdf))
+  message("Invalid geometries after repair: ", length(bad))
+  
+  if (length(bad) > 0) {
+    gdf <- gdf[-bad, ]
+    message("Dropped invalid geometries: ", length(bad))
+  }
+  
+  # -----------------------------
+  # 5. Combine all geometries of the same class
+  # -----------------------------
+  # st_combine creates one MULTIPOLYGON-like geometry per class without
+  # dissolving boundaries. This is safer than st_union for segmentation data.
+  
+  gdf_by_class <- gdf %>%
+    group_by(class_name) %>%
+    summarise(
+      geometry = sf::st_combine(geometry),
+      .groups = "drop"
+    )
+  
+  # Final repair
+  gdf_by_class <- sf::st_make_valid(gdf_by_class)
+  gdf_by_class <- sf::st_collection_extract(gdf_by_class, "POLYGON")
+  
+  sf::st_crs(gdf_by_class) <- NA
+  
+  print(gdf_by_class)
+  
+  # -----------------------------
+  # 6. Define QuPath class colors
+  # -----------------------------
+  
+  class_names <- sort(unique(gdf_by_class$class_name))
+  
+  palette <- grDevices::rainbow(length(class_names))
+  
+  rgb_to_int <- function(hex) {
+    rgb <- grDevices::col2rgb(hex)
+    as.integer(rgb[1, ] * 65536 + rgb[2, ] * 256 + rgb[3, ])
+  }
+  
+  color_map <- setNames(
+    rgb_to_int(palette),
+    class_names
+  )
+  
+  # -----------------------------
+  # 7. Convert geometries to GeoJSON geometry objects
+  # -----------------------------
+  
+  geom_json <- geojsonsf::sfc_geojson(sf::st_geometry(gdf_by_class))
+  
+  # -----------------------------
+  # 8. Generate one GeoJSON feature per class
+  # -----------------------------
+  
+  features <- vector("list", nrow(gdf_by_class))
+  
+  for (i in seq_len(nrow(gdf_by_class))) {
+    class_name <- as.character(gdf_by_class$class_name[i])
+  
+    features[[i]] <- list(
+      type = "Feature",
+      geometry = jsonlite::fromJSON(
+        geom_json[i],
+        simplifyVector = FALSE
+      ),
+      properties = list(
+        object_type = "annotation",
+        name = class_name,
+        classification = list(
+          name = class_name,
+          colorRGB = unname(color_map[class_name])
+        )
+      )
+    )
+  }
+  
+  geojson_output <- list(
+    type = "FeatureCollection",
+    features = features
+  )
+  
+  # -----------------------------
+  # 9. Save directly as compressed GeoJSON
+  # -----------------------------
+  
+  dir.create(
+    dirname(output_gz),
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+  
+  con <- gzfile(output_gz, open = "wt", encoding = "UTF-8")
+  
+  jsonlite::write_json(
+    geojson_output,
+    con,
+    auto_unbox = TRUE,
+    pretty = FALSE
+  )
+  
+  close(con)
+  
+  message("Saved compressed QuPath GeoJSON to: ", output_gz)
+}
+
+```
+
+
+
+# Neighborhood analysis, GBM FGF- vs FGF+
+FGF- vs FGF+ neighborhood
+```{r}
+# --- CONFIGURATION ---
+fgf_ligands    <- c("FGF1", "FGF2")  # or just "FGF2" for FGF2-only
+fgf.cutoff     <- 0
+radius.use     <- radius.use.spatial
+
+neighborhood.dir <- paste0(output.dir, "segmented/", "neighborhood_radius=", radius.use, "_microns/")
+dir.create(neighborhood.dir, showWarnings = FALSE)
+
+gbm_celltypes <- c("MES-like", "AC-like", "OPC-like", "NPC-like")
+
+# -----------------------------------------------------------------------
+# Load data & fetch gene expression into metadata
+# -----------------------------------------------------------------------
+seurat.obj <- readRDS(paste0(output.dir, "seurat_objs/", "segmented.seurat.obj.w.annotations.RDS"))
+
+gene_vars  <- c("FGF1", "FGF2", "FGFR1", "FGFR2")
+seurat.obj <- AddMetaData(seurat.obj, FetchData(seurat.obj, vars = gene_vars))
+seurat.obj$celltype.original <- seurat.obj$celltype
+
+centroid_df <- seurat.obj@meta.data[, c("cell_id", "x.microns", "y.microns")]
+colnames(centroid_df) <- c("cell_id", "x", "y")
+
+# -----------------------------------------------------------------------
+# Subset oligos & add module scores
+# -----------------------------------------------------------------------
+oligos <- subset(seurat.obj, subset = celltype == "Oligodendrocytes")
+oligos <- add.module.score(oligos, oligo.gene.signatures)
+oligos <- add.module.score(oligos, gene.signatures.gsea)
+oligos <- add.module.score(oligos, fgfr.gene.signatures)
+oligos <- add.module.score(oligos, fgf.gene.signatures)
+
+
+  
+fgf_label <- paste(fgf_ligands, collapse = ".")  # e.g. "FGF2" or "FGF1.FGF2"
+
+
+# -----------------------------------------------------------------------
+# Reclassify GBM subtypes according to gbm_group mode
+# -----------------------------------------------------------------------
+seurat.obj@meta.data <- seurat.obj@meta.data %>%
+  mutate(celltype = case_when(
+    celltype.original %in% gbm_celltypes &
+    rowSums(across(all_of(fgf_ligands)), na.rm = TRUE) >  fgf.cutoff ~ "FGFpos_GBM",
+
+    celltype.original %in% gbm_celltypes &
+    rowSums(across(all_of(fgf_ligands)), na.rm = TRUE) <= fgf.cutoff ~ "FGFneg_GBM",
+    TRUE ~ celltype.original
+  ))
+
+all.celltypes <- sort(unique(seurat.obj$celltype))
+print(all.celltypes)
+
+# -----------------------------------------------------------------------
+# Neighborhood composition around every oligo
+# -----------------------------------------------------------------------
+oligo.neighborhood.df <- data.frame()
+
+for (cell.id in oligos$cell_id) {
+  neighborhood.cells <- get_cells_within_radius(
+    centroids = centroid_df,
+    center_id = cell.id,
+    radius    = radius.use
+  )
+
+  neighorhood.df <- seurat.obj@meta.data %>% filter(cell_id %in% neighborhood.cells)
+
+  # Handle case where oligo has no neighbors within radius
+  if (nrow(neighorhood.df) == 0) {
+    df <- data.frame(matrix(0, nrow = 1, ncol = length(all.celltypes)))
+    colnames(df) <- all.celltypes
+    df$cell_id <- cell.id
+    df$n_neighbors <- 0
+  } else {
+    neighborhood.prop.df <- as.data.frame(table(Var1 = neighorhood.df$celltype))
+    n.neighbors <- sum(neighborhood.prop.df$Freq)
+    neighborhood.prop.df$fraction <- neighborhood.prop.df$Freq / n.neighbors
+    neighborhood.prop.df$Freq     <- NULL
+    df <- neighborhood.prop.df %>% pivot_wider(names_from = Var1, values_from = fraction)
+    for (ct in setdiff(all.celltypes, colnames(df))) df[ct] <- 0
+    df$cell_id <- cell.id
+    df$n_neighbors <- n.neighbors
+  }
+
+  oligo.neighborhood.df <- rbind(oligo.neighborhood.df, df)
+}
+
+oligo.neighborhood.df <- data.frame(oligo.neighborhood.df)
+
+
+# -----------------------------------------------------------------------
+# Add neighborhood fractions back to oligos Seurat object
+# -----------------------------------------------------------------------
+
+# Set rownames BEFORE adding the suffix
+rownames(oligo.neighborhood.df) <- oligo.neighborhood.df$cell_id
+
+# Remove cell_id column and add suffix to the rest
+oligo.neighborhood.df$cell_id <- NULL
+colnames(oligo.neighborhood.df) <- sapply(colnames(oligo.neighborhood.df), function(x) ifelse(x != "n_neighbors", paste0(x, "_nb_frac"), x))
+
+oligos <- AddMetaData(oligos, oligo.neighborhood.df)
+
+oligos.metadata.df <- oligos@meta.data
+
+#oligos.metadata.df <- oligos.metadata.df %>% filter(seurat_clusters != "16")
+
+# -----------------------------------------------------------------------
+# Neighborhood annotation
+# -----------------------------------------------------------------------
+
+# Neighborhood fraction column names (R converts - to . in column names)
+fgf_pos_col <- "FGFpos_GBM_nb_frac"
+fgf_neg_col <- "FGFneg_GBM_nb_frac"
+
+oligos.metadata.df$neighborhood.annotation <- case_when(
+  oligos.metadata.df[[fgf_pos_col]] > fgf.cutoff ~ paste0("GBM ", fgf_label, "+"),
+  oligos.metadata.df[[fgf_neg_col]] > fgf.cutoff ~ paste0("GBM ", fgf_label, "-"),
+  TRUE ~ "GBM-"
+)
+
+oligos.metadata.df$neighborhood.annotation <- factor(
+  oligos.metadata.df$neighborhood.annotation,
+  levels = c("GBM-", paste0("GBM ", fgf_label, "-"), paste0("GBM ", fgf_label, "+"))
+)
+
+comparisons <- list(c("GBM-", paste0("GBM ", fgf_label, "-")), c(paste0("GBM ", fgf_label, "-"), paste0("GBM ", fgf_label, "+")), c("GBM-", paste0("GBM ", fgf_label, "+")))
+
+# -----------------------------------------------------------------------
+# Overall boxplot
+# -----------------------------------------------------------------------
+make_neighborhood_plot(
+  df       = oligos.metadata.df,
+  comparisons = comparisons,
+  filename = paste0(neighborhood.dir, "FGF.neighborhood.annotation_vs_reactive.oligo_", fgf_label, ".pdf")
+)
+
+
+# -----------------------------------------------------------------------
+# Overall boxplot
+# -----------------------------------------------------------------------
+
+if (sample.id == "P2_S11") {
+  make_neighborhood_plot(
+    df       = oligos.metadata.df %>% filter(x.microns < 8000),
+    comparisons = comparisons,
+    filename = paste0(neighborhood.dir, "FGF.neighborhood.annotation_vs_reactive.oligo_", fgf_label, "_good_area.pdf")
+  )
+  make_neighborhood_plot(
+    df        = oligos.metadata.df %>% filter(x.microns < 8000),
+    comparisons = comparisons,
+    facet_var = "seurat_clusters",
+    filename  = paste0(neighborhood.dir, "FGF.neighborhood.annotation_vs_reactive.oligo_by_seurat.clusters_", fgf_label, "_good_area.pdf"),
+    width     = 20
+  )
+}
+
+
+
+# -----------------------------------------------------------------------
+# By Seurat cluster
+# -----------------------------------------------------------------------
+if (sample.id == "P2_S8") {
+  make_neighborhood_plot(
+    df        = oligos.metadata.df,
+    comparisons = comparisons,
+    facet_var = "seurat_clusters",
+    filename  = paste0(neighborhood.dir, "FGF.neighborhood.annotation_vs_reactive.oligo_by_seurat.clusters_", fgf_label, ".pdf"),
+    width     = 20,
+    height = 20
+  )
+} else {
+  make_neighborhood_plot(
+    df        = oligos.metadata.df,
+    comparisons = comparisons,
+    facet_var = "seurat_clusters",
+    filename  = paste0(neighborhood.dir, "FGF.neighborhood.annotation_vs_reactive.oligo_by_seurat.clusters_", fgf_label, ".pdf"),
+    width     = 20,
+    height = 12
+  )
+}
+
+
+write.table(oligos.metadata.df, 
+              paste0(neighborhood.dir, sample.id, "_", gbm_group, fgf_label, "_oligos.metadata_FGF.tsv"), 
+              sep = "\t", row.names = T, col.names = TRUE)
+```
+
+
+
+# Distance to tumor vs oligo signatures
+```{r}
+radius.use <- radius.use.spatial
+neighborhood.dir <- paste0(root.dir, "Results/", "my_data/", "autopsy/", "visium/", sample.id, "/", sample.id, "_denoise.FALSE_filter.TRUE/", "segmented/", "neighborhood_radius=", radius.use, "_microns/")
+oligos.metadata.df <- read.csv(paste0(neighborhood.dir, sample.id, "_FGFFGF1.FGF2_oligos.metadata_FGF.tsv"), sep = "\t", row.names = 1)
+
+oligos.metadata.df$GBM_frac <- oligos.metadata.df$FGFneg_GBM_nb_frac + oligos.metadata.df$FGFpos_GBM_nb_frac
+oligos.metadata.df$neighborhood.annotation <- case_when(
+  oligos.metadata.df[["GBM_frac"]] > 0 ~ "GBM+",
+  TRUE ~ "GBM-"
+)
+
+
+for (y in c("reactive.oligo.general", "acute.demyelination", "acute.de.re.myelination")) {
+  
+  y.label <- case_when(
+    y %in% c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific") ~ "Reactive oligo signature",
+    y == "acute.demyelination" ~ "Demyelination signature",
+    y == "acute.remyelination" ~ "Remyelination signature",
+    y == "acute.de.re.myelination" ~ "Remyelination signature",
+    TRUE ~ ""
+  )
+  
+  make_neighborhood_plot(
+    df        = oligos.metadata.df,
+    comparisons = list(c("GBM-", "GBM+")),
+    y_var = y,
+    y_var_label = y.label,
+    facet_var = NULL,
+    filename  = paste0(neighborhood.dir, "GBM.neighborhood.annotation_vs_", y, ".pdf"),
+    width     = 10,
+    height = 8
+  )
+  
+  p <- ggplot(oligos.metadata.df, aes(GBM_frac, .data[[y]])) +
+    geom_point(alpha = 0.1) +
+    geom_smooth(method = "lm") +
+    stat_cor(method = "spearman")
+  pdf(paste0(neighborhood.dir, "GBM.frac_vs_", y, ".pdf"), width = 10, height = 8)
+  print(p)
+  dev.off()
+}
+```
+
+
+
+# Spatial plot by signatures in oligodendrocytes
+```{r}
+
+##### oligos only spatial plot by reactive oligo signature #####
+for (y in c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific", "acute.demyelination", "acute.remyelination", "acute.de.re.myelination", 
+            names(fgf.gene.signatures), names(fgfr.gene.signatures))) {
+  
+  legend.label <- case_when(
+    y %in% c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific") ~ "Reactive oligo signature",
+    y == "acute.demyelination" ~ "Demyelination signature",
+    y == "acute.remyelination" ~ "Remyelination signature",
+    y == "acute.de.re.myelination" ~ "Remyelination signature",
+    TRUE ~ y
+  )
+  
+  oligos.metadata.df <- oligos.metadata.df %>% arrange(.data[[y]])
+  p <- ggplot() +
+    geom_raster(
+      data = r_small_df,
+      aes(
+        x = x * microns_per_pixel,
+        y = y * microns_per_pixel,
+        fill = rgb(r, g, b, maxColorValue = 255)
+      )
+    ) +
+    scale_fill_identity() +
+    geom_point(
+      data = oligos.metadata.df,
+      aes(x = x * microns_per_pixel, 
+          y = y * microns_per_pixel, 
+          color = .data[[y]]),
+      size = 0.2,
+      alpha = 0.9
+    ) +
+    scale_color_viridis_c(
+      option = "inferno",
+      limits = quantile(oligos.metadata.df[[y]], c(0.01, 0.99), na.rm = TRUE),
+      oob = scales::squish
+    ) +
+    coord_fixed() +
+    labs(
+      color = ""
+    ) + 
+    scale_y_reverse() +
+    xlab("x (microns)") +
+    ylab("y (microns)") +
+    scale_y_reverse() +
+    ggtitle(legend.label)
+
+  pdf(paste0(output.dir, "segmented/", "spatial/", "oligos_only/", "oligos.only_spatialplot_by_", y, ".pdf"), width = 12, height = 8)
+  print(p)
+  dev.off()
+}
+
+
+# exploratory
+p <- ggplot(seurat.obj@meta.data, aes(seurat_clusters, hypoxia.signature)) +
+  geom_boxplot(outlier.shape = NA)
+pdf(paste0(output.dir, "segmented/", "by_cluster/", "seurat_clusters_vs_hypoxia.signature.pdf"), width = 12, height = 8)
+print(p)
+dev.off()
+
+p <- ggplot(oligos.metadata.df, aes(hypoxia.signature, reactive.oligo.general)) +
+  geom_point(alpha = 0.1) +
+  stat_cor(method = correlation.method.use)
+pdf(paste0(output.dir, "segmented/", "oligos/", "hypoxia.signature_vs_reactive.oligo.general.pdf"), width = 8, height = 8)
+print(p)
+dev.off()
+
+p <- ggplot(oligos.metadata.df, aes(nFeature_RNA, reactive.oligo.general)) +
+  geom_point(alpha = 0.1) +
+  stat_cor(method = correlation.method.use)
+pdf(paste0(output.dir, "segmented/", "qc/", "nFeature_RNA_vs_reactive.oligo.general.pdf"), width = 8, height = 8)
+print(p)
+dev.off()
+
+
+
+y <- "seurat_clusters"
+p <- ggplot() +
+  geom_raster(
+    data = r_small_df,
+    aes(
+      x = x * microns_per_pixel,
+      y = y * microns_per_pixel,
+      fill = rgb(r, g, b, maxColorValue = 255)
+    )
+  ) +
+  scale_fill_identity() +
+  geom_point(
+    data = oligos.metadata.df,
+    aes(x = x * microns_per_pixel, 
+        y = y * microns_per_pixel, 
+        color = .data[[y]]),
+    size = 0.2,
+    alpha = 0.9
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 5))) +
+  coord_equal(expand = FALSE) +
+  scale_y_reverse() +
+  xlab("x (microns)") +
+  ylab("y (microns)")
+
+pdf(paste0(output.dir, "segmented/", "spatial/", "oligos_only/", "oligos.only_spatialplot_by_", y, ".pdf"), width = 11, height = 8)
+print(p)
+dev.off()
+```
+
+
+
+
+# Gene expression of genes of interest, all cells
+```{r}
+seurat.obj <- readRDS(paste0(output.dir, "seurat_objs/", "segmented.seurat.obj.w.annotations.RDS"))
+
+p <- DotPlot(seurat.obj, features = c("FGFR2", "FGF2", "FGFR1", "FGF1"), group.by = "celltype")
+pdf(paste0(output.dir, "segmented/spatial/interactions/", "FGF_FGFR_DotPlot.pdf"), width = 12, height = 8)
+print(p)
+dev.off()
+
+genes.of.interest <- c("FGFR2", "FGFR1", "FGF2", "FGF1", "CD44", "ATF3", "MBP", "RBFOX3", "MAP2")
+data <- FetchData(seurat.obj, vars = genes.of.interest)
+seurat.obj <- AddMetaData(seurat.obj, data)
+
+metadata.df <- seurat.obj@meta.data
+
+for (y in genes.of.interest) {
+  metadata.df <- metadata.df %>% arrange(.data[[y]])
+  
+  # 2. Generate the plot
+  p <- ggplot(
+      metadata.df, 
+      # Use ifelse to turn 0s into NA so we can color them separately
+      aes(x.microns, y.microns, color = ifelse(.data[[y]] == 0, NA, .data[[y]]))
+    ) +
+    geom_point(size = 0.2, alpha = 0.9) +
+    scale_color_viridis_c(
+      option = "inferno", 
+      na.value = "grey30",  # This sets non-expressing (0) cells to grey
+      oob = scales::squish,
+      name = y              # Keeps the legend title as the gene name
+    ) +
+    coord_fixed() +
+    labs(
+      title = paste0(y, " gene expression"),
+      x = "x (microns)",
+      y = "y (microns)"
+    ) +
+    # Apply the requested black theme
+    theme_void() + 
+    theme(
+      plot.background = element_rect(fill = "black", color = NA),
+      panel.background = element_rect(fill = "black", color = NA),
+      legend.text = element_text(color = "white"),
+      legend.title = element_text(color = "white", face = "bold"),
+      plot.title = element_text(color = "white", hjust = 0.5, size = 14, face = "bold"),
+      # Since theme_void() hides axes, these ensure the legend is visible
+      legend.position = "right"
+    ) +
+    scale_y_reverse()
+  
+  
+  pdf(paste0(output.dir, "segmented/", "spatial/", "by_gene/", "spatialplot_by_", y, ".pdf"), width = 12, height = 8)
+  print(p)
+  dev.off()
+}
+  
+```
+
+
+
+# Interaction plotting
+```{r}
+library(ggnewscale)
+plot_spatial_interaction <- function(data, 
+                                     target_gbm_type = "MES-like", 
+                                     ligands = c("FGF1", "FGF2"), 
+                                     receptors = c("FGFR1", "FGFR2"),
+                                     save_plot = TRUE,
+                                     output_dir = paste0(output.dir, "segmented/", "spatial/", "interactions/")) {
+  
+  # 1. Filter Ligand Cells (GBM)
+  if (target_gbm_type == "All-GBM") {
+    ligand_data <- data %>% filter(grepl("like", celltype))
+  } else {
+    ligand_data <- data %>% filter(celltype == target_gbm_type)
+  }
+  
+  # Calculate Ligand Score (Average if multiple)
+  ligand_label <- paste(ligands, collapse = "+")
+  if (length(ligands) > 1) {
+    ligand_data$ligand_score <- rowMeans(ligand_data[, ligands, drop = FALSE], na.rm = TRUE)
+  } else {
+    ligand_data$ligand_score <- ligand_data[[ligands]]
+  }
+  
+  ligand_signal <- ligand_data %>% filter(ligand_score > 0) %>% arrange(ligand_score)
+  
+  # 2. Filter Receptor Cells (Oligos)
+  oligo_data <- data %>% filter(celltype == "Oligodendrocytes")
+  
+  # Calculate Receptor Score (Average if multiple)
+  receptor_label <- paste(receptors, collapse = "+")
+  if (length(receptors) > 1) {
+    oligo_data$receptor_score <- rowMeans(oligo_data[, receptors, drop = FALSE], na.rm = TRUE)
+  } else {
+    oligo_data$receptor_score <- oligo_data[[receptors]]
+  }
+  
+  oligo_signal <- oligo_data %>% filter(receptor_score > 0) %>% arrange(receptor_score)
+  
+  # 3. Define Background
+  background_cells <- data %>%
+    filter(!(cell_id %in% ligand_signal$cell_id) & !(cell_id %in% oligo_signal$cell_id))
+  
+  # 4. Create Plot
+  plot_title <- paste0(target_gbm_type, " (", ligand_label, ") -> Oligos (", receptor_label, ")")
+  
+  p <- ggplot() +
+    # Background
+    geom_point(data = background_cells, aes(x.microns, y.microns), color = "gray15", size = 0.4) +
+    
+    # Receptor Layer (Blue)
+    geom_point(data = oligo_signal, aes(x.microns, y.microns, color = receptor_score), size = 0.8) +
+    scale_color_gradientn(colors = c("#000044", "#377EB8", "#A6CEE3"), 
+                          name = paste("Oligo", receptor_label),
+                          limits = quantile(oligo_signal$receptor_score, c(0.05, 0.95), na.rm = TRUE),
+                          oob = scales::squish) +
+    
+    # Ligand Layer (Red)
+    new_scale_color() +
+    geom_point(data = ligand_signal, aes(x.microns, y.microns, color = ligand_score), size = 0.8) +
+    scale_color_gradientn(colors = c("#440000", "#E41A1C", "#FB9A99"), 
+                          name = paste(target_gbm_type, ligand_label),
+                          limits = quantile(ligand_signal$ligand_score, c(0.05, 0.95), na.rm = TRUE),
+                          oob = scales::squish) +
+    
+    coord_fixed() +
+    theme_void() + 
+    theme(
+      plot.background = element_rect(fill = "black", color = NA),
+      panel.background = element_rect(fill = "black", color = NA),
+      legend.text = element_text(color = "white"),
+      legend.title = element_text(color = "white", size = 8, face = "bold"),
+      plot.title = element_text(color = "white", hjust = 0.5, size = 14, face = "bold"),
+      plot.margin = margin(10, 10, 10, 10),
+      axis.text.x = element_text(colour = "white"),
+      axis.text.y = element_text(colour = "white"),
+      axis.title.x = element_text(colour = "white"),
+      axis.title.y = element_text(colour = "white")
+    ) +
+    labs(title = plot_title) +
+    scale_y_reverse() +
+    xlab("x (microns)") +
+    ylab("y (microns)")
+  
+  # 5. Save or Return
+  if (save_plot) {
+    # Fix 1: use ligand_label and receptor_label, not undefined target_ligand/target_receptor
+    pdf(paste0(output_dir, "spatial_", target_gbm_type, "_", ligand_label, "_to_", receptor_label, ".pdf"), 
+        width = 11, height = 8)
+    print(p)
+    dev.off()
+  }
+  
+  return(p)  # Fix 3: always return the plot
+}
+
+
+
+plot_spatial_interaction(metadata.df, 
+                         target_gbm_type = "All-GBM", 
+                         ligands = c("FGF1", "FGF2"), 
+                         receptors = c("FGFR1", "FGFR2"))
+
+plot_spatial_interaction(metadata.df, 
+                         target_gbm_type = "All-GBM", 
+                         ligands = c("FGF2"), 
+                         receptors = c("FGFR1", "FGFR2"))
+
+plot_spatial_interaction(metadata.df, 
+                         target_gbm_type = "MES-like", 
+                         ligands = c("FGF1", "FGF2"), 
+                         receptors = c("FGFR1", "FGFR2"))
+
+
+plot_spatial_interaction(metadata.df, 
+                         target_gbm_type = "AC-like", 
+                         ligands = c("FGF1", "FGF2"), 
+                         receptors = c("FGFR1", "FGFR2"))
+
+
+plot_spatial_interaction(metadata.df, 
+                         target_gbm_type = "MES-like", 
+                         ligands = c("FGF2"), 
+                         receptors = c("FGFR2"))
+```
+
+
+
+# Quantify interaction spatially
+```{r}
+library(RANN)
+
+run_spatial_interaction <- function(
+    metadata.df,
+    ligands    = c("FGF1", "FGF2"),   # one or both of FGF1, FGF2
+    receptors  = c("FGFR1", "FGFR2"), # one or both of FGFR1, FGFR2
+    dist_threshold = radius.use.spatial,
+    min_pairs      = 0,
+    output_dir     = paste0(output.dir, "segmented/", "spatial/", "interactions/")
+) {
+  
+  # --- Derived labels ---
+  ligand_label   <- paste(ligands,    collapse = "/")
+  receptor_label <- paste(receptors,  collapse = "/")
+  
+  # --- Composite score helpers ---
+  # Average across genes if multiple, otherwise use single column directly
+  score_cols <- function(df, genes) {
+    #if (length(genes) > 1) rowMeans(df[, genes, drop = FALSE], na.rm = TRUE)
+    if (length(genes) > 1) rowSums(df[, genes, drop = FALSE], na.rm = TRUE)
+    else df[[genes]]
+  }
+  
+  # -----------------------------------------------------------------------
+  # 1. Identify Receiver population (Oligos with receptor score > 0)
+  # -----------------------------------------------------------------------
+  oligo_all <- metadata.df %>% filter(celltype == "Oligodendrocytes")
+  oligo_all$receptor_score <- score_cols(oligo_all, receptors)
+  oligo_targets <- oligo_all %>% filter(receptor_score > 0)
+  
+  message(sprintf("Receivers: %d Oligodendrocytes with %s > 0", 
+                  nrow(oligo_targets), receptor_label))
+  
+  # -----------------------------------------------------------------------
+  # 2. Sender cell types
+  # -----------------------------------------------------------------------
+  all_cell_types <- unique(metadata.df$celltype)
+  all_cell_types <- all_cell_types[all_cell_types != "Oligodendrocytes"]
+  
+  # -----------------------------------------------------------------------
+  # 3. Per-sender-type metrics
+  # -----------------------------------------------------------------------
+  scatter_data <- lapply(all_cell_types, function(ct) {
+    
+    all_sender_cells <- metadata.df %>% filter(celltype == ct)
+    all_sender_cells$ligand_score <- score_cols(all_sender_cells, ligands)
+    
+    # Mean ligand expression across ALL cells of this type (includes zeros)
+    mean_ligand_expr   <- mean(all_sender_cells$ligand_score, na.rm = TRUE)
+    percent_expressing <- 100 * mean(
+      rowSums(all_sender_cells[, ligands, drop = FALSE], na.rm = TRUE) > 0,
+      na.rm = TRUE
+    )
+        
+    sender_cells <- all_sender_cells %>% filter(ligand_score > 0)
+    
+    # Need at least 1 expressing sender cell to do NN search
+    if (nrow(sender_cells) == 0) {
+      return(data.frame(
+        CellType           = ct,
+        Median_Distance    = NA,
+        N_Niche_Pairs      = 0,
+        Status             = "No Expressing Senders",
+        mean_ligand_expr   = mean_ligand_expr,
+        percent_expressing = percent_expressing
+      ))
+    }
+    
+    # Nearest ligand+ sender for every receptor+ oligo
+    nn <- nn2(
+      data  = sender_cells[, c("x.microns", "y.microns")],
+      query = oligo_targets[, c("x.microns", "y.microns")],
+      k     = 1
+    )
+    
+    all_pairs <- data.frame(
+      oligo_expr    = oligo_targets$receptor_score,
+      neighbor_expr = sender_cells$ligand_score[nn$nn.idx],
+      distance      = nn$nn.dists[, 1]
+    )
+    
+    global_median_dist <- median(all_pairs$distance)
+    niche_pairs        <- all_pairs %>% filter(distance <= dist_threshold)
+    
+    status <- if (nrow(niche_pairs) >= min_pairs) "Valid" else "Insufficient Pairs"
+    
+    data.frame(
+      CellType           = ct,
+      Median_Distance    = global_median_dist,
+      N_Niche_Pairs      = nrow(niche_pairs),
+      Status             = status,
+      mean_ligand_expr   = mean_ligand_expr,
+      percent_expressing = percent_expressing
+    )
+  })
+  
+  plot_df <- bind_rows(scatter_data) %>% filter(Status == "Valid")
+  
+  # -----------------------------------------------------------------------
+  # 4. Plot
+  # -----------------------------------------------------------------------
+  y_label <- ifelse(grepl("/", ligand_label), sprintf("Sum of %s expression", ligand_label), sprintf("%s expression", ligand_label))
+  p <- ggplot(plot_df, aes(x = Median_Distance, y = mean_ligand_expr, label = CellType)) +
+    geom_point(aes(size = N_Niche_Pairs, color = percent_expressing), alpha = 0.8) +
+    scale_color_viridis_c(option = "plasma", name = "Percent\nExpression") +
+    geom_text(vjust = -1.2, size = 4, check_overlap = FALSE) +
+    labs(
+      title = sprintf("%s -> %s interaction by cell type", ligand_label, receptor_label),
+      y     = y_label,
+      x     = sprintf("Median distance to nearest %s+ cell (um)", ligand_label),
+      size  = sprintf("Pairs in niche\n(< %d um)", dist_threshold)
+    )
+  
+  # -----------------------------------------------------------------------
+  # 5. Save
+  # -----------------------------------------------------------------------
+  fname <- sprintf("FGF_interaction_%s_to_%s.pdf", ligand_label, receptor_label)
+  fname <- str_replace_all(fname, "/", ".")
+  pdf(paste0(output_dir, fname), width = 12, height = 8)
+  print(p)
+  dev.off()
+  message("Saved: ", fname)
+  
+  invisible(plot_df)  # return data silently for downstream use
+}
+
+metadata.df %>% 
+  group_by(celltype) %>%
+  summarize(score = mean(FGF1)) %>%
+  arrange(desc(score))
+
+
+metadata.df %>% 
+  group_by(celltype) %>%
+  summarize(score = mean(FGF2)) %>%
+  arrange(desc(score))
+
+
+# Single ligand / single receptor
+run_spatial_interaction(metadata.df, ligands = "FGF2", receptors = "FGFR2")
+
+# Both ligands / both receptors
+run_spatial_interaction(metadata.df, ligands = c("FGF1", "FGF2"), receptors = c("FGFR1", "FGFR2"))
+
+run_spatial_interaction(metadata.df, ligands = c("FGF1"), receptors = c("FGFR1", "FGFR2"))
+run_spatial_interaction(metadata.df, ligands = c("FGF2"), receptors = c("FGFR1", "FGFR2"))
+```
+
+
+
+# FGFR downstream signaling
+```{r}
+run_ligand_signaling_correlation <- function(
+    metadata.df,
+    target_celltype    = "Oligodendrocytes",
+    sender_celltypes   = c("MES-like", "AC-like", "OPC-like", "NPC-like"),
+    ligands            = c("FGF1", "FGF2"),
+    signaling_score    = "fgfr_signaling_score",
+    dist_threshold     = radius.use.spatial,   # used for boxplot: near vs far split
+    neighbor_radius    = radius.use.spatial,   # used for scatter: radius to sum ligand expression
+    output_dir         = paste0(output.dir, "segmented/spatial/interactions/signaling/")
+) {
+  
+  ligand_label <- paste(ligands, collapse = "/")
+  
+  # -----------------------------------------------------------------------
+  # 1. Target cells (receptor side)
+  # -----------------------------------------------------------------------
+  target_cells <- metadata.df %>% filter(celltype == target_celltype)
+  target_cells$signaling_score <- target_cells[[signaling_score]]
+
+  # -----------------------------------------------------------------------
+  # 2. Sender cells (ligand side)
+  # -----------------------------------------------------------------------
+  sender_cells <- metadata.df %>% filter(celltype %in% sender_celltypes)
+  sender_cells$ligand_score <- rowSums(sender_cells[, ligands, drop = FALSE], na.rm = TRUE)
+  sender_cells <- sender_cells %>% filter(ligand_score > 0)
+  
+  message(sprintf("%d %s cells with %s > 0", nrow(sender_cells), 
+                  paste(sender_celltypes, collapse = "/"), ligand_label))
+  
+  if (nrow(sender_cells) == 0) {
+    message(sprintf("No sender cells expressing %s found in: %s", 
+                    ligand_label, paste(sender_celltypes, collapse = ", ")))
+    return(invisible(NULL))
+  }
+  
+  # -----------------------------------------------------------------------
+  # 3. For each target cell, sum ligand expression within neighbor_radius
+  #    and get nearest neighbor distance for boxplot split
+  # -----------------------------------------------------------------------
+  nn_all <- nn2(
+    data  = sender_cells[, c("x.microns", "y.microns")],
+    query = target_cells[, c("x.microns", "y.microns")],
+    k     = nrow(sender_cells)
+  )
+  
+  # Sum ligand expression within neighbor_radius (for scatter)
+  ligand_sum <- sapply(seq_len(nrow(target_cells)), function(i) {
+    within_radius <- nn_all$nn.dists[i, ] <= neighbor_radius
+    sum(sender_cells$ligand_score[nn_all$nn.idx[i, within_radius]], na.rm = TRUE)
+  })
+  
+  # Nearest neighbor distance (for boxplot split)
+  nearest_dist <- nn_all$nn.dists[, 1]
+  
+  pair_df <- data.frame(
+    cell_id         = target_cells$cell_id,
+    signaling_score = target_cells$signaling_score,
+    ligand_sum      = ligand_sum,
+    nearest_dist    = nearest_dist
+  )
+  
+  message(sprintf("%d target cells; %d have at least one ligand+ neighbor within %d um",
+                  nrow(pair_df), sum(ligand_sum > 0), neighbor_radius))
+  
+  if (nrow(pair_df) < 3) {
+    message("Too few pairs for correlation — try increasing neighbor_radius")
+    return(invisible(NULL))
+  }
+  
+  # -----------------------------------------------------------------------
+  # 4. Correlation test (ligand sum vs signaling score)
+  # -----------------------------------------------------------------------
+  cor_res <- cor.test(pair_df$ligand_sum, pair_df$signaling_score, method = "spearman")
+  
+  cor_label <- sprintf("Spearman rho = %.3f\np = %.2e\nn = %d",
+                       cor_res$estimate, cor_res$p.value, nrow(pair_df))
+  
+  # -----------------------------------------------------------------------
+  # 5. Plot A: scatter — total ligand within neighbor_radius vs signaling score
+  # -----------------------------------------------------------------------
+  p_scatter <- ggplot(pair_df, aes(x = ligand_sum, y = signaling_score)) +
+    geom_point(alpha = 0.4, size = 0.8) +
+    geom_smooth(method = "lm") +
+    annotate("text", x = Inf, y = Inf, label = cor_label,
+             hjust = 1.1, vjust = 1.5, size = 6) +
+    labs(
+      title = "GBM -> Oligodendrocytes",
+      x     = sprintf("Total %s expression within %d um", ligand_label, neighbor_radius),
+      y     = signaling_score
+    ) +
+    theme(axis.title.y = element_text(size = 12))
+  
+  # -----------------------------------------------------------------------
+  # 6. Plot B: boxplot — near vs far split using dist_threshold
+  # -----------------------------------------------------------------------
+  negative.label <- paste0(">", dist_threshold, " um")
+  positive.label <- paste0("<=", dist_threshold, " um")
+  
+  all_target_df <- pair_df %>%
+    mutate(proximity = ifelse(nearest_dist <= dist_threshold,
+                              positive.label,
+                              negative.label))
+  all_target_df$proximity <- factor(all_target_df$proximity, levels = c(positive.label, negative.label))
+  
+  stat_test <- all_target_df %>%
+    wilcox_test(signaling_score ~ proximity, alternative = "greater") %>%
+    adjust_pvalue(method = "fdr") %>%
+    add_significance() %>%
+    add_xy_position(x = "proximity")
+  stat_test$p.label <- sapply(stat_test$p.adj, format.p.value)
+  
+  p_box <- ggplot(all_target_df, aes(x = proximity, y = signaling_score)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_point(position = position_jitter(width = 0.2), alpha = 0.1, size = 1) +
+    stat_pvalue_manual(stat_test, label = "p.label", label.size = 6) +
+    labs(
+      title = "GBM -> Oligodendrocytes",
+      x     = sprintf("Nearest %s+ neighbor", ligand_label),
+      y     = signaling_score
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          axis.title.y = element_text(size = 12)) +
+    stat_summary(fun = "mean", geom = "point", shape = 23, size = 3, fill = "red")
+  
+  # -----------------------------------------------------------------------
+  # 7. Save
+  # -----------------------------------------------------------------------
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  fname_scatter <- sprintf("%s%s_ligandscore_vs_signaling_scatter_%s.pdf", 
+                           output_dir, str_replace_all(ligand_label, "/", "."), signaling_score)
+  pdf(fname_scatter, width = 11, height = 8)
+  print(p_scatter)
+  dev.off()
+  
+  fname_box <- sprintf("%s%s_ligand_proximity_vs_signaling_boxplot_%s.pdf", 
+                       output_dir, str_replace_all(ligand_label, "/", "."), signaling_score)
+  pdf(fname_box, width = 8, height = 8)
+  print(p_box)
+  dev.off()
+  
+  message("Saved: ", fname_scatter)
+  message("Saved: ", fname_box)
+  
+  invisible(list(pairs = pair_df, all_targets = all_target_df, cor = cor_res))
+}
+
+seurat.obj <- AddMetaData(seurat.obj, oligos.metadata.df)
+metadata.df <- seurat.obj@meta.data
+
+
+# Run
+for (pathway in c("reactive.oligo.general", names(fgfr.gene.signatures), "FGFR1", "FGFR2")) {
+  run_ligand_signaling_correlation(
+    metadata.df      = metadata.df,
+    target_celltype  = "Oligodendrocytes",
+    sender_celltypes = c("MES-like", "AC-like", "OPC-like", "NPC-like"),
+    ligands          = c("FGF1", "FGF2"),
+    signaling_score  = pathway,
+    dist_threshold   = radius.use.spatial,
+    neighbor_radius  = radius.use.spatial
+  )
+  
+  run_ligand_signaling_correlation(
+    metadata.df      = metadata.df,
+    target_celltype  = "Oligodendrocytes",
+    sender_celltypes = c("MES-like", "AC-like", "OPC-like", "NPC-like"),
+    ligands          = c("FGF2"),
+    signaling_score  = pathway,
+    dist_threshold   = radius.use.spatial,
+    neighbor_radius  = radius.use.spatial
+  )
+}
+
+stop()
+```
+
+
+
+
+# FastCNV for subset
+```{r}
+seurat.obj <- readRDS(paste0(output.dir, "seurat_objs/", "segmented.seurat.obj.w.annotations.RDS"))
+
+all.clusters <- unique(seurat.obj$seurat_clusters)
+
+subcluster <- "normal" # "malignant" or "normal" or other
+
+if (sample.id == "P2_S1") {
+  subset.use.normal <- c("6", "7", "30", "17", "16", "20", "13", "25", "31", "12", "18", "23", "15", "8", "32", "27", "26", "14", "11", "29", "21") 
+  reference.clusters <- c("12", "18", "31") 
+  
+  
+} else if (sample.id == "P1_A5") {
+  subset.use.normal <- c("5", "3", "23", "15", "22", "12", "14", "19", "20", "6", "9", "13") # "17", 
+  reference.clusters <- c("13") 
+  
+} else if (sample.id == "P2_S11") {
+  subset.use.normal <- c("30", "12", "21", "9", "8", "29") 
+  reference.clusters <- c("29") 
+  
+} else if (sample.id == "P2_S8") {
+  subset.use.normal <- setdiff(all.clusters, c("5"))
+  reference.clusters <- c("20") 
+  
+}
+
+# if malignant
+if (subcluster == "malignant") {
+  subset.use <- setdiff(all.clusters, subset.use.normal)
+  subset.use <- c(subset.use, reference.clusters)
+} else {
+  subset.use <- subset.use.normal
+}
+
+subset.use <- sort(unique(subset.use))
+print(subset.use)
+
+cluster.by <- "seurat_clusters" # celltype or seurat_clusters
+
+
+#seurat.obj <- readRDS(paste0(output.dir, "seurat_objs/", "segmented.seurat.obj.RDS"))
+
+
+seurat.obj$seurat_clusters <- as.character(seurat.obj$seurat_clusters)
+
+if (cluster.by == "seurat_clusters") {
+  seurat.obj$annotation <- seurat.obj$seurat_clusters
+} else {
+  seurat.obj$annotation <- seurat.obj$celltype.by.cluster 
+}
+
+
+seurat.obj <- subset(seurat.obj, subset = annotation %in% subset.use)
+
+# seurat.obj$downsample <- TRUE
+# Idents(seurat.obj) <- "downsample"
+# seurat.obj <- subset(seurat.obj, subset = downsample == TRUE, downsample = 10000)
+
+
+dim(seurat.obj)
+DimPlot(seurat.obj, group.by = "annotation", label = T, shuffle = T)
+
+
+ 
+reference.clusters.label <- paste0(reference.clusters, collapse = ".") %>% str_replace_all("/", ".")
+subset.use.label <- paste0(subset.use, collapse = ".") %>% str_replace_all("/", ".")
+fastcnv.dir <- paste0(output.dir, 'inferCNV/', sample.id, "_subset=", subset.use.label, "_fastCNV_subcluster=", subcluster, "_", reference.clusters.label)
+dir.create(fastcnv.dir)
+
+seurat.obj@meta.data <- seurat.obj@meta.data %>% dplyr::mutate(annotation = ifelse(annotation %in% reference.clusters, "Reference", annotation))
+
+# Assuming your Seurat object is named 'seurat_obj'
+# 1. Get the raw or normalized counts matrix (rows = genes, cols = cells)
+counts <- GetAssayData(seurat.obj, assay = "RNA", slot = "counts")
+
+# 2. Calculate the fraction of cells expressing each gene
+# (binarize the matrix to 0 and 1, sum across rows, and divide by total cells)
+percent_cells <- rowSums(counts > 0) / ncol(counts)
+
+# 3. Filter for genes expressed in at least 5% (0.05) of cells
+expressed_genes <- names(percent_cells[percent_cells >= 0.01])
+
+# 4. Subset your Seurat object to keep only these genes
+seurat_filtered <- subset(seurat.obj, features = expressed_genes)
+
+
+denoise <- T
+windowSize <- 100
+
+
+
+
+if (sample.id == "P2_S1") {
+  
+  if (subcluster == "malignant") {
+    topNGenes <- 12000
+    thresholdPercentile <- 0.1
+  } else {
+    topNGenes <- 12000
+    thresholdPercentile <- 0.05
+  }
+  
+} else if (sample.id == "P1_A5") {
+  
+  if (subcluster == "malignant") {
+    topNGenes <- 10000
+    thresholdPercentile <- 0.1
+  } else {
+    topNGenes <- 12000
+    thresholdPercentile <- 0.1
+  }
+  
+} else if (sample.id == "P2_S11") {
+  
+  if (subcluster == "malignant") {
+    topNGenes <- 12000
+    thresholdPercentile <- 0.1
+  } else {
+    topNGenes <- 12000
+    thresholdPercentile <- 0.1
+  }
+} else if (sample.id == "P2_S8") {
+  
+  if (subcluster == "malignant") {
+    topNGenes <- 7000
+    thresholdPercentile <- 0.1
+  } else {
+    topNGenes <- 7000
+    thresholdPercentile <- 0.1
+  }
+}
+
+# P2A1 nonmalignant 12000 0.05 
+# P2A1 malignant 12000 0.1
+
+# P1A5 nonmalignant 12000 0.1 
+# P1A5 malignant 10000 0.1
+
+referenceLabel <- reference.clusters
+
+
+sampleName <- paste0(sample.id, "_denoise=", denoise, "_topNGenes=", topNGenes, "_thresholdPercentile=", thresholdPercentile,
+                     "_windowSize=", windowSize, "_referenceLabel=", paste0(reference.clusters.label, collapse = "."))
+
+print(sampleName)
+
+unique(seurat.obj$annotation)
+
+
+
+seurat.obj <- fastCNV_10XHD(seurat.obj, 
+                            sampleName = sampleName, 
+                            referenceVar = "annotation", 
+                            referenceLabel = "Reference", 
+                            assay = "RNA", 
+                            printPlot = FALSE,
+                            outputType = "png",
+                            denoise = denoise,
+                            savePath = fastcnv.dir,
+                            topNGenes = topNGenes,
+                            thresholdPercentile = thresholdPercentile,
+                            windowSize=windowSize,
+                            k_clusters = NULL)
+
+p1 <- DimPlot(seurat.obj, group.by = "seurat_clusters", label = T, shuffle = T)
+p2 <- DimPlot(seurat.obj, group.by = "cnv_clusters", label = T, shuffle = T)
+p3 <- DimPlot(seurat.obj, group.by = "celltype.by.cluster.fine", label = T, shuffle = T)
+p <- p1 + p2 + p3
+pdf(paste0(fastcnv.dir, "/", sampleName, "_cnv_clusters.pdf"), width = 24, height = 8)
+print(p)
+dev.off()
+
+df <- seurat.obj@meta.data %>% dplyr::select(cell_id, cnv_clusters, cnv_fraction)
+write.table(df, paste0(output.dir, "inferCNV/", sample.id, "_subset=", subset.use.label, "_fastCNV_result.tsv"), sep = "\t", row.names = T, col.names = T, quote = F)
+```
+
+
+
+
+# FastCNV
+All cells
+```{r}
+sample.info.df <- read_excel(paste0(root.dir, "RawData/", "autopsy_sample_information.xlsx"), sheet = 4) %>% filter(`Sample ID` == sample.id)
+normal.clusters <- sample.info.df %>% filter(Denoise == denoise.label, Filter == filter) %>% pull(`Normal Clusters`) %>% str_split(", ") %>% unlist()
+
+
+cluster.by <- "seurat_clusters" # celltype or seurat_clusters
+
+#seurat.obj <- readRDS(paste0(output.dir, "seurat_objs/", "segmented.seurat.obj.RDS"))
+seurat.obj <- readRDS(paste0(output.dir, "seurat_objs/", "segmented.seurat.obj.w.annotations.RDS"))
+
+seurat.obj$seurat_clusters <- as.character(seurat.obj$seurat_clusters)
+
+if (cluster.by == "seurat_clusters") {
+  seurat.obj$annotation <- seurat.obj$seurat_clusters
+  
+  if (sample.id == "P2_S11") {
+    reference.clusters <- c("29")
+  } else if (sample.id == "P1_A5") {
+    reference.clusters <- c("13")
+  } else if (sample.id == "P2_S8") {
+    reference.clusters <- c("20", "0", "13", "14", "23", "17")
+  } else {
+    reference.clusters <- c("10", "13", "17", "15", "11")
+  }
+  
+  #seurat.obj@meta.data <- seurat.obj@meta.data %>% mutate(annotation = ifelse(annotation %in% reference.clusters, annotation, celltype.by.cluster.fine))
+  #seurat.obj$annotation <- sapply(seurat.obj$annotation, function(x) ifelse(x %in% reference.clusters, "Reference", x))
+  unique(seurat.obj$annotation)
+  
+} else {
+  seurat.obj$annotation <- seurat.obj$celltype.by.cluster 
+  #reference.clusters <- setdiff(unique(seurat.obj$annotation), "Malignant cluster")
+  seurat.obj@meta.data <- seurat.obj@meta.data %>% mutate(annotation = ifelse(seurat_clusters %in% c("12", "18", "23", "25"), "Reference", celltype.by.cluster))
+  reference.clusters <- "Reference"
+  
+  #seurat.obj$annotation <- sapply(seurat.obj$annotation, function(x) ifelse(x %in% reference.clusters, "Reference", x))
+}
+
+DimPlot(seurat.obj, group.by = "annotation", label = T)
+
+reference.clusters.label <- paste0(reference.clusters, collapse = ".")  %>% str_replace_all("/", ".")
+fastcnv.dir <- paste0(output.dir, 'inferCNV/', sample.id, "_fastCNV_", reference.clusters.label)
+dir.create(fastcnv.dir)
+
+downsample <- T
+if (downsample) {
+  seurat.obj$downsample <- T
+  Idents(seurat.obj) <- "downsample"
+  seurat.obj <- subset(seurat.obj, subset = downsample == T, downsample = 10000)
+}
+
+
+#seurat.obj <- subset(seurat.obj, subset = annotation == "Astrocytes")
+
+# Assuming your Seurat object is named 'seurat_obj'
+# 1. Get the raw or normalized counts matrix (rows = genes, cols = cells)
+counts <- GetAssayData(seurat.obj, assay = "RNA", slot = "counts")
+
+# 2. Calculate the fraction of cells expressing each gene
+# (binarize the matrix to 0 and 1, sum across rows, and divide by total cells)
+percent_cells <- rowSums(counts > 0) / ncol(counts)
+
+# 3. Filter for genes expressed in at least 5% (0.05) of cells
+expressed_genes <- names(percent_cells[percent_cells >= 0.01])
+
+# 4. Subset your Seurat object to keep only these genes
+seurat_filtered <- subset(seurat.obj, features = expressed_genes)
+
+
+print(length(expressed_genes))
+
+denoise <- T
+topNGenes <- 12000
+thresholdPercentile <- 0.1
+windowSize <- 100
+
+if (denoise) {
+  referenceLabel <- reference.clusters
+} else {
+  referenceLabel <- reference.clusters
+}
+
+unique(seurat.obj$annotation)
+print(referenceLabel)
+
+sampleName <- paste0(sample.id, "_denoise=", denoise, "_topNGenes=", topNGenes, "_thresholdPercentile=", thresholdPercentile,
+                     "_windowSize=", windowSize, "_referenceLabel=", paste0(str_replace_all(referenceLabel, "/", "."), collapse = "."))
+
+seurat.obj <- fastCNV_10XHD(seurat.obj, 
+                            sampleName = sampleName, 
+                            referenceVar = "annotation", 
+                            referenceLabel = referenceLabel, 
+                            assay = "RNA", 
+                            printPlot = FALSE,
+                            outputType = "png",
+                            denoise = denoise,
+                            savePath = fastcnv.dir,
+                            topNGenes = topNGenes,
+                            thresholdPercentile = thresholdPercentile,
+                            windowSize=windowSize,
+                            k_clusters = NULL)
+
+DimPlot(seurat.obj, group.by = "cnv_clusters", shuffle = T)
+dim(seurat.obj)
+
+
+
+stop()
+
+seurat.obj$cnv_clusters
+seurat.obj.subset <- subset(seurat.obj, subset = cnv_clusters %in% c("7"))
+dim(seurat.obj.subset)
+seurat.obj.subset <- fastCNV_10XHD(seurat.obj.subset, 
+                            sampleName = paste0(sample.id, "_subset"), 
+                            referenceVar = "annotation", 
+                            referenceLabel = NULL, 
+                            assay = "RNA", 
+                            printPlot = FALSE,
+                            outputType = "png",
+                            denoise = FALSE,
+                            savePath = fastcnv.dir,
+                            topNGenes = 7000,
+                            thresholdPercentile = 0.01,
+                            windowSize=150,
+                            k_clusters = NULL)
+
+DimPlot(seurat.obj, group.by = "cnv_clusters", shuffle = T)
+
+
+stop()
+hist(seurat.obj$cnv_fraction)
+seurat.obj$cnv_clusters <- as.character(seurat.obj$cnv_clusters)
+y <- "cnv_clusters"
+p <- ggplot() +
+    geom_point(
+      data = seurat.obj@meta.data,
+      aes(x = x * microns_per_pixel, 
+          y = y * microns_per_pixel, 
+          color = .data[[y]]),
+      size = 0.2,
+      alpha = 0.9
+    ) +
+    coord_equal(expand = FALSE) +
+    scale_y_reverse() +
+    xlab("x (microns)") +
+    ylab("y (microns)")
+
+
+y <- "cnv_fraction"
+p <- ggplot() +
+    geom_raster(
+      data = r_small_df,
+      aes(
+        x = x * microns_per_pixel,
+        y = y * microns_per_pixel,
+        fill = rgb(r, g, b, maxColorValue = 255)
+      )
+    ) +
+    scale_fill_identity() +
+    geom_point(
+      data = seurat.obj@meta.data,
+      aes(x = x * microns_per_pixel, 
+          y = y * microns_per_pixel, 
+          color = .data[[y]]),
+      size = 0.2,
+      alpha = 0.9
+    ) +
+    coord_equal(expand = FALSE) +
+    scale_y_reverse() +
+    xlab("x (microns)") +
+    ylab("y (microns)")
+  
+```
+
+
+
+# InferCNV
+```{r}
+sample.info.df <- read_excel(paste0(root.dir, "RawData/", "autopsy_sample_information.xlsx"), sheet = 4) %>% filter(`Sample ID` == sample.id)
+normal.clusters <- sample.info.df %>% filter(Denoise == denoise.label, Filter == filter) %>% pull(`Normal Clusters`) %>% str_split(", ") %>% unlist()
+
+use.normal.clusters <- T
+use.hmm <- F
+cluster.by.groups <- T
+cluster.by <- "seurat_clusters" # "seurat_clusters", "subclusters"
+
+infercnv.sample.id <- sample.id
+
+
+#seurat.obj <- readRDS(paste0(output.dir, "seurat_objs/", "segmented.seurat.obj.RDS"))
+seurat.obj <- readRDS(paste0(output.dir, "seurat_objs/", "segmented.seurat.obj.w.annotations.RDS"))
+seurat.obj$seurat_clusters <- as.character(seurat.obj$seurat_clusters)
+unique(seurat.obj$seurat_clusters)
+seurat.obj$downsample <- T
+Idents(seurat.obj) <- "downsample"
+#seurat.obj <- subset(seurat.obj, subset = downsample == T, downsample = 10000)
+
+if (cluster.by == "subclusters") {
+  infercnv.sample.id <- paste0(infercnv.sample.id, "_oligo.only")
+  seurat.obj$cluster <- apply(seurat.obj@meta.data, 1, function(row) ifelse(!is.na(row[["oligo_clusters"]]), paste0("O_", row[["oligo_clusters"]]), row[["seurat_clusters"]]))
+} else if (cluster.by == "seurat_clusters") {
+  seurat.obj$cluster <- seurat.obj$seurat_clusters
+} else if (cluster.by == "celltype") {
+  seurat.obj$cluster <- seurat.obj$celltype.by.cluster
+  #seurat.obj$cluster <- apply(seurat.obj@meta.data, 1, function(row) ifelse(row[["seurat_clusters"]] %in% normal.clusters, "Neurons", row[["celltype.by.cluster"]]))
+}
+
+
+table(seurat.obj$cluster)
+
+#infercnv.sample.id <- paste0(infercnv.sample.id, "_oligo_myeloid")
+#seurat.obj <- subset(seurat.obj, subset = cluster %in% c("Oligodendrocytes", "Myeloid", "Neurons"))
+
+table(seurat.obj$cluster)
+
+
+# get normal/reference clusters
+all.clusters <- unique(seurat.obj$cluster)
+print(all.clusters)
+
+if (use.normal.clusters) {
+  normal.clusters <- sample.info.df %>% filter(Denoise == denoise.label, Filter == filter) %>% pull(`Normal Clusters`) %>% str_split(", ") %>% unlist()
+} else {
+  if (cluster.by == "seurat_clusters") {
+    predicted.malignant.clusters <- sample.info.df %>% filter(Denoise == denoise.label, Filter == filter) %>% pull(`Malignant Clusters`) %>% str_split(", ") %>% unlist()
+    normal.clusters <- setdiff(all.clusters, predicted.malignant.clusters)
+  } else {
+    normal.clusters <- setdiff(all.clusters, "Malignant cluster")
+  }
+}
+
+normal.clusters <- sort(intersect(normal.clusters, all.clusters))
+print(normal.clusters)
+
+
+if (cluster.by == "subclusters") {
+  clusters.use <- c(all.clusters[startsWith(all.clusters, "O")], normal.clusters)
+  seurat.obj <- subset(seurat.obj, subset = cluster %in% clusters.use)
+} 
+
+
+dim(seurat.obj)
+table(seurat.obj$cluster)
+
+
+DimPlot(seurat.obj, group.by = "cluster", shuffle = T, label = T)
+FeaturePlot(seurat.obj, features = c("CDK4", "MDM2"), order = T)
+
+
+count.matrix.infer.cnv <- seurat.obj@assays$RNA$counts
+print(dim(count.matrix.infer.cnv))
+
+# create annotations file and output directory
+annotations.df <- data.frame(cell=colnames(seurat.obj), annotation=seurat.obj$cluster)
+
+
+# create annotations file and infercnv output folder
+normal.clusters.label <- paste0(normal.clusters, collapse=".")
+
+
+infercnv.output.dir <- paste0(output.dir, 'inferCNV/', infercnv.sample.id, '_normal.corrected.', normal.clusters.label)
+
+if (use.hmm) {
+  infercnv.output.dir <- paste0(infercnv.output.dir, '.hmm_i6')
+}
+infercnv.output.dir <- paste0(infercnv.output.dir, '/')
+
+dir.create(infercnv.output.dir, showWarnings = TRUE)
+print(infercnv.output.dir)
+
+annotations.file.path <- paste0(infercnv.output.dir, sample.id, '_infer.cnv.annotations.file.normal.corrected.tsv')
+write.table(annotations.df, annotations.file.path, sep="\t", row.names=F, col.names=F, quote=F)
+
+
+
+# create infercnv object
+infercnv_obj = CreateInfercnvObject(raw_counts_matrix=count.matrix.infer.cnv,
+                                    annotations_file=annotations.file.path,
+                                    gene_order_file=paste0(root.dir, "ExternalData/hg38_gencode_v27.txt"),
+                                    ref_group_names=normal.clusters)
+
+
+# run default analysis
+infercnv_obj_default = infercnv::run(
+  infercnv_obj,
+  cutoff=0.01, # cutoff=1 works well for Smart-seq2, and cutoff=0.1 works well for 10x Genomics
+  out_dir=infercnv.output.dir,
+  cluster_by_groups=cluster.by.groups, 
+  analysis_mode='subclusters',
+  HMM_type='i6',
+  plot_steps=FALSE,
+  denoise=TRUE,
+  HMM=use.hmm, # HMM=TRUE needs a lot of memory
+  no_prelim_plot=FALSE,
+  png_res=300,
+  save_rds = FALSE,
+  save_final_rds = FALSE
+)
+
+print('done')
+```
+
+
+
+
+# FGF all samples 
+```{r}
+radius.use <- 100
+
+df <- data.frame()
+
+for (sample.id in c("P2_S1")) { # c("P2_S1", "P1_A5", "P2_S11")
+  neighborhood.dir <- paste0(root.dir, "Results/", "my_data/", "autopsy/", "visium/", sample.id, "/", sample.id, "_denoise.FALSE_filter.TRUE/", "segmented/", "neighborhood_radius=", radius.use, "_microns/")
+  oligos.metadata.df <- read.csv(paste0(neighborhood.dir, sample.id, "_FGFFGF1.FGF2_oligos.metadata_FGF.tsv"), sep = "\t", row.names = 1)
+  row.df <- oligos.metadata.df %>% dplyr::select(reactive.oligo.general, neighborhood.annotation, sample.id)
+  df <- rbind(df, row.df)
+}
+df$neighborhood.annotation <- sapply(df$neighborhood.annotation, function(x) case_when(
+  x == "GBM FGF1.FGF2-" ~ "GBM FGF1/2-",
+  x == "GBM FGF1.FGF2+" ~ "GBM FGF1/2+",
+  TRUE ~ x
+))
+df$sample.desc <- sapply(df$sample.id, function(x) case_when(
+  x == "P1_A5" ~ "GBM 1 Edge",
+  x == "P2_S1" ~ "GBM 2 Core",
+  x == "P2_S11" ~ "GBM 2 Brainstem",
+  TRUE ~ x
+))
+df$neighborhood.annotation <- factor(df$neighborhood.annotation, levels = c("GBM-", "GBM FGF1/2-", "GBM FGF1/2+"))
+
+
+# Split the dataframe by sample
+df$sample.desc <- factor(df$sample.desc, levels = c("GBM 1 Edge", "GBM 2 Core", "GBM 2 Brainstem"))
+df_list <- df %>% group_split(sample.desc)
+plot_list <- list()
+
+for (i in seq_along(df_list)) {
+  
+  current_df <- df_list[[i]]
+  current_sample <- unique(current_df$sample.desc)
+  
+  # 1. Add cell counts to create the dynamic x-axis strings
+  current_df <- current_df %>%
+    group_by(neighborhood.annotation) %>%
+    mutate(
+      n_cells = n(),
+      labeled_neighborhood = paste0(neighborhood.annotation, "\n(n=", n_cells, ")")
+    ) %>%
+    ungroup()
+  
+  # 2. FORCE THE X-AXIS ORDER
+  # We look up what the dynamic string names became for your three target groups
+  gbm_neg_label <- current_df %>% filter(neighborhood.annotation == "GBM-") %>% pull(labeled_neighborhood) %>% unique()
+  fgf_neg_label <- current_df %>% filter(neighborhood.annotation == "GBM FGF1/2-") %>% pull(labeled_neighborhood) %>% unique()
+  fgf_pos_label <- current_df %>% filter(neighborhood.annotation == "GBM FGF1/2+") %>% pull(labeled_neighborhood) %>% unique()
+  
+  # Convert to factor using your explicit sequence order
+  current_df <- current_df %>%
+    mutate(labeled_neighborhood = factor(labeled_neighborhood, levels = c(gbm_neg_label, fgf_neg_label, fgf_pos_label)))
+  
+  # 3. Run the statistical test on the clean strings
+  stat.test <- current_df %>%
+    wilcox_test(reactive.oligo.general ~ neighborhood.annotation,
+                comparisons = list(c("GBM-", "GBM FGF1/2-"), c("GBM FGF1/2-", "GBM FGF1/2+"), c("GBM-", "GBM FGF1/2+")),
+                alternative = "less") %>%
+    add_significance() %>%
+    adjust_pvalue(method = "fdr")
+  
+  # 4. Create a clean lookup table to map the names
+  label_mapping <- current_df %>% 
+    distinct(neighborhood.annotation, labeled_neighborhood)
+  
+  # 5. Swap the original group1/group2 names with the exact (n=X) strings
+  stat.test <- stat.test %>%
+    left_join(label_mapping, by = c("group1" = "neighborhood.annotation")) %>%
+    mutate(group1 = as.character(labeled_neighborhood)) %>% 
+    select(-labeled_neighborhood) %>%
+    left_join(label_mapping, by = c("group2" = "neighborhood.annotation")) %>%
+    mutate(group2 = as.character(labeled_neighborhood)) %>% 
+    select(-labeled_neighborhood)
+  
+  # 6. Calculate bracket coordinates using the factor column
+  stat.test <- stat.test %>%
+    add_xy_position(x = "labeled_neighborhood", data = current_df, formula = reactive.oligo.general ~ labeled_neighborhood)
+  
+  stat.test$p.label <- sapply(stat.test$p.adj, format.p.value)
+  
+  # 7. Build the individual plot using your exact format
+  # p <- ggplot(current_df, aes(labeled_neighborhood, reactive.oligo.general, color = labeled_neighborhood)) +
+  #   geom_boxplot() +
+  #   theme(
+  #     axis.text.x = element_text(angle = 45, hjust = 1),
+  #     legend.position = "none"
+  #   ) +
+  #   labs(
+  #     title = current_sample, 
+  #     x = "Neighborhood", 
+  #     y = "Reactive oligo signature"
+  #   ) +
+  #   stat_pvalue_manual(stat.test, label = "p.label", label.size = 6, step.increase = 0.1)
+  
+  
+  p <- ggplot(current_df, aes(labeled_neighborhood, reactive.oligo.general, color = labeled_neighborhood)) +
+    geom_boxplot() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "none"
+    ) +
+    labs(
+      x = "Neighborhood (100 microns)", 
+      y = "Reactive oligo signature"
+    ) +
+    stat_pvalue_manual(stat.test, label = "p.label", label.size = 6, step.increase = 0.1)
+  
+  plot_list[[i]] <- p
+}
+
+# Stitch them together side-by-side
+#final_plot <- plot_list[[1]] + plot_list[[2]] + plot_list[[3]] + plot_layout(ncol = 3)
+
+final_plot <- plot_list[[1]]
+#pdf(paste0(root.dir, "Figures/", "Figure 5/", "FGF_neighborhood_vs_reactive.oligo.general_by_sample.desc.pdf"), width = 16, height = 8)
+pdf(paste0(root.dir, "Figures/", "Figure 5/", "FGF_neighborhood_vs_reactive.oligo.general_P2_S1.pdf"), width = 10, height = 7)
+print(final_plot)
+dev.off()
+```
+

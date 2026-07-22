@@ -1,0 +1,805 @@
+---
+title: "Figure_5.RMD"
+output: html_document
+date: "2026-07-01"
+---
+
+
+
+# Setup
+```{r}
+root.dir <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Projects/Jackie_post-mortem/"
+figures.dir <- paste0(root.dir, "Figures/", "Figure 5/")
+supp.figures.dir <- paste0(root.dir, "Figures/", "Figure 5/", "Supplemental/")
+
+suppressMessages(suppressWarnings(source(paste0(root.dir, "Code/", 'helper_functions.R'))))
+
+
+library(corrplot)
+```
+
+
+
+# Main: Nomura correlations
+```{r}
+seurat.obj <- readRDS(paste0(root.dir, "ProcessedData/", "Nomura_2025_GBM/", "Nomura_2025_GBM_merged_seurat_obj.RDS"))
+seurat.obj$keep <- !is.na(seurat.obj$CellType)
+seurat.obj <- subset(seurat.obj, subset = keep == TRUE)
+
+
+seurat.obj.oligo <- subset(seurat.obj, subset = CellType == "Oligodendrocyte")
+seurat.obj.oligo <- add.module.score(seurat.obj.oligo, oligo.gene.signatures["reactive.oligo.general"])
+seurat.obj.oligo <- add.module.score(seurat.obj.oligo, gene.signatures.gsea["hypoxia.signature"])
+
+
+oligo.df <- seurat.obj.oligo@meta.data %>% 
+  group_by(Patient, Sample, Timepoint) %>%
+  summarize(mean.reactive.oligo = mean(reactive.oligo.general),
+            mean.hypoxia.signature = mean(hypoxia.signature)) %>%
+  ungroup() 
+
+
+for (timepoint.use in c("Primary", "Recurrent")) {
+  
+  if (timepoint.use == "Recurrent") {
+    seurat.obj@meta.data <- seurat.obj@meta.data %>% mutate(CellTypeBroad = CellType) # merge malignant
+  } else {
+    seurat.obj@meta.data <- seurat.obj@meta.data %>% mutate(CellTypeBroad = ifelse(CellType == "Malignant", State, CellType))
+    
+  }
+  
+  celltype.comp.df <- seurat.obj@meta.data %>% 
+    group_by(Patient, Sample, Timepoint, CellTypeBroad) %>%
+    summarize(count = n()) %>%
+    mutate(fraction.celltype = count / sum(count)) %>%
+    ungroup() 
+  
+  
+  celltype.comp.wide.df <- celltype.comp.df %>%
+    pivot_wider(id_cols = c(Patient, Sample, Timepoint), names_from = CellTypeBroad, values_from = fraction.celltype, values_fill = 0)
+  
+  df <- celltype.comp.wide.df %>% inner_join(oligo.df, by = c("Patient", "Sample", "Timepoint"))
+  df <- df %>%
+    dplyr::rename(`Reactive oligodendrocyte signature` = mean.reactive.oligo,
+                  `Hypoxia signature` = mean.hypoxia.signature)
+  
+  if (timepoint.use == "Primary") {
+    df <- df %>% filter(Timepoint == "T1")
+  } else {
+    df <- df %>% filter(Timepoint != "T1")
+  }
+  
+  
+  # correlation plot
+  data <- df
+  data$Sample <- NULL
+  data$Timepoint <- NULL
+  data$Patient <- NULL
+  data$count <- NULL
+  
+  res <- Hmisc::rcorr(as.matrix(data), type = correlation.method.use)
+  cor.table <- res$r
+  p.mat     <- res$P
+  p.mat[is.na(p.mat)] <- 1
+  
+  p.mat.df <- data.frame(p.mat)
+  p.mat.df$celltype <- rownames(p.mat.df)
+  write.table(p.mat.df, paste0(figures.dir, "corrplot_by_cell_type_composition_", timepoint.use, "_pvals.tsv"), sep = "\t", row.names = F, col.names = T)
+  
+  col_range <- colorRampPalette(c("blue", "white", "red"))(200)
+  
+  if (timepoint.use == "Primary") {
+    x.use <- 25
+    y.use <- 12
+  } else {
+    x.use <- 16
+    y.use <- 8
+  }
+  
+  pdf(paste0(figures.dir, "corrplot_by_cell_type_composition_", timepoint.use, ".pdf"), width = 12, height = 12)
+  
+  # increase right margin
+  par(mar = c(5, 4, 4, 6))
+
+  corrplot(
+    cor.table,
+    order = "hclust",
+    hclust.method = "average",
+    type = "upper",
+    method = "color",
+    col = col_range,
+    tl.col = "black",
+    tl.srt = 45,
+    p.mat = p.mat,
+    sig.level = c(0.001, 0.01, 0.05),
+    insig = "label_sig",
+    pch.col = "black",
+    pch.cex = 1.2
+  )
+  text(x = x.use, y = y.use, labels = paste0(str_to_title(correlation.method.use), "'s correlation"), 
+   srt = 270, xpd = TRUE, cex = 1.2)
+  dev.off()
+}  
+
+
+
+```
+
+
+
+# Supp: Nomura GBM pre- and post-treatment correlations by cell type
+```{r}
+plot.list <- list()
+celltypes <- sort(unique(celltype.comp.df$CellTypeBroad))
+celltypes.color.scale <- scale_color_manual(breaks = celltypes, values = as.character(polychrome(length(celltypes))))
+
+df <- celltype.comp.df %>% inner_join(oligo.df, by = c("Patient", "Sample", "Timepoint"))
+for (s in celltypes) {
+  for (t in c("Primary", "Recurrent")) {
+    if (t == "Primary") {
+      temp <- df %>% filter(CellTypeBroad == s, Timepoint == "T1")
+    } else {
+      temp <- df %>% filter(CellTypeBroad == s, Timepoint != "T1")
+    }
+    
+    res <- cor.test(temp$fraction.celltype, temp$mean.reactive.oligo)
+    p.val <- res$p.value
+    if (res$p.value < 0.001) {
+      p.val <- formatC(res$p.value, format = "e", digits = 2)
+    } else {
+      p.val <- round(res$p.value, 3)
+    }
+    p <- ggplot(temp, aes(fraction.celltype, mean.reactive.oligo, color = CellTypeBroad)) +
+      geom_point() +
+      geom_smooth(method = "lm") +
+      xlab("Fraction cell type in sample") +
+      ylab("Reactive oligodendrocyte signature\nin oligodendrocytes") +
+      annotate("text", label = paste0("rho = ", round(res$estimate, 2), "\np-value = ", p.val), x = -Inf, y = Inf, hjust = 0, vjust = 1) + 
+      ggtitle(paste0(s, " - ", t)) + 
+      celltypes.color.scale +
+      theme(legend.position="none")
+    plot.list[[paste0(s, " - ", t)]] <- p
+  }
+}
+
+p <- cowplot::plot_grid(plotlist = plot.list)
+pdf(paste0(supp.figures.dir, "cell_type_composition_by_cell_type_vs_reactive_oligo_signature.pdf"), width = 30, height = 20)
+print(p)
+dev.off()
+```
+
+
+
+# Brad signatures in Nomura
+```{r}
+seurat.obj <- readRDS(paste0(root.dir, "ProcessedData/", "Nomura_2025_GBM/", "Nomura_2025_GBM_merged_seurat_obj.RDS"))
+
+oligo.genes <- c("OLIG2", "SOX10", "BCAS1", "ENPP6", "ASPA", "OPALIN", "MOG", "MBP")
+seurat.obj$keep <- !is.na(seurat.obj$CellType)
+seurat.obj <- subset(seurat.obj, subset = keep == TRUE)
+
+data <- FetchData(seurat.obj, vars =  c("FGF1", "FGF2", "FGFR1", "FGFR2", oligo.genes))
+seurat.obj <- AddMetaData(seurat.obj, data)
+
+seurat.obj.oligo <- subset(seurat.obj, subset = CellType == "Oligodendrocyte")
+seurat.obj.oligo <- add.module.score(seurat.obj.oligo, oligo.gene.signatures)
+seurat.obj.oligo <- add.module.score(seurat.obj.oligo, fgf.gene.signatures)
+
+reactive.oligo.threshold <- median(seurat.obj.oligo$reactive.oligo.general)
+
+# reactive oligo signature cutoff
+ggplot(seurat.obj.oligo@meta.data, aes(x = reactive.oligo.general)) + 
+  geom_histogram() + 
+  geom_vline(aes(xintercept = reactive.oligo.threshold), color = "blue")
+
+seurat.obj.oligo$reactive.oligo <- seurat.obj.oligo$reactive.oligo.general > reactive.oligo.threshold
+
+df <- seurat.obj.oligo@meta.data %>%
+  pivot_longer(cols = names(fgf.gene.signatures), names_to = "Signature", values_to = "Score") 
+
+p <- ggplot(df, aes(reactive.oligo, Score)) +
+  geom_boxplot() +
+  stat_compare_means() +
+  facet_wrap(~Signature)
+
+pdf(paste0(supp.figures.dir, "reactive.oligo_vs_fgf.gene.signatures.pdf"), width = 12, height = 8)
+print(p)
+dev.off()
+```
+
+
+
+# FGF and FGFR expression in Nomura
+```{r}
+save.dir <- paste0(root.dir, "Figures/", "Figure 5/", "FGF_FGFR/")
+seurat.obj <- readRDS(paste0(root.dir, "ProcessedData/", "Nomura_2025_GBM/", "Nomura_2025_GBM_merged_seurat_obj.RDS"))
+
+seurat.obj$keep <- !is.na(seurat.obj$CellType)
+seurat.obj <- subset(seurat.obj, subset = keep == TRUE)
+
+seurat.obj$Timepoint <- sapply(seurat.obj$timepoint, function(x) ifelse(x == "T1", "Primary", "Recurrent"))
+
+
+oligo.genes <- c("OLIG2", "SOX10", "BCAS1", "ENPP6", "ASPA", "OPALIN", "MOG", "MBP")
+data <- FetchData(seurat.obj, vars =  c("FGF1", "FGF2", "FGFR1", "FGFR2", oligo.genes))
+seurat.obj <- AddMetaData(seurat.obj, data)
+
+
+
+seurat.obj.malignant <- subset(seurat.obj, subset = CellType == "Malignant")
+seurat.obj.malignant$State <- factor(seurat.obj.malignant$State, levels = c("AC", "MES", "Stress", "Hypoxia", "GPC", "Cilia",  "OPC", "NPC", "Neuron", "Unresolved"))
+p <- DotPlot(seurat.obj.malignant, features = c("FGF2", "FGF1"), group.by = "State", scale = F) +
+  scale_color_viridis_c(option = "inferno") +
+  ylab("Malignant state") +
+  xlab("Ligand")
+pdf(paste0(save.dir, "nomura_2025_gbm_fgf1_fgf2_expression_by_malignant_state.pdf"), width = 6, height = 8)
+print(p)
+dev.off()
+
+
+
+seurat.obj.oligo <- subset(seurat.obj, subset = CellType == "Oligodendrocyte")
+seurat.obj.oligo <- add.module.score(seurat.obj.oligo, oligo.gene.signatures)
+
+# FGFR downsteram pathways
+pathways.use <- c("HALLMARK_PI3K_AKT_MTOR_SIGNALING", "KEGG_MAPK_SIGNALING_PATHWAY", "BIOCARTA_PLC_PATHWAY", "HALLMARK_IL6_JAK_STAT3_SIGNALING")
+
+seurat.obj.oligo <- add.module.score(seurat.obj.oligo, fgfr.gene.signatures[pathways.use])
+
+reactive.oligo.threshold <- median(seurat.obj.oligo$reactive.oligo.general)
+
+seurat.obj.oligo$reactive.oligo <- seurat.obj.oligo$reactive.oligo.general > reactive.oligo.threshold
+
+seurat.obj.oligo@meta.data <- seurat.obj.oligo@meta.data %>% dplyr::mutate(CellTypeNew = case_when(
+  reactive.oligo ~ "Oligodendrocyte\n(reactive high)",
+  TRUE ~ "Oligodendrocyte\n(reactive low)"
+)) 
+
+
+color_scale_use <- scale_color_manual(
+  breaks = c("Oligodendrocyte\n(reactive high)", "Oligodendrocyte\n(reactive low)"),
+  values = c("#556B2F", "#A6D854"),
+  guide = "none"
+)
+
+seurat.obj.oligo$CellType <- NULL
+for (by_sample_use in c(T, F)) {
+  
+  plot_gene_expression(seurat.obj.oligo@meta.data, 
+                       features = c("FGFR2", "FGFR1"), 
+                       cell_type_col = "CellTypeNew",
+                       cell_type_levels = c("Oligodendrocyte\n(reactive high)", "Oligodendrocyte\n(reactive low)"),
+                       color_values = c("#556B2F", "#A6D854"),
+                       color_breaks = c("Oligodendrocyte\n(reactive high)", "Oligodendrocyte\n(reactive low)"),
+                       by_sample = by_sample_use, 
+                       plot_width = 16,
+                       plot_height = 8,
+                       output_path = paste0(save.dir, "nomura_2025_gbm_fgfr1_fgfr2_expression_by_reactive.oligo_sample_use=", by_sample_use, ".pdf"))
+  
+  oligo.genes.plot <- c("BCAS1", "ENPP6", "MBP", "ASPA")
+  plot_gene_expression(seurat.obj.oligo@meta.data, 
+                       features = oligo.genes.plot, 
+                       cell_type_col = "CellTypeNew",
+                       cell_type_levels = c("Oligodendrocyte\n(reactive high)", "Oligodendrocyte\n(reactive low)"),
+                       color_values = c("#556B2F", "#A6D854"),
+                       color_breaks = c("Oligodendrocyte\n(reactive high)", "Oligodendrocyte\n(reactive low)"),
+                       by_sample = by_sample_use, 
+                       plot_width = 16,
+                       plot_height = 8,
+                       output_path = paste0(save.dir, "nomura_2025_gbm_oligo_genes_expression_by_reactive.oligo_sample_use=", by_sample_use, ".pdf"))
+  
+  plot_gene_expression(seurat.obj.oligo@meta.data, 
+                       features = pathways.use, 
+                       cell_type_col = "CellTypeNew",
+                       cell_type_levels = c("Oligodendrocyte\n(reactive high)", "Oligodendrocyte\n(reactive low)"),
+                       color_values = c("#556B2F", "#A6D854"),
+                       color_breaks = c("Oligodendrocyte\n(reactive high)", "Oligodendrocyte\n(reactive low)"),
+                       by_sample = by_sample_use, 
+                       plot_width = 30,
+                       plot_height = 8,
+                       output_path = paste0(save.dir, "nomura_2025_gbm_fgfr_signaling_by_reactive.oligo_sample_use=", by_sample_use, ".pdf"))
+}
+```
+
+
+
+# OPC-oligo state
+```{r}
+save.dir <- paste0(root.dir, "Figures/", "Figure 5/", "Oligo_OPC/")
+seurat.obj.oligo.opc <- subset(seurat.obj, subset = CellType %in% c("Oligodendrocyte", "OPC"))
+seurat.obj.oligo.opc <- add.module.score(seurat.obj.oligo.opc, oligo.gene.signatures)
+
+color_scale_use <- scale_color_manual(
+  breaks = c("Oligodendrocyte", "OPC"),
+  values = c("#A6D854", "#F0E442"),
+  guide = "none"
+)
+
+
+seurat.obj.oligo.opc$`Reactive oligo sig` <- seurat.obj.oligo.opc$reactive.oligo.general
+for (by_sample_use in c(T, F)) {
+  plot_gene_expression(seurat.obj.oligo.opc@meta.data, 
+                         features = c("Reactive oligo sig"), 
+                         cell_type_col = "CellType",
+                         cell_type_levels = c("Oligodendrocyte", "OPC"),
+                         color_values = c("#A6D854", "#F0E442"),
+                         color_breaks = c("Oligodendrocyte", "OPC"),
+                         by_sample = by_sample_use, 
+                         mean_size = 3,
+                         plot_width = 8,
+                         plot_height = 8,
+                         output_path = paste0(save.dir, "nomura_2025_gbm_reactive.oligo.general_by_oligo.opc_sample_use=", by_sample_use, ".pdf"))
+}
+
+```
+
+
+
+# Main: Greenwald FGF/FGFR expression
+```{r}
+seurat.obj.merged <- readRDS(paste0(root.dir, "ProcessedData/", "Greenwald_2024_GBM/", "Greenwald_2024_GBM_seurat.obj.merged.RDS"))
+
+p <- VlnPlot(
+  seurat.obj.merged, 
+  group.by = "mp", 
+  features = c("FGF1", "FGF2", "FGFR1", "FGFR2", "FGFR3", "FGFR4"), 
+  stack = TRUE, 
+  flip = TRUE
+) + 
+  stat_summary(
+    fun = "mean", 
+    geom = "point", 
+    size = 3, 
+    aes(color = "Mean", shape = "Mean")
+  ) +
+  stat_summary(
+    fun = "median", 
+    geom = "point", 
+    size = 10, 
+    aes(color = "Median", shape = "Median")
+  ) +
+  scale_color_manual(name = "Statistics", values = c("Mean" = "black", "Median" = "blue")) +
+  scale_shape_manual(name = "Statistics", values = c("Mean" = 18, "Median" = 95)) +
+  guides(fill = guide_legend(override.aes = list(shape = NA))) + 
+  theme(legend.position = "right")
+
+
+pdf(paste0(figures.dir, "mp_vs_FGF_FGFR_genes.pdf"), width = 12, height = 8)
+print(p)
+dev.off()
+```
+
+
+
+# Main: Greenwald GBM pre-treatment spatial correlations
+```{r}
+library(corrplot)
+
+n.hop <- 3
+seurat.obj.merged.neigborhood <- readRDS(paste0(root.dir, "ProcessedData/", "Greenwald_2024_GBM/", "Greenwald_2024_GBM_oligodendrocytes.merged.w.neighborhood.metadata_n.hop=", n.hop, ".RDS"))
+seurat.obj.merged.neigborhood$filter <- is.na(seurat.obj.merged.neigborhood$Mac)
+seurat.obj.merged.neigborhood <- subset(seurat.obj.merged.neigborhood, subset = filter == FALSE) # I think the neighborhood was low quality or no neighbors
+all.cell.types <- c("AC", "Chromatin.Reg", "Inflammatory.Mac", "Mac", "MES", "MES.Ast", "Prolif.Metab", "Reactive.Ast", "Vasc", "MES.Hyp", "Neuron", "NPC", "Oligo", "OPC")
+
+
+if (n.hop == 1) {
+  seurat.obj.merged.neigborhood <- subset(seurat.obj.merged.neigborhood, subset = n.neighbors >= 3)
+} else if (n.hop == 2) {
+  seurat.obj.merged.neigborhood <- subset(seurat.obj.merged.neigborhood, subset = n.neighbors >= 9)
+} else if (n.hop == 3) {
+  seurat.obj.merged.neigborhood <- subset(seurat.obj.merged.neigborhood, subset = n.neighbors >= 10)
+}
+
+# Define neighborhood
+seurat.obj.merged.neigborhood$total.Mac <- seurat.obj.merged.neigborhood$Mac + seurat.obj.merged.neigborhood$Inflammatory.Mac
+seurat.obj.merged.neigborhood$total.MES <- seurat.obj.merged.neigborhood$MES + seurat.obj.merged.neigborhood$MES.Hyp
+
+mac.cutoff <- 0.1
+mes.cutoff <- 0.1
+
+seurat.obj.merged.neigborhood$neighborhood.annotation <- apply(seurat.obj.merged.neigborhood@meta.data, 1, function(row) case_when(
+  as.numeric(row["total.MES"]) <= mes.cutoff && as.numeric(row["total.Mac"]) <= mac.cutoff ~ "MES- Mac-",
+  as.numeric(row["total.MES"]) <= mes.cutoff && as.numeric(row["total.Mac"]) > mac.cutoff ~ "MES- Mac+",
+  as.numeric(row["total.MES"]) > mes.cutoff && as.numeric(row["total.Mac"]) <= mac.cutoff ~ "MES+ Mac-",
+  as.numeric(row["total.MES"]) > mes.cutoff && as.numeric(row["total.Mac"]) > mac.cutoff ~ "MES+ Mac+",
+  TRUE ~ NA
+))
+
+control.neighborhood <- "MES- Mac-"
+seurat.obj.merged.neigborhood$neighborhood.annotation <- factor(seurat.obj.merged.neigborhood$neighborhood.annotation, levels = c(control.neighborhood, "MES- Mac+", "MES+ Mac-", "MES+ Mac+"))
+
+
+
+# Combining all samples
+# TODO calculate inflammatory signature and hypoxia signature in neighborhood not just single spot
+seurat.obj.merged.neigborhood.downsample <- seurat.obj.merged.neigborhood
+Idents(seurat.obj.merged.neigborhood.downsample) <- "sample.id"
+seurat.obj.merged.neigborhood.downsample$downsample <- T
+set.seed(123)
+seurat.obj.merged.neigborhood.downsample <- subset(seurat.obj.merged.neigborhood.downsample, subset = downsample == T, downsample = 30)
+
+
+metadata <- seurat.obj.merged.neigborhood.downsample@meta.data
+vars.of.interest <- c("reactive.oligo.general", "hypoxia.signature", setdiff(all.cell.types, "Low.quality"))
+data <- metadata[, vars.of.interest]
+data <- data %>% dplyr::rename(`Reactive oligodendrocyte signature` = reactive.oligo.general,
+                               Hypoxia = hypoxia.signature)
+
+res <- Hmisc::rcorr(as.matrix(data), type = correlation.method.use)
+cor.table <- res$r
+p.mat     <- res$P
+p.mat[is.na(p.mat)] <- 1
+
+p.mat.df <- data.frame(p.mat)
+p.mat.df$celltype <- rownames(p.mat.df)
+write.table(p.mat.df, paste0(figures.dir, "all_samples_combined_corrplot_neighborhood_nhop=", n.hop, "_pvals.tsv"), sep = "\t", row.names = F, col.names = T)
+
+col_range <- colorRampPalette(c("blue", "white", "red"))(200)
+pdf(paste0(figures.dir, "all_samples_combined_corrplot_neighborhood_nhop=", n.hop, ".pdf"), width = 10, height = 10)
+
+par(mar = c(5, 4, 4, 6))
+
+corrplot(
+  cor.table,
+  order = "hclust",
+  hclust.method = "average",
+  type = "upper",
+  method = "color",
+  col = col_range,
+  tl.col = "black",
+  tl.srt = 45,
+  p.mat = p.mat,
+  sig.level = c(0.001, 0.01, 0.05),
+  insig = "label_sig",
+  pch.col = "black",
+  pch.cex = 1.2
+)
+text(x = 21, y = 8, labels = paste0(str_to_title(correlation.method.use), "'s correlation"), 
+ srt = 270, xpd = TRUE, cex = 1.2)
+dev.off()
+
+
+
+
+pdf(paste0(figures.dir, "all_samples_combined_corrplot_neighborhood_nhop=", n.hop, "_pvals.pdf"), width = 20, height = 20)
+
+par(mar = c(5, 4, 4, 6))
+
+corrplot(
+  cor.table,
+  order = "hclust",
+  hclust.method = "average",
+  type = "upper",
+  method = "color",
+  col = col_range,
+  tl.col = "black",
+  tl.srt = 45,
+  p.mat = p.mat,
+  sig.level = -1,
+  insig = "p-value",
+  pch.col = "black",
+  pch.cex = 0.8
+)
+text(x = 21, y = 8, labels = paste0(str_to_title(correlation.method.use), "'s correlation"), 
+ srt = 270, xpd = TRUE, cex = 1.2)
+dev.off()
+```
+
+
+
+# Supplemental: Visium linear model
+```{r}
+library(lme4)
+library(lmerTest)
+
+n.hop <- 3
+seurat.obj.merged.neigborhood <- readRDS(paste0(root.dir, "ProcessedData/", "Greenwald_2024_GBM/", "Greenwald_2024_GBM_oligodendrocytes.merged.w.neighborhood.metadata_n.hop=", n.hop, ".RDS"))
+seurat.obj.merged.neigborhood$filter <- is.na(seurat.obj.merged.neigborhood$Mac)
+table(seurat.obj.merged.neigborhood$filter)
+seurat.obj.merged.neigborhood <- subset(seurat.obj.merged.neigborhood, subset = filter == FALSE) # I think the neighborhood was low quality or no neighbors, TODO investigate
+dim(seurat.obj.merged.neigborhood)
+
+if (n.hop == 1) {
+  seurat.obj.merged.neigborhood <- subset(seurat.obj.merged.neigborhood, subset = n.neighbors >= 3)
+} else if (n.hop == 2) {
+  seurat.obj.merged.neigborhood <- subset(seurat.obj.merged.neigborhood, subset = n.neighbors >= 9)
+} else if (n.hop == 3) {
+  seurat.obj.merged.neigborhood <- subset(seurat.obj.merged.neigborhood, subset = n.neighbors >= 10)
+}
+
+dim(seurat.obj.merged.neigborhood)
+
+oligo.df <- seurat.obj.merged.neigborhood@meta.data %>%
+  filter(mp == "Oligo") %>%
+  filter(!is.na(reactive.oligo.general)) %>%
+  group_by(sample.id) %>%
+  mutate(
+    y = as.numeric(reactive.oligo.general),
+    mes = as.numeric(MES),
+    mac = as.numeric(Mac),
+    vasc = as.numeric(Vasc),
+    hyp = as.numeric(hypoxia.signature) # spot-level hypoxia
+  ) %>%
+  ungroup()
+
+
+model <- lmer(
+  y ~ mes * mac + vasc + hyp + (1 | sample.id),
+  data = oligo.df
+)
+
+summary(model)
+
+
+model <- lmer(
+  y ~ mes + mac + vasc + hyp + (1 | sample.id),
+  data = oligo.df
+)
+
+summary(model)
+```
+
+
+
+# Main: Greenwald GBM pre-treatment neighborhood vs reactive oligodendrocyte signatures
+```{r}
+stat.test <- seurat.obj.merged.neigborhood.downsample@meta.data %>%
+  wilcox_test(reactive.oligo.general ~ neighborhood.annotation, ref.group = control.neighborhood, alternative = "less") %>%
+  adjust_pvalue(method = "fdr") %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "neighborhood.annotation") 
+stat.test$p.label <- sapply(stat.test$p.adj, format.p.value)
+
+p <- ggplot(seurat.obj.merged.neigborhood.downsample@meta.data, aes(neighborhood.annotation, reactive.oligo.general)) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(alpha = 0.6, position = position_jitter(width = 0.2), fill = "#B76EB8", shape = 21) +
+  xlab("Neighborhood") +
+  ylab("Reactive oligodendrocyte signature") +
+  stat_pvalue_manual(stat.test, label = "p.label", size = 6)
+pdf(paste0(figures.dir, "all_samples_combined_neighborhood_vs_reactive_oligo_signature_nhop=", n.hop, ".pdf"), width = 10, height = 7)
+print(p)
+dev.off()
+  
+
+# by hypoxia level
+hypoxia.cutoff <- median(seurat.obj.merged.neigborhood.downsample$hypoxia.signature)
+seurat.obj.merged.neigborhood.downsample$hypoxia.level <- sapply(seurat.obj.merged.neigborhood.downsample$hypoxia.signature, function(x) ifelse(x > hypoxia.cutoff, "High", "Low"))
+
+stat.test <- seurat.obj.merged.neigborhood.downsample@meta.data %>%
+  group_by(hypoxia.level) %>%
+  wilcox_test(reactive.oligo.general ~ neighborhood.annotation, ref.group = control.neighborhood, alternative = "less") %>%
+  adjust_pvalue(method = "fdr") %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "neighborhood.annotation") 
+stat.test$p.label <- sapply(stat.test$p.adj, format.p.value)
+
+p <- ggplot(seurat.obj.merged.neigborhood.downsample@meta.data, aes(neighborhood.annotation, reactive.oligo.general)) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(alpha = 0.6, position = position_jitter(width = 0.2), fill = "#B76EB8", shape = 21) +
+  xlab("Neighborhood") +
+  ylab("Reactive oligodendrocyte signature") +
+  stat_pvalue_manual(stat.test, label = "p.label", size = 6) +
+  ylim(c(-0.3, 0.7)) +
+  facet_wrap(~hypoxia.level)
+pdf(paste0(supp.figures.dir, "all_samples_combined_neighborhood_vs_reactive_oligo_signature_by_hypoxia_nhop=", n.hop, ".pdf"), width = 14, height = 7)
+print(p)
+dev.off()
+
+
+# demyelination signature
+stat.test <- seurat.obj.merged.neigborhood.downsample@meta.data %>%
+  wilcox_test(acute.demyelination ~ neighborhood.annotation, ref.group = control.neighborhood, alternative = "less") %>%
+  adjust_pvalue(method = "fdr") %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "neighborhood.annotation") 
+stat.test$p.label <- sapply(stat.test$p.adj, format.p.value)
+
+p <- ggplot(seurat.obj.merged.neigborhood.downsample@meta.data, aes(neighborhood.annotation, acute.demyelination)) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(alpha = 0.6, position = position_jitter(width = 0.2), fill = "#B76EB8", shape = 21) +
+  xlab("Neighborhood") +
+  ylab("Demyelination signature") +
+  stat_pvalue_manual(stat.test, label = "p.label", size = 6)
+pdf(paste0(figures.dir, "all_samples_combined_neighborhood_vs_demyelination_signature_nhop=", n.hop, ".pdf"), width = 10, height = 7)
+print(p)
+dev.off()
+```
+
+
+
+# Supplemental: Greenwald pre-treatment neighborhood vs reactive oligo signature by sample
+```{r}
+plot.list <- c()
+for (s.id in sort(unique(seurat.obj.merged.neigborhood$sample.id))) {
+  
+  temp <- seurat.obj.merged.neigborhood@meta.data %>% filter(sample.id == s.id)
+  if (nrow(temp) == 0) {
+    next
+  }
+  
+  seurat.obj.merged.neigborhood.subset <- subset(seurat.obj.merged.neigborhood, subset = sample.id == s.id)
+  
+  if (
+    control.neighborhood %ni% seurat.obj.merged.neigborhood.subset$neighborhood.annotation ||
+    dplyr::n_distinct(seurat.obj.merged.neigborhood.subset$neighborhood.annotation) < 2 ||
+    sum(seurat.obj.merged.neigborhood.subset$neighborhood.annotation == control.neighborhood) == 0
+  ) {
+    stat.test <- data.frame()
+  } else {
+    stat.test <- seurat.obj.merged.neigborhood.subset@meta.data %>%
+      wilcox_test(reactive.oligo.general ~ neighborhood.annotation, ref.group = levels(seurat.obj.merged.neigborhood.subset$neighborhood.annotation)[1], alternative = "less") %>%
+      adjust_pvalue(method = "fdr") %>%
+      add_significance("p.adj") %>%
+      add_xy_position(x = "neighborhood.annotation") 
+    stat.test$p.label <- sapply(stat.test$p.adj, format.p.value)
+  }
+  
+  p <- ggplot(seurat.obj.merged.neigborhood.subset@meta.data, aes(neighborhood.annotation, reactive.oligo.general)) + 
+    geom_boxplot(outlier.shape = NA) +
+    geom_point(alpha = 0.6, position = position_jitter(width = 0.2), fill = "#B76EB8", shape = 21) +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1), legend.position = "none") +
+    xlab("Neighborhood") +
+    ylab("Reactive oligo signature\nin oligodendrocytes") + 
+    ggtitle(s.id)
+  
+  if (nrow(stat.test) > 0) {
+    p <- p + stat_pvalue_manual(
+      stat.test,
+      label = "p.label",
+      size = 5
+    )
+  }
+  
+  plot.list[[s.id]] <- p
+}
+p <- plot_grid(plotlist = plot.list)
+pdf(paste0(supp.figures.dir, "by_sample_neighborhood_vs_reactive_oligo_signature_nhop=", n.hop, ".pdf"), width = 30, height = 30)
+print(p)
+dev.off()
+
+
+
+# demyelination signature
+plot.list <- c()
+for (s.id in sort(unique(seurat.obj.merged.neigborhood$sample.id))) {
+  
+  temp <- seurat.obj.merged.neigborhood@meta.data %>% filter(sample.id == s.id)
+  if (nrow(temp) == 0) {
+    next
+  }
+  
+  seurat.obj.merged.neigborhood.subset <- subset(seurat.obj.merged.neigborhood, subset = sample.id == s.id)
+  stat.test <- seurat.obj.merged.neigborhood.subset@meta.data %>%
+    wilcox_test(acute.demyelination ~ neighborhood.annotation, ref.group = levels(seurat.obj.merged.neigborhood.subset$neighborhood.annotation)[1], alternative = "less") %>%
+    adjust_pvalue(method = "fdr") %>%
+    add_significance("p.adj") %>%
+    add_xy_position(x = "neighborhood.annotation") 
+  stat.test$p.label <- sapply(stat.test$p.adj, format.p.value)
+  
+  p <- ggplot(seurat.obj.merged.neigborhood.subset@meta.data, aes(neighborhood.annotation, acute.demyelination)) + 
+    geom_boxplot(outlier.shape = NA) +
+    geom_point(alpha = 0.6, position = position_jitter(width = 0.2), fill = "#B76EB8", shape = 21) +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1), legend.position = "none") +
+    xlab("Neighborhood") +
+    ylab("Demyelination signature\nin oligodendrocytes") + 
+    ggtitle(s.id) +
+    stat_pvalue_manual(stat.test, label = "p.label", size = 5)
+  plot.list[[s.id]] <- p
+}
+p <- plot_grid(plotlist = plot.list)
+pdf(paste0(supp.figures.dir, "by_sample_neighborhood_vs_demyelination_signature_nhop=", n.hop, ".pdf"), width = 30, height = 30)
+print(p)
+dev.off()
+
+stop()
+```
+
+
+
+
+
+
+# Main: Our data Visium HD
+```{r}
+# TODO curently in Code/Figure 5/analyze_my_data_VisiumHD.RMD
+```
+
+
+# Main: Our data Visium HD
+```{r}
+# TODO curently in Code/Figure 5/analyze_my_data_VisiumHD.RMD
+```
+
+
+
+# Main: Ligand receptor interactions
+```{r}
+library(liana)
+
+seurat.obj <- readRDS(paste0(root.dir, "ProcessedData/", "my_data/", "autopsy/", "all_postmortem_samples_cellbender.FALSE_denoise.heat.shock.signature_postmortem.sensitive_postmortem.signature_filter.FALSE_batch.correction.None/", "seurat_objects/all_postmortem_samples_w_celltypes.velmeshev2019.RDS"))
+seurat.obj <- subset(seurat.obj, subset = low.quality.by.qc == FALSE)
+seurat.obj$celltype <- seurat.obj$predicted.annotation_l2.w.neftel
+unique(seurat.obj$celltype)
+
+Idents(seurat.obj) <- "celltype"
+table(seurat.obj$celltype)
+
+for (sample.id.use in unique(seurat.obj$sample.id)) {
+  print(sample.id.use)
+  seurat.obj.subset <- subset(seurat.obj, subset = sample.id == sample.id.use)
+  liana_test <- liana_wrap(seurat.obj.subset, idents_col = "celltype")
+  liana_test <- liana_test %>%
+    liana_aggregate()
+  liana_test$sample.id <- sample.id.use
+  write.table(liana_test, paste0(root.dir, "Results/", "my_data/", "autopsy/", "all_postmortem_samples_cellbender.FALSE_denoise.heat.shock.signature_postmortem.sensitive_postmortem.signature_filter.FALSE_batch.correction.None/", "interactions/", sample.id.use, "_liana_test.tsv"), quote=F, sep="\t", row.names=F, col.names=T)
+}
+```
+
+
+
+# LIANA analysis
+```{r}
+seurat.obj <- readRDS(paste0(root.dir, "ProcessedData/", "my_data/", "autopsy/", "all_postmortem_samples_cellbender.FALSE_denoise.heat.shock.signature_postmortem.sensitive_postmortem.signature_filter.FALSE_batch.correction.None/", "seurat_objects/all_postmortem_samples_w_celltypes.velmeshev2019.RDS"))
+
+output.dir <- "all_postmortem_samples_cellbender.FALSE_denoise.heat.shock.signature_postmortem.sensitive_postmortem.signature_filter.FALSE_batch.correction.None/"
+
+# combine all samples
+liana.df <- data.frame()
+for (sample.id.use in unique(seurat.obj$sample.id)) {
+  liana_test <- read.csv(paste0(root.dir, "Results/", "my_data/", "autopsy/", output.dir, "interactions/", sample.id.use, "_liana_test.tsv"), sep="\t")
+  liana_test <- liana_test #%>% filter(aggregate_rank < 0.1)
+  liana.df <- rbind(liana.df, liana_test)
+}
+
+unique(liana.df$sample.id)
+unique(liana.df$source)
+
+summary.df <- liana.df %>% 
+  group_by(source, target, ligand.complex, receptor.complex) %>%
+  summarize(n.samples = n_distinct(sample.id),
+            n.control.samples = sum(sample.id %in% healthy.sections),
+            n.tumor.samples = sum(sample.id %ni% healthy.sections),
+            sample.ids = paste(sample.id, collapse = ", "),
+            median.aggregate_rank = median(aggregate_rank),
+            median.sca.LRscore = median(sca.LRscore),
+            median.edge_specificity = median(natmi.edge_specificity))
+summary.df$n.tumor.control.samples.diff <- summary.df$n.tumor.samples - summary.df$n.control.samples
+summary.df$interaction.label <- paste0(summary.df$ligand.complex, "->", summary.df$receptor.complex, "|", summary.df$source, "->", summary.df$target)
+write.table(summary.df, paste0(root.dir, "Results/", "my_data/", "autopsy/", output.dir, "interactions/", "all_samples_combined_liana_summary.tsv"), quote=F, sep="\t", row.names=F, col.names=T)
+
+
+library(writexl)
+write_xlsx(summary.df, path = paste0(root.dir, "Figures/", "Tables/", "Table SX LIANA predictions.xlsx"))
+
+
+
+
+mes.oligo.df  <- summary.df %>% filter(source == "MES-like (Neftel)", target == "Oligodendrocytes") %>% arrange(desc(n.tumor.control.samples.diff))
+oligo.mes.df <- summary.df %>% filter(source == "Oligodendrocytes", target == "MES-like (Neftel)") %>% arrange(desc(n.tumor.control.samples.diff))
+mes.oligo.interactions.df <- rbind(mes.oligo.df, oligo.mes.df) %>% arrange(desc(n.tumor.control.samples.diff)) %>% filter(n.tumor.samples >= 5)
+
+mes.oligo.interactions.df$interaction.label %>% paste0(collapse = "    ")
+
+intersect(oligo.gene.signatures$reactive.oligo.general, mes.oligo.df$receptor.complex)
+intersect(oligo.gene.signatures$reactive.oligo.general, oligo.mes.df$ligand.complex)
+
+
+mac.oligo.df  <- summary.df %>% filter(source == "Myeloid", target == "Oligodendrocytes") %>% arrange(desc(n.tumor.control.samples.diff))
+oligo.mac.df <- summary.df %>% filter(source == "Oligodendrocytes", target == "Myeloid") %>% arrange(desc(n.tumor.control.samples.diff))
+mac.oligo.interactions.df <- rbind(mac.oligo.df, oligo.mac.df) %>% arrange(desc(n.tumor.control.samples.diff)) %>% filter(n.tumor.samples >= 5)
+
+
+mac.oligo.interactions.df$interaction.label %>% paste0(collapse = "    ")
+
+intersect(oligo.gene.signatures$reactive.oligo.general, mac.oligo.df$receptor.complex)
+intersect(oligo.gene.signatures$reactive.oligo.general, oligo.mac.df$ligand.complex)
+
+
+
+malignant.oligo.df  <- summary.df %>% filter(source %in% c(malignant.states), target == "Oligodendrocytes") %>% arrange(desc(n.tumor.control.samples.diff))
+
+df <- malignant.oligo.df %>% filter(receptor.complex %in% c("FGFR1", "FGFR2"), ligand.complex %in% c("FGF1", "FGF2"))
+```
+
+
+

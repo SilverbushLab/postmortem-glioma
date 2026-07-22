@@ -1,0 +1,143 @@
+---
+title: "sussman2024pHGG_prepare_input_for_tensor_decomp.RMD"
+output: html_document
+date: "2026-01-31"
+---
+
+
+
+# Setup
+```{r}
+library(Seurat)
+library(tidyverse)
+library(Matrix)
+library(readxl)
+
+root.dir <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Projects/Jackie_post-mortem/"
+
+suppressMessages(suppressWarnings(source(paste0(root.dir, "Code/", 'helper_functions.R'))))
+
+n.vf <- 10000
+output.dir <- paste0(root.dir, "ProcessedData/", "Sussman2024/", "tensor_decomposition/", "l1_top_", n.vf, "_vf/", "input/")
+```
+
+
+
+# Create a table/matrix for each sample
+```{r}
+seurat.obj <- readRDS(paste0(root.dir, "ExternalData/", 'Sussman_2024/', 'SeuratObjsFromLevel3ByPatientFinal/', 'all.samples.merged.not.downsampled.seurat.obj.w.annotations.RDS'))
+
+seurat.obj$celltype.label <- seurat.obj$annotation.l1
+celltype.labels <- sort(unique(seurat.obj$celltype.label))
+
+# counts.df <- seurat.obj@meta.data %>% 
+#   group_by(celltype.label, sample.id) %>% 
+#   summarize(count = n())
+sample.ids <- sort(unique(seurat.obj$sample.id))
+
+min.cells.per.label <- 5 
+
+
+# subset to variable genes
+genes.keep <- rownames(seurat.obj)[rowSums(seurat.obj@assays$RNA$counts > 0) >= 50] # expressed in at least 50 cells
+seurat.obj <- subset(seurat.obj, features = genes.keep)
+
+pseudobulk <- AggregateExpression(seurat.obj, group.by=c("celltype.label", "sample.id"), return.seurat=T, normalization.method = "RC", scale.factor = 1e6)
+data <- pseudobulk@assays$RNA@layers$data
+data <- log2(data + 1)
+
+gene.var <- apply(data, 1, var)
+names(gene.var) <- rownames(pseudobulk)
+gene.mean <- apply(data, 1, mean)
+plot(gene.mean, gene.var)
+variable.genes <- names(sort(gene.var, decreasing = TRUE))[1:n.vf]
+
+variable.genes.df <- data.frame(variable.genes)
+colnames(variable.genes.df) <- "variable.genes"
+write.table(variable.genes.df, paste0(output.dir, "variable.genes.tsv"), sep="\t", quote=F, row.names=F, col.names=T)
+
+
+# pseudobulk each sample x cell type pair
+for (s.id in sample.ids) {
+  print(s.id)
+  seurat.obj.subset <- subset(seurat.obj, subset = sample.id == s.id)
+  seurat.obj.subset$celltype.label <- factor(seurat.obj.subset$celltype.label, levels = celltype.labels)
+  
+  # only use groups with more than min.cells.per.label
+  label.counts <- table(seurat.obj.subset$celltype.label)
+  labels.to.use <- names(label.counts[label.counts >= min.cells.per.label])
+  seurat.obj.subset <- subset(seurat.obj.subset, subset = celltype.label %in% labels.to.use)
+  
+  # sum counts and normalize to counts per million for each cell type x sample
+  pseudobulk <- AggregateExpression(seurat.obj.subset, group.by="celltype.label", return.seurat=T, normalization.method = "RC", scale.factor = 1e6)
+  data <- pseudobulk@assays$RNA@layers$data
+  
+  rownames(data) <- rownames(pseudobulk)
+  colnames(data) <- colnames(pseudobulk)
+  
+  for (missing.celltype in setdiff(celltype.labels, colnames(data))) {
+    new_col <- Matrix(rep(0, nrow(data)), sparse = TRUE)
+    data <- cbind(data, new_col)
+    colnames(data)[ncol(data)] <- missing.celltype
+  }
+  
+  data <- data[, match(celltype.labels, colnames(data))]
+  
+  stopifnot(ncol(data) == length(celltype.labels))
+  stopifnot(identical(colnames(data), celltype.labels))
+  
+  # variable genes only
+  data <- data[variable.genes, ]
+  data <- log2(data + 1)
+  
+  write.table(data, paste0(output.dir, s.id, ".tsv"), sep="\t", quote=F, row.names=T, col.names=T)
+}
+
+```
+
+
+
+
+# Check current inputs and original inputs match
+```{r}
+# Load tools package for checksums
+library(tools)
+
+# Define directories
+dir1 <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Projects/Jackie_post-mortem/ProcessedData/Sussman2024/tensor_decomposition/l1_top_10000_vf/input/"
+dir2 <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Projects/Jackie_post-mortem/ProcessedData/Sussman2024/tensor_decomposition/l1_top_10000_vf/input_original/"
+
+# 1. List files (relative paths so structure can be compared)
+files1 <- list.files(dir1, recursive = TRUE, full.names = FALSE)
+files2 <- list.files(dir2, recursive = TRUE, full.names = FALSE)
+
+# Compare file names
+if (setequal(files1, files2)) {
+  cat("✅ Both directories contain the same files (by name).\n")
+} else {
+  cat("❌ File name differences found.\n")
+  cat("In dir1 but not dir2:\n", setdiff(files1, files2), "\n")
+  cat("In dir2 but not dir1:\n", setdiff(files2, files1), "\n")
+}
+
+# 2. Compare file contents (only for common files)
+common_files <- intersect(files1, files2)
+
+# Build full paths
+paths1 <- file.path(dir1, common_files)
+paths2 <- file.path(dir2, common_files)
+
+# Compute checksums
+hash1 <- md5sum(paths1)
+hash2 <- md5sum(paths2)
+
+# Check for mismatches
+mismatches <- common_files[hash1 != hash2]
+
+if (length(mismatches) == 0) {
+  cat("✅ All common files are identical in content.\n")
+} else {
+  cat("❌ The following files differ in content:\n")
+  print(mismatches)
+}
+```

@@ -1,0 +1,108 @@
+---
+title: "nomura_2025_GBM_preprocessing.RMD"
+output: html_document
+date: "2026-05-10"
+---
+
+
+
+# Setup
+```{r setup}
+root.dir <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Projects/Jackie_post-mortem/"
+suppressWarnings(source(paste0(root.dir, "Code/", 'helper_functions.R')))
+```
+
+
+
+# Create Seurat object from GEO files
+```{r}
+gse.data.dir <- paste0(root.dir, "ExternalData/", "Nomura_2025_GBM/", "GSE274546_RAW/")
+synapse.data.dir <- paste0(root.dir, "ExternalData/", "Nomura_2025_GBM/", "sn_rna/")
+
+# metadata
+celltype.metadata <- readRDS(paste0(synapse.data.dir, "celltype_meta_data_2023_09_10.RDS")) %>% data.frame()
+rownames(celltype.metadata) <- celltype.metadata$CellID
+dim(celltype.metadata)
+ 
+malignant.metadata <- readRDS(paste0(synapse.data.dir, "malignant_meta_data_2023_09_10.RDS")) %>% data.frame()
+rownames(malignant.metadata) <- malignant.metadata$CellID
+dim(malignant.metadata)
+
+celltype.fine.metadata <- read.csv(paste0(synapse.data.dir, "mp_extended_cell_type_classification_20231102.txt"), sep = "\t")
+rownames(celltype.fine.metadata) <- celltype.fine.metadata$CellID
+
+
+seurat.obj.list <- list()
+for (f in sort(list.files(gse.data.dir))) {
+  patient.timepoint <- unlist(str_split(f, "_"))[2]
+  print(patient.timepoint)
+  patient.number <- unlist(str_split(patient.timepoint, "T"))[1]
+  timepoint <- paste0("T", unlist(str_split(patient.timepoint, "T"))[2])
+  
+  sample.id <- celltype.metadata %>% filter(Patient == patient.number, Timepoint == timepoint) %>% pull(Sample) %>% unique()
+  print(sample.id)
+  
+  if (length(sample.id) > 1) {
+    stop(sample.id)
+  }
+  
+  counts <- readRDS(paste0(gse.data.dir, f))
+  seurat.obj.sample <- CreateSeuratObject(counts)
+  seurat.obj.sample$patient.timepoint <- patient.timepoint
+  seurat.obj.sample$patient.number <- patient.number
+  seurat.obj.sample$timepoint <- timepoint
+  seurat.obj.sample$sample.id <- sample.id
+  seurat.obj.list[[sample.id]] <- seurat.obj.sample
+}
+
+seurat.obj <- merge(seurat.obj.list[[1]], seurat.obj.list[2:length(seurat.obj.list)])
+seurat.obj[["RNA"]] <- JoinLayers(seurat.obj[["RNA"]])
+
+seurat.obj <- AddMetaData(seurat.obj, celltype.metadata)
+seurat.obj <- AddMetaData(seurat.obj, malignant.metadata)
+seurat.obj <- AddMetaData(seurat.obj, celltype.fine.metadata)
+
+seurat.obj <- NormalizeData(seurat.obj)
+seurat.obj[["percent.mt"]] <- PercentageFeatureSet(seurat.obj, pattern = "^MT-") 
+
+
+seurat.obj.malignant <- subset(seurat.obj, subset = CellType == "Malignant")
+seurat.obj.malignant <- score.neftel(seurat.obj.malignant)
+neftel.metadata <- seurat.obj.malignant@meta.data %>% dplyr::select(neftel_x, neftel_y, neftel_type)
+seurat.obj <- AddMetaData(seurat.obj, neftel.metadata)
+
+seurat.obj$CellTypeBroad <- apply(seurat.obj@meta.data, 1, function(row) case_when(
+  row[["CellType"]] == "Malignant" ~ row[["neftel_type"]],
+  row[["CellType"]] %in% c("Inhibitory neuron", "Excitatory neuron") ~ "Neurons",
+  row[["CellType"]] %in% c("Endothel", "Pericyte") ~ "Vascular",
+  TRUE ~ row[["CellType"]]
+))
+
+print(dim(seurat.obj))
+
+seurat.obj <- add.module.score(seurat.obj, gene.signatures.gsea)
+
+saveRDS(seurat.obj, paste0(root.dir, "ProcessedData/", "Nomura_2025_GBM/", "Nomura_2025_GBM_merged_seurat_obj.RDS"))
+```
+
+
+
+# Downsample
+```{r}
+seurat.obj <- readRDS(paste0(root.dir, "ProcessedData/", "Nomura_2025_GBM/", "Nomura_2025_GBM_merged_seurat_obj.RDS"))
+
+# just oligodendrocytes
+seurat.obj.oligo <- subset(seurat.obj, subset = CellType == "Oligodendrocyte")
+table(seurat.obj.oligo$CellType)
+saveRDS(seurat.obj.oligo, paste0(root.dir, "ProcessedData/", "Nomura_2025_GBM/", "Nomura_2025_GBM_merged_seurat_obj_oligo.RDS"))
+
+
+# downsample
+Idents(seurat.obj) <- "sample.id"
+seurat.obj$downsample <- TRUE
+seurat.obj.downsample <- subset(seurat.obj, subset = downsample == TRUE, downsample = 1000)
+print(dim(seurat.obj.downsample))
+saveRDS(seurat.obj.downsample, paste0(root.dir, "ProcessedData/", "Nomura_2025_GBM/", "Nomura_2025_GBM_merged_seurat_obj_downsample.RDS"))
+```
+
+

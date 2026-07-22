@@ -1,0 +1,1011 @@
+---
+title: "postmortem_interval_correlation.RMD"
+output: html_document
+date: "2026-06-26"
+---
+
+Try to correlate gene signatures with the postmortem interval
+
+# Setup
+```{r}
+library(Seurat)
+library(tidyverse)
+library(pals)
+library(ggrepel)
+library(ggprism)
+library(cowplot)
+library(ggpubr)
+library(AUCell)
+library("org.Hs.eg.db")
+
+root.dir <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Projects/Jackie_post-mortem/"
+suppressMessages(suppressWarnings(source(paste0(root.dir, "Code/", 'helper_functions.R'))))
+
+data.dir <- paste0(root.dir, 'ExternalData/')
+results.dir <- paste0(root.dir, 'Results/', "postmortem_interval_correlation/")
+processed.data.dir <- paste0(root.dir, 'ProcessedData/')
+
+set.seed(123)
+```
+
+
+
+# Herring 2022
+
+# PMI correlation by sample
+```{r}
+# all Herring 2022 data no filter
+seurat.obj.merged <- readRDS(paste0(data.dir, 'Herring_2022/', 'processed/', 'all.sampled.merged.downsampled.seurat.obj.RDS'))
+
+herring.2022 <- subset(seurat.obj.merged, subset = (is.sample.organoid_ == FALSE))
+print(dim(herring.2022))
+
+# read in Herring 2022 metadata from supplemental table
+herring.2022.supp.metadata <- readxl::read_excel(paste0(data.dir, 'Herring_2022/', 'TableS1_1-s2.0-S0092867422012582-mmc1.xlsx'), sheet = "sample.metadata.JP.modified")
+herring.2022.sample.metadata <- herring.2022.supp.metadata %>% dplyr::select(c(`snRNA-seq library ID`, PMI, `Age (years)`, Stage, `Stage category`, Sex, Race, `Oxygen/No Oxygen`, Individual, `Cause of Death`, `Brain Regions*`)) 
+herring.2022.sample.metadata$Stage <- as.factor(herring.2022.sample.metadata$Stage)
+herring.2022.sample.metadata$Sex <- as.factor(herring.2022.sample.metadata$Sex)
+herring.2022.sample.metadata$Race <- as.factor(herring.2022.sample.metadata$Race)
+print(dim(herring.2022.sample.metadata))
+```
+
+
+
+# Process data
+```{r}
+# add module score for gene signatures
+herring.2022 <- add.module.score(herring.2022, gene.signatures)
+herring.2022 <- add.module.score(herring.2022, gene.signatures.gsea)
+
+# aggregate analysis by sample/individual
+# covariates with "_" were generated for all cells (including filtered out ones) on the sample level
+herring.2022.metadata <- herring.2022@meta.data # has metadata but only for cells not filtered out. merge with sample level metadata
+herring.2022.metadata$PMI_ <- as.numeric(as.character(herring.2022.metadata$PMI_))
+herring.2022.metadata$library.id_ <- as.character(herring.2022.metadata$library.id_)
+
+herring.2022.metadata <- herring.2022.metadata %>% left_join(herring.2022.sample.metadata, by=c('library.id_'='snRNA-seq library ID', 'PMI_'='PMI'))
+
+
+# PMI regression with all covariates
+# covariate.y is from the sample-level metadata (supplemental table) rather than the published cell-level metadata
+herring.2022.metadata.by.sample <- herring.2022.metadata %>% 
+  group_by(library.id_, geo.sample.id_, PMI_, `Age (years)`, Stage, `Stage category`, Sex.y, Race.y, `Oxygen/No Oxygen`, `Cause of Death`, `Brain Regions*`) %>% 
+  dplyr::summarize(
+            mean.percent.mt = mean(percent.mt),
+            mean.postmortem.glial = mean(postmortem.glial),
+            mean.postmortem.score = mean(postmortem.signature),
+            mean.postmortem.sensitive = mean(postmortem.sensitive),
+            mean.heat.shock = mean(heat.shock.signature),
+            mean.apoptosis = mean(apoptosis.signature),
+            mean.necrosis = mean(necrosis.signature),
+            mean.hypoxia = mean(hypoxia.signature))
+print(dim(herring.2022.metadata.by.sample))
+
+
+# renaming variables for convenience
+herring.2022.metadata.by.sample <- herring.2022.metadata.by.sample %>% dplyr::rename(library.id=library.id_) 
+herring.2022.metadata.by.sample <- herring.2022.metadata.by.sample %>% dplyr::rename(PMI=PMI_)
+#herring.2022.metadata.by.sample <- data.frame(herring.2022.metadata.by.sample)
+#rownames(herring.2022.metadata.by.sample) <- herring.2022.metadata.by.sample$library.id
+```
+
+
+
+
+# Regression models
+```{r}
+run_pmi_model <- function(data, 
+                          predictors, 
+                          response = "PMI", 
+                          results.dir = NULL, 
+                          save.figures = FALSE, 
+                          fig.name = "PMI_vs_PMI.prediction.pdf",
+                          save.model.summary = FALSE,
+                          summary.name = "PMI_model_summary.txt") {
+  # ---- Build model formula ----
+  formula_str <- paste(response, "~", paste(predictors, collapse = " + "))
+  model_formula <- as.formula(formula_str)
+  
+  # ---- Fit linear model ----
+  model <- lm(model_formula, data = data)
+  model_summary <- summary(model)
+  print(model_summary)
+  
+  # ---- Extract key metrics ----
+  r.sq <- model_summary$r.squared
+  adj.r.sq <- model_summary$adj.r.squared
+  f.pval <- pf(model_summary$fstatistic[1],
+               model_summary$fstatistic[2],
+               model_summary$fstatistic[3],
+               lower.tail = FALSE)
+  
+  # ---- Optionally save model summary ----
+  if (save.model.summary && !is.null(results.dir)) {
+    sink(file.path(results.dir, summary.name))
+    print(model_summary)
+    cat("\n--- Extracted metrics ---\n")
+    cat("R²:", r.sq, "\n")
+    cat("Adjusted R²:", adj.r.sq, "\n")
+    cat("Model p-value:", f.pval, "\n")
+    sink()
+  }
+  
+  # ---- Predictions ----
+  data$adjusted.y <- predict(model, newdata = data)
+  
+  # ---- Correlation ----
+  cor.res <- cor.test(data[[response]], data$adjusted.y, method = correlation.method.use)
+  cor.label <- paste0("Spearman rho = ", round(cor.res$estimate, 2),
+                      "\n p = ", formatC(cor.res$p.value, format = "e", digits = 2))
+  
+  # ---- Plot ----
+  p <- ggplot(data, aes_string(x = response, y = "adjusted.y")) + 
+    geom_point(alpha = 0.6) + 
+    xlab("Postmortem interval (hours)") +
+    ylab("Postmortem interval (hours)\nmodel predicted") +
+    geom_smooth(method='lm') +
+    annotate("text", x=-Inf, y=Inf, hjust=-0.1, vjust=1.5, label=cor.label, size=6)
+  
+  # ---- Save figure ----
+  if (save.figures && !is.null(results.dir)) {
+    pdf(file.path(results.dir, fig.name), width=10, height=8)
+    print(p)
+    dev.off()
+  }
+  
+  return(list(
+    model = model,
+    model_summary = model_summary,
+    R2 = r.sq,
+    adj_R2 = adj.r.sq,
+    model_pval = f.pval,
+    cor.res = cor.res,
+    plot = p
+  ))
+}
+
+models.dir <- paste0(results.dir, 'Herring_2022/', 'models/')
+metadata.vars <- c("Sex.y", "Race.y", "`Age (years)`", "`Oxygen/No Oxygen`")
+
+
+# Figure 1
+model <- lm(mean.postmortem.score ~ mean.percent.mt, data=herring.2022.metadata.by.sample)
+herring.2022.metadata.by.sample$mean.postmortem.score.res <- residuals(model)
+p <- ggplot(herring.2022.metadata.by.sample, aes(x = PMI, y = mean.postmortem.score.res)) + 
+    geom_point(alpha = 0.6) + 
+    xlab("Postmortem interval (hours)") +
+    ylab("Postmortem enriched score (MT adjusted)") +
+    geom_smooth(method='lm') +
+    stat_cor(method = correlation.method.use, size = 7, cor.coef.name = "rho")
+pdf(paste0(root.dir, "Figures/", "Figure 1/", "herring2022_PMI_vs_postmortem_enriched_percent_mt_adjusted.pdf"), width = 10, height = 8)
+print(p)
+dev.off()
+
+
+
+model <- lm(mean.postmortem.score ~ mean.heat.shock, data=herring.2022.metadata.by.sample)
+herring.2022.metadata.by.sample$mean.heat.shock.res <- residuals(model)
+p <- ggplot(herring.2022.metadata.by.sample, aes(x = PMI, y = mean.heat.shock.res)) + 
+    geom_point(alpha = 0.6) + 
+    xlab("Postmortem interval (hours)") +
+    ylab("Postmortem heat shock score (MT adjusted)") +
+    geom_smooth(method='lm') +
+    stat_cor(method = correlation.method.use, size = 7, cor.coef.name = "rho")
+
+
+# Figure 1 Supplemental
+
+# Note: adjusting for percent.mt doesn't really do anything
+p <- ggplot(herring.2022.metadata.by.sample, aes(x = PMI, y = mean.postmortem.sensitive)) + 
+    geom_point(alpha = 0.6) + 
+    xlab("Postmortem interval (hours)") +
+    ylab("Living enriched score") +
+    geom_smooth(method='lm') +
+    stat_cor(method = correlation.method.use, size = 7, cor.coef.name = "rho")
+pdf(paste0(root.dir,  "Figures/", "Figure 1/", "Supplemental/", "herring2022_PMI_vs_living_enriched.pdf"), width = 10, height = 8)
+print(p)
+dev.off()
+
+p <- ggplot(herring.2022.metadata.by.sample, aes(x = PMI, y = mean.heat.shock)) + 
+    geom_point(alpha = 0.6) + 
+    xlab("Postmortem interval (hours)") +
+    ylab("Hypoxia heat shock score") +
+    geom_smooth(method='lm') +
+    stat_cor(method = correlation.method.use, size = 7, cor.coef.name = "rho")
+pdf(paste0(root.dir, "Figures/", "Figure 1/", "Supplemental/", "herring2022_PMI_vs_hypoxia_heat_shock.pdf"), width = 10, height = 8)
+print(p)
+dev.off()
+
+# existing signatures (don't correlated with PMI)
+p <- ggplot(herring.2022.metadata.by.sample, aes(x = PMI, y = mean.hypoxia)) + 
+    geom_point(alpha = 0.6) + 
+    xlab("Postmortem interval (hours)") +
+    ylab("Hypoxia score") +
+    geom_smooth(method='lm') +
+    stat_cor(method = correlation.method.use, size = 7, cor.coef.name = "rho")
+
+p <- ggplot(herring.2022.metadata.by.sample, aes(x = PMI, y = mean.apoptosis)) + 
+    geom_point(alpha = 0.6) + 
+    xlab("Postmortem interval (hours)") +
+    ylab("Apoptosis score") +
+    geom_smooth(method='lm') +
+    stat_cor(method = correlation.method.use, size = 7, cor.coef.name = "rho")
+
+p <- ggplot(herring.2022.metadata.by.sample, aes(x = PMI, y = mean.necrosis)) + 
+    geom_point(alpha = 0.6) + 
+    xlab("Postmortem interval (hours)") +
+    ylab("Necrosis score") +
+    geom_smooth(method='lm') +
+    stat_cor(method = correlation.method.use, size = 7, cor.coef.name = "rho")
+
+
+# postmortem score only
+res <- run_pmi_model(
+  data = herring.2022.metadata.by.sample,
+  predictors = c("mean.postmortem.score"),
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_postmortem.score.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_postmortem.score.txt"
+)
+
+
+# postmortem sensitive
+res <- run_pmi_model(
+  data = herring.2022.metadata.by.sample,
+  predictors = c("mean.postmortem.sensitive"),
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_postmortem.sensitive.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_postmortem.sensitive.txt"
+)
+
+# postmortem score + metadata
+res <- run_pmi_model(
+  data = herring.2022.metadata.by.sample,
+  predictors = c("mean.postmortem.score", metadata.vars),
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_postmortem.score_w.metadata.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_postmortem.score_w.metadata.txt"
+)
+
+# percent.mt only
+res <- run_pmi_model(
+  data = herring.2022.metadata.by.sample,
+  predictors = c("mean.percent.mt"),
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_percent.mt.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_percent.mt.txt"
+)
+
+# postmortem score + percent.mt
+res <- run_pmi_model(
+  data = herring.2022.metadata.by.sample,
+  predictors = c("mean.postmortem.score", 
+                "mean.percent.mt"),
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_postmortem.score_percent.mt.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_postmortem.score_percent.mt.txt"
+)
+
+
+# postmortem sensitive only
+res <- run_pmi_model(
+  data = herring.2022.metadata.by.sample,
+  predictors = c("mean.postmortem.sensitive"),
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_postmortem.sensitive_only.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_postmortem.sensitive_only.txt"
+)
+
+
+# postmortem sensitive + percent.mt
+res <- run_pmi_model(
+  data = herring.2022.metadata.by.sample,
+  predictors = c("mean.postmortem.sensitive", 
+                "mean.percent.mt"),
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_postmortem.sensitive_percent.mt.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_postmortem.sensitive_percent.mt.txt"
+)
+
+# postmortem score + percent.mt, with metadata
+res <- run_pmi_model(
+  data = herring.2022.metadata.by.sample,
+  predictors = c("mean.postmortem.score", 
+                 "mean.percent.mt",
+                  metadata.vars),
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_postmortem.score_percent.mt_w.metadata.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_postmortem.score_percent.mt_w.metadata.txt"
+)
+
+
+# all postmortem signatures, no metadata
+res <- run_pmi_model(
+  data = herring.2022.metadata.by.sample,
+  predictors = c("mean.postmortem.score", 
+                 "mean.postmortem.sensitive",
+                 "mean.heat.shock", 
+                 "mean.percent.mt"),
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_all.postmortem.signatures_no.metadata.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_all.postmortem.signatures_no.metadata.txt"
+)
+
+
+# only metadata
+res <- run_pmi_model(
+  data = herring.2022.metadata.by.sample,
+  predictors = metadata.vars,
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_metadata.only.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_metadata.only.txt"
+)
+
+
+# all postmortem signatures with metadata
+res <- run_pmi_model(
+  data = herring.2022.metadata.by.sample,
+  predictors = c("mean.postmortem.score", 
+                "mean.postmortem.sensitive",
+                "mean.heat.shock", 
+                "mean.percent.mt", 
+                 metadata.vars),
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_all.postmortem.signatures_w.metadata.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_all.postmortem.signatures_w.metadata.txt"
+)
+
+
+
+# all postmortem signatures wo heat shock with metadata
+res <- run_pmi_model(
+  data = herring.2022.metadata.by.sample,
+  predictors = c("mean.postmortem.score", 
+                "mean.postmortem.sensitive",
+                "mean.percent.mt", 
+                 metadata.vars),
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_postmortem.score_percent.mt_postmortem.sensitive_w.metadata.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_postmortem.score_percent.mt_postmortem.sensitive_w.metadata.txt"
+)
+
+
+
+# all postmortem signatures without percent.mt, with metadata
+res <- run_pmi_model(
+  data = herring.2022.metadata.by.sample,
+  predictors = c("mean.postmortem.score", 
+                 "mean.postmortem.sensitive",
+                 "mean.heat.shock", 
+                  metadata.vars),
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_all.postmortem.signatures_no.percent.mt_w.metadata.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_all.postmortem.signatures_no.percent.mt_w.metadata.txt"
+)
+
+
+# Sex is very correlated with PMI
+ggplot(herring.2022.metadata.by.sample, aes(Sex.y, PMI)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter()
+```
+
+
+
+# Heat shock signature vs cause of death
+```{r}
+cod.abbreviations <- abbreviate(herring.2022.metadata.by.sample$`Cause of Death`)
+herring.2022.metadata.by.sample$cod.label <- cod.abbreviations
+herring.2022.metadata.by.sample$cod <- apply(herring.2022.metadata.by.sample, 1, function(row) 
+  ifelse(row[["cod.label"]] %in% c("PHmd", "CoLVN"), 
+         "Unclear", 
+         ifelse(row[["Oxygen/No Oxygen"]] == "Oxygen", "Hypoxia", "Normoxia"))
+)
+herring.2022.metadata.by.sample$cod <- factor(herring.2022.metadata.by.sample$cod, levels = c("Normoxia", "Hypoxia", "Unclear"))
+
+
+# Figure 1
+
+# abbreviations table
+herring.2022.metadata.by.sample.df <- herring.2022.metadata.by.sample %>% data.frame() %>% dplyr::select(cod.label, Cause.of.Death) %>% arrange(cod.label) %>% distinct()
+colnames(herring.2022.metadata.by.sample.df) <- c("Abbreviation", "Cause of Death")
+write.table(herring.2022.metadata.by.sample.df, paste0(root.dir, 'Figures/', 'Figure 1/', 'cause.of.death.abbreviations.tsv'), sep = "\t", quote = F)
+
+set.seed(123)
+p.heat.shock <- ggplot(herring.2022.metadata.by.sample, aes(cod, mean.heat.shock, label = cod.label)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(position = position_jitter(seed=1), alpha = 0.6) + 
+  geom_text_repel(position = position_jitter(seed=1), size=4, color = "black") +
+  xlab("Cause of death") +
+  ylab("Hypoxia heat shock score") +
+  stat_compare_means(comparisons = list(c("Normoxia", "Hypoxia")))
+
+pdf(paste0(results.dir, 'Herring_2022/', 'cause.of.death_vs_heat.shock.score_all.pdf'), width=10, height = 6)
+print(p.heat.shock)
+dev.off()
+
+
+# remove unclear causes of death
+herring.2022.metadata.by.sample.filter <- herring.2022.metadata.by.sample %>% filter(cod != "Unclear")
+
+set.seed(123)
+p.heat.shock <- ggplot(herring.2022.metadata.by.sample.filter, aes(cod, mean.heat.shock, label = cod.label)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(position = position_jitter(seed=1), alpha = 0.6) + 
+  geom_text_repel(position = position_jitter(seed=1), size=4, color = "black") +
+  xlab("Cause of death") +
+  ylab("Hypoxia heat shock score") +
+  ylim(c(-0.2, 1.2))
+
+wt_result <- wilcox.test(mean.heat.shock ~ cod, data = herring.2022.metadata.by.sample.filter)
+p_val <- format.pval(wt_result$p.value, digits = 2)
+p_label <- paste0("p = ", p_val)
+
+p <- p.heat.shock + 
+  geom_signif(
+    comparisons = list(c("Normoxia", "Hypoxia")),
+    annotations = p_label,
+    y_position = max(herring.2022.metadata.by.sample.filter$mean.heat.shock) + 0.05,
+    tip_length = 0.03,
+    vjust = -0.5,
+    size = 0.5,     
+    textsize = 6    
+  )
+
+pdf(paste0(root.dir, 'Figures/', 'Figure 1/', 'herring2022_cause_of_death_vs_hypoxia_heat_shock.pdf'), width=10, height = 8)
+print(p)
+dev.off()
+```
+
+
+
+
+# PMI correlation by sample and cell type
+```{r}
+# by cell type
+herring.2022.metadata.by.sample.celltype <- herring.2022.metadata %>%
+  group_by(library.id_, PMI_, `Age (years)`, Stage, `Stage category`, Sex.y, Race.y, `Oxygen/No Oxygen`, `Brain Regions*`, annotation_l1) %>%
+  dplyr::summarize(
+            mean.percent.mt = mean(percent.mt),
+            mean.postmortem.score = mean(postmortem.signature),
+            mean.heat.shock = mean(heat.shock.signature),
+            mean.postmortem.glial = mean(postmortem.glial),
+            mean.postmortem.sensitive = mean(postmortem.sensitive),
+            mean.immune.signature = mean(immune.factor),
+            mean.vascular.signature = mean(vascular.factor),
+            mean.neuron.signature = mean(neurons.factor),
+            mean.glial.signature= mean(glial.factor),
+            mean.malignant.signature = mean(malignant.factor)) %>%
+  ungroup()
+
+herring.2022.metadata.by.sample.celltype <- herring.2022.metadata.by.sample.celltype %>% dplyr::rename(library.id=library.id_)
+herring.2022.metadata.by.sample.celltype <- herring.2022.metadata.by.sample.celltype %>% dplyr::rename(PMI=PMI_)
+
+herring.2022.metadata.by.sample.celltype$annotation_l1 <- sapply(herring.2022.metadata.by.sample.celltype$annotation_l1, function(x) ifelse(x %in% c("Low.quality", "Poor.Quality"), "Low.quality", x))
+#herring.2022.metadata.by.sample.celltype.filter <- herring.2022.metadata.by.sample.celltype %>% filter(annotation_l1 %ni% c("Low.quality", "Poor.Quality"))
+
+
+metadata.vars <- c("Sex.y", "Race.y", "`Age (years)`", "`Oxygen/No Oxygen`")
+postmortem.signatures <- c("mean.heat.shock", "mean.postmortem.sensitive", "mean.percent.mt", "mean.postmortem.score")
+
+
+# postmortem score
+res <- run_pmi_model(
+  data = herring.2022.metadata.by.sample.celltype,
+  predictors = c(postmortem.signatures,
+                 "annotation_l1"),
+  results.dir = paste0(models.dir, "by_celltype/"),
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_all.postmortem.signatures_w.annotaiton_l1_no.metadata.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_all.postmortem.signatures_w.annotaiton_l1_no.metadata.txt"
+)
+
+# postmortem score + metadata
+res <- run_pmi_model(
+  data = herring.2022.metadata.by.sample.celltype,
+  predictors = c(postmortem.signatures,
+                 "annotation_l1",
+                  metadata.vars),
+  results.dir = paste0(models.dir, "by_celltype/"),
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_all.postmortem.signatures_w.annotaiton_l1_w.metadata.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_all.postmortem.signatures_w.annotaiton_l1_w.metadata.txt"
+)
+
+
+for (celltype in unique(herring.2022.metadata.by.sample.celltype$annotation_l1)) {
+  print(celltype)
+  
+  celltype.df <- filter(herring.2022.metadata.by.sample.celltype, annotation_l1 == celltype)
+  
+  
+  # postmortem score
+  predictors <- c("mean.postmortem.score", "mean.heat.shock",
+                 "mean.postmortem.sensitive", "mean.percent.mt")
+  
+  if (celltype == "Glial") {
+    
+    res <- run_pmi_model(
+      data = celltype.df,
+      predictors = c(postmortem.signatures, "mean.postmortem.glial"),
+      results.dir = paste0(models.dir, "by_celltype/"),
+      save.figures = TRUE,
+      fig.name = paste0(celltype, "_PMI_vs_PMI.prediction_all.postmortem.signatures_postmortem.glial_no.metadata.pdf"),
+      save.model.summary = TRUE,
+      summary.name = paste0(celltype, "_PMI_model_summary_all.postmortem.signatures_postmortem.glial_no.metadata.txt")
+    )
+    
+    res <- run_pmi_model(
+      data = celltype.df,
+      predictors = c(postmortem.signatures, "mean.postmortem.glial", metadata.vars),
+      results.dir = paste0(models.dir, "by_celltype/"),
+      save.figures = TRUE,
+      fig.name = paste0(celltype, "_PMI_vs_PMI.prediction_all.postmortem.signatures_postmortem.glial_w.metadata.pdf"),
+      save.model.summary = TRUE,
+      summary.name = paste0(celltype, "_PMI_model_summary_all.postmortem.signatures_postmortem.glial_w.metadata.txt")
+    )
+  }
+  
+  res <- run_pmi_model(
+    data = celltype.df,
+    predictors = postmortem.signatures,
+    results.dir = paste0(models.dir, "by_celltype/"),
+    save.figures = TRUE,
+    fig.name = paste0(celltype, "_PMI_vs_PMI.prediction_all.postmortem.signatures_no.metadata.pdf"),
+    save.model.summary = TRUE,
+    summary.name = paste0(celltype, "_PMI_model_summary_all.postmortem.signatures_no.metadata.txt")
+  )
+  
+  
+  # percent.mt and postmortem.score
+  res <- run_pmi_model(
+    data = celltype.df,
+    predictors = c(postmortem.signatures, metadata.vars),
+    results.dir = paste0(models.dir, "by_celltype/"),
+    save.figures = TRUE,
+    fig.name = paste0(celltype, "_PMI_vs_PMI.prediction_all.postmortem.signatures_w.metadata.pdf"),
+    save.model.summary = TRUE,
+    summary.name = paste0(celltype, "_PMI_model_summary_all.postmortem.signatures_w.metadata.txt")
+  )
+}
+
+```
+
+
+
+
+
+# Velmeshev 2019
+
+# PMI correlation by sample
+```{r PMI}
+seurat.obj <- readRDS(paste0(data.dir, 'Velmeshev_2019_Autism/', 'SeuratObjects/', 'raw.velmeshev2019.autism.all.cells.seurat.obj.RDS'))
+
+seurat.obj <- add.module.score(seurat.obj, gene.signatures)
+
+
+# by sample
+sample.df <- seurat.obj@meta.data %>%
+  group_by(individual, sample, region, diagnosis, sex, age, post.mortem.interval..hours., Capbatch, Seqbatch, RNA.Integrity.Number) %>% 
+  summarize(mean.percent.mt = mean(percent.mt),
+            mean.postmortem.score = mean(postmortem.signature),
+            mean.heat.shock = mean(heat.shock.signature),
+            mean.postmortem.glial = mean(postmortem.glial),
+            mean.postmortem.sensitive = mean(postmortem.sensitive)) %>%
+  ungroup()
+#sample.df$PMI <- sample.df$post.mortem.interval..hours.
+
+# add patient-level metadata
+patient.metadata.df <- read_excel(paste0(root.dir, "ExternalData/", "Velmeshev_2019_Autism/", "aav8130_data-s1.xlsx"), sheet = 1)
+sample.df <- sample.df %>% left_join(patient.metadata.df, by = c("individual" = "Patient ID"))
+
+
+#sample.df <- sample.df %>% filter(diagnosis == "Control")
+
+
+models.dir <- paste0(results.dir, 'Velmeshev_2019/', 'models/')
+
+metadata.vars <- c("sex", "region", "age", "diagnosis")
+
+
+sample.df$Diagnosis <- sample.df$diagnosis
+
+# Figure 1 RIN correlations
+p <- ggplot(sample.df, aes(x = RNA.Integrity.Number, y = mean.postmortem.sensitive)) + 
+     geom_point(alpha = 0.6) + 
+     xlab("RNA integrity number") +
+     ylab("Living enriched score") +
+     geom_smooth(method='lm') +
+     stat_cor(method = correlation.method.use, size = 7, cor.coef.name = "rho")
+pdf(paste0(root.dir, "Figures/", "Figure 1/", "velmeshev2019_RIN_vs_living_enriched.pdf"), width = 10, height = 8)
+print(p)
+dev.off()
+
+p <- ggplot(sample.df %>% filter(diagnosis == "Control"), aes(x = RNA.Integrity.Number, y = mean.postmortem.sensitive)) + 
+     geom_point(alpha = 0.6) + 
+     xlab("RNA integrity number") +
+     ylab("Living enriched score") +
+     geom_smooth(method='lm') +
+     stat_cor(method = correlation.method.use, size = 7, cor.coef.name = "rho")
+pdf(paste0(root.dir, "Figures/", "Figure 1/", "velmeshev2019_RIN_vs_living_enriched_control_only.pdf"), width = 10, height = 8)
+print(p)
+dev.off()
+
+p <- ggplot(sample.df, aes(x = RNA.Integrity.Number, y = mean.postmortem.sensitive)) + 
+     geom_point(alpha = 0.6, aes(color = Diagnosis)) + 
+     xlab("RNA integrity number") +
+     ylab("Living enriched score") +
+     geom_smooth(method='lm') +
+     stat_cor(method = correlation.method.use, size = 7, cor.coef.name = "rho")
+pdf(paste0(root.dir, "Figures/", "Figure 1/", "velmeshev2019_RIN_vs_living_enriched_all_samples.pdf"), width = 10, height = 8)
+print(p)
+dev.off()
+
+
+# Figure 1 Supplemental
+p <- ggplot(sample.df, aes(x = RNA.Integrity.Number, y = mean.postmortem.score)) + 
+     geom_point(alpha = 0.6) + 
+     xlab("RNA integrity number") +
+     ylab("Postmortem enriched score") +
+     geom_smooth(method='lm') +
+     stat_cor(method = correlation.method.use, size = 7, cor.coef.name = "rho")
+pdf(paste0(root.dir, "Figures/", "Figure 1/", "Supplemental/", "velmeshev2019_RIN_vs_postmortem_enriched.pdf"), width = 10, height = 8)
+print(p)
+dev.off()
+
+p <- ggplot(sample.df, aes(x = RNA.Integrity.Number, y = mean.heat.shock)) + 
+     geom_point(alpha = 0.6) + 
+     xlab("RNA integrity number") +
+     ylab("Hypoxia heat shock score") +
+     geom_smooth(method='lm') +
+     stat_cor(method = correlation.method.use, size = 7, cor.coef.name = "rho")
+pdf(paste0(root.dir, "Figures/", "Figure 1/", "Supplemental/", "velmeshev2019_RIN_vs_hypoxia_heat_shock.pdf"), width = 10, height = 8)
+print(p)
+dev.off()
+
+
+# Figure 1 Supplemental, PMI correlations
+model <- lm(mean.postmortem.score ~ mean.percent.mt, data=sample.df)
+sample.df$mean.postmortem.score.res <- residuals(model)
+
+p <- ggplot(sample.df, aes(x = PMI, y = mean.postmortem.score)) + 
+     geom_point(alpha = 0.6) + 
+     xlab("PMI (hours)") +
+     ylab("Postmortem enriched score") +
+     geom_smooth(method='lm') +
+     stat_cor(method = correlation.method.use, size = 7, cor.coef.name = "rho")
+pdf(paste0(root.dir, "Figures/", "Figure 1/", "Supplemental/", "velmeshev2019_PMI_vs_postmortem_enriched.pdf"), width = 10, height = 8)
+print(p)
+dev.off()
+
+p <- ggplot(sample.df, aes(x = PMI, y = mean.postmortem.score.res)) + 
+     geom_point(alpha = 0.6, aes(color = Diagnosis)) + 
+     xlab("PMI (hours)") +
+     ylab("Postmortem enriched score (MT adjusted)") +
+     geom_smooth(method='lm') +
+     stat_cor(method = correlation.method.use, size = 7, cor.coef.name = "rho") 
+pdf(paste0(root.dir, "Figures/", "Figure 1/", "Supplemental/", "velmeshev2019_PMI_vs_postmortem_enriched_percent_mt_adjusted.pdf"), width = 10, height = 8)
+print(p)
+dev.off()
+
+p <- ggplot(sample.df %>% filter(diagnosis == "Control"), aes(x = PMI, y = mean.postmortem.score.res)) + 
+     geom_point(alpha = 0.6) + 
+     xlab("PMI (hours)") +
+     ylab("Postmortem enriched score (MT adjusted)") +
+     geom_smooth(method='lm') +
+     stat_cor(method = correlation.method.use, size = 7, cor.coef.name = "rho") 
+pdf(paste0(root.dir, "Figures/", "Figure 1/", "Supplemental/", "velmeshev2019_PMI_vs_postmortem_enriched_percent_mt_adjusted_adjust_all_show_control_only.pdf"), width = 10, height = 8)
+print(p)
+dev.off()
+
+sample.control.df <- sample.df %>% filter(diagnosis == "Control")
+model <- lm(mean.postmortem.score ~ mean.percent.mt, data=sample.control.df)
+sample.control.df$mean.postmortem.score.res <- residuals(model)
+p <- ggplot(sample.control.df, aes(x = PMI, y = mean.postmortem.score.res)) + 
+     geom_point(alpha = 0.6) + 
+     xlab("PMI (hours)") +
+     ylab("Postmortem enriched score (MT adjusted)") +
+     geom_smooth(method='lm') +
+     stat_cor(method = correlation.method.use, size = 7, cor.coef.name = "rho") 
+pdf(paste0(root.dir, "Figures/", "Figure 1/", "Supplemental/", "velmeshev2019_PMI_vs_postmortem_enriched_percent_mt_adjusted_control_only.pdf"), width = 10, height = 8)
+print(p)
+dev.off()
+
+
+
+p <- ggplot(sample.df, aes(x = PMI, y = mean.postmortem.sensitive)) + 
+     geom_point(alpha = 0.6) + 
+     xlab("PMI (hours)") +
+     ylab("Living enriched score") +
+     geom_smooth(method='lm') +
+     stat_cor(method = correlation.method.use, size = 7, cor.coef.name = "rho")
+pdf(paste0(root.dir, "Figures/", "Figure 1/", "Supplemental/", "velmeshev2019_PMI_vs_living_enriched.pdf"), width = 10, height = 8)
+print(p)
+dev.off()
+
+p <- ggplot(sample.df, aes(x = PMI, y = mean.heat.shock)) + 
+     geom_point(alpha = 0.6) + 
+     xlab("PMI (hours)") +
+     ylab("Hypoxia heat shock score") +
+     geom_smooth(method='lm') +
+     stat_cor(method = correlation.method.use, size = 7, cor.coef.name = "rho")
+pdf(paste0(root.dir, "Figures/", "Figure 1/", "Supplemental/", "velmeshev2019_PMI_vs_hypoxia_heat_shock.pdf"), width = 10, height = 8)
+print(p)
+dev.off()
+
+p <- ggplot(sample.df, aes(x = `Cause of death`, y = mean.heat.shock, label = sample, color = diagnosis)) + 
+  geom_point(alpha = 0.6) + 
+  xlab("Cause of death") +
+  ylab("Hypoxia heat shock score") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  geom_text_repel(size = 2) +
+  labs(color = "Diagnosis")
+pdf(paste0(root.dir, "Figures/", "Figure 1/", "Supplemental/", "velmeshev2019_COD_vs_hypoxia_heat_shock.pdf"), width = 14, height = 10)
+print(p)
+dev.off()
+
+
+p <- ggplot(sample.df, aes(x = PMI, y = RNA.Integrity.Number)) + 
+     geom_point(alpha = 0.6) + 
+     xlab("Postmortem interval (hours)") +
+     ylab("RNA integrity number") +
+     geom_smooth(method='lm') +
+     stat_cor(method = correlation.method.use, size = 7, cor.coef.name = "rho")
+pdf(paste0(results.dir, 'Velmeshev_2019/', "PMI_vs_RIN.pdf"), width = 8, height = 6)
+print(p)
+dev.off()
+
+
+
+# postmortem sensitive
+res <- run_pmi_model(
+  data = sample.df,
+  predictors = c("mean.postmortem.sensitive"),
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_postmortem.sensitive.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_postmortem.sensitive.txt"
+)
+
+
+# postmortem sensitive with metadata
+res <- run_pmi_model(
+  data = sample.df,
+  predictors = c("mean.postmortem.sensitive",
+                 metadata.vars),
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_postmortem.sensitive_w.metadata.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_postmortem.sensitive_w.metadata.txt"
+)
+
+
+# postmortem score
+res <- run_pmi_model(
+  data = sample.df,
+  predictors = c("mean.postmortem.score"),
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_postmortem.score.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_postmortem.score.txt"
+)
+
+
+# postmortem score with metadata
+res <- run_pmi_model(
+  data = sample.df,
+  predictors = c("mean.postmortem.score",
+                 metadata.vars),
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_postmortem.score_w.metadata.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_postmortem.score_w.metadata.txt"
+)
+
+res <- run_pmi_model(
+  data = sample.df,
+  predictors = c("mean.postmortem.score",
+                 "mean.percent.mt",
+                  metadata.vars),
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_postmortem.score_percent.mt_w.metadata.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_postmortem.score_percent.mt_w.metadata.txt"
+)
+
+
+
+# all variables no metadata
+res <- run_pmi_model(
+  data = sample.df,
+  predictors = c("mean.postmortem.score",
+                 "mean.postmortem.sensitive",
+                 "mean.heat.shock",
+                 "mean.percent.mt"),
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_all.postmortem.variables_no.metadata.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_all.postmortem.variables_no.metadata.txt"
+)
+
+
+# all variables with metadata
+res <- run_pmi_model(
+  data = sample.df,
+  predictors = c("mean.postmortem.score",
+                 "mean.postmortem.sensitive",
+                 "mean.heat.shock",
+                 "mean.percent.mt",
+                  metadata.vars),
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_all.postmortem.variables_w.metadata.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_all.postmortem.variables_w.metadata.txt"
+)
+
+
+
+# all variables except heat shock with metadata
+res <- run_pmi_model(
+  data = sample.df,
+  predictors = c("mean.postmortem.score",
+                 "mean.postmortem.sensitive",
+                 "mean.percent.mt",
+                  metadata.vars),
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_postmortem.score_percent.mt_postmortem.sensitive_w.metadata.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_postmortem.score_percent.mt_postmortem.sensitive_w.metadata.txt"
+)
+
+# metadata only
+res <- run_pmi_model(
+  data = sample.df,
+  predictors = c(metadata.vars),
+  results.dir = models.dir,
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_metadata.only.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_metadata.only.txt"
+)
+```
+
+
+
+# PMI correlation by sample and cell type
+```{r}
+# by sample and cell type
+sample.celltype.df <- seurat.obj@meta.data %>%
+  group_by(individual, sample, region, diagnosis, sex, age, post.mortem.interval..hours., Capbatch, Seqbatch, RNA.Integrity.Number, annotation_l1) %>% 
+  summarize(mean.postmortem.score = mean(postmortem.signature),
+            mean.percent.mt = mean(percent.mt),
+            mean.heat.shock = mean(heat.shock.signature),
+            mean.postmortem.glial = mean(postmortem.glial),
+            mean.postmortem.sensitive = mean(postmortem.sensitive)) %>%
+  ungroup()
+sample.celltype.df$PMI <- sample.celltype.df$post.mortem.interval..hours.
+sample.celltype.df <- sample.celltype.df %>% filter(diagnosis == "Control")
+
+
+
+metadata.vars <-  c("sex", "region", "age")
+postmortem.signatures <- c("mean.heat.shock", "mean.postmortem.sensitive", "mean.percent.mt", "mean.postmortem.score")
+
+
+# all variables, no metadata
+res <- run_pmi_model(
+  data = sample.celltype.df,
+  predictors = c(postmortem.signatures, 
+                 "annotation_l1"),
+  results.dir = paste0(models.dir, "by_celltype/"),
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_all.postmortem.signatures_w.annotation.l1_no.metadata.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_all.postmortem.signatures_w.annotation.l1_no.metadata.txt"
+)
+
+
+# all variables, with metadata
+res <- run_pmi_model(
+  data = sample.celltype.df,
+  predictors = c(postmortem.signatures, 
+                 "annotation_l1",
+                 metadata.vars),
+  results.dir = paste0(models.dir, "by_celltype/"),
+  save.figures = TRUE,
+  fig.name = "PMI_vs_PMI.prediction_all.postmortem.signatures_w.annotation.l1_w.metadata.pdf",
+  save.model.summary = TRUE,
+  summary.name = "PMI_model_summary_all.postmortem.signatures_w.annotation.l1_w.metadata.txt"
+)
+
+
+
+for (celltype in unique(sample.celltype.df$annotation_l1)) {
+  print(celltype)
+  
+  celltype.df <- filter(sample.celltype.df, annotation_l1 == celltype)
+  
+  # all variables
+  predictors <- postmortem.signatures
+  if (celltype == "Glial") {
+    res <- run_pmi_model(
+      data = celltype.df,
+      predictors = c(predictors, "mean.postmortem.glial"),
+      results.dir = paste0(models.dir, "by_celltype/"),
+      save.figures = TRUE,
+      fig.name = paste0(celltype, "_PMI_vs_PMI.prediction_all.postmortem.signatures_postmortem.glial_no.metadata.pdf"),
+      save.model.summary = TRUE,
+      summary.name = paste0(celltype, "_PMI_model_summary_all.postmortem.signatures_postmortem.glial_no.metadata.txt")
+    )
+  
+    res <- run_pmi_model(
+      data = celltype.df,
+      predictors = c(predictors, "mean.postmortem.glial", metadata.vars),
+      results.dir = paste0(models.dir, "by_celltype/"),
+      save.figures = TRUE,
+      fig.name = paste0(celltype, "_PMI_vs_PMI.prediction_all.postmortem.signatures_postmortem.glial_w.metadata.pdf"),
+      save.model.summary = TRUE,
+      summary.name = paste0(celltype, "_PMI_model_summary_all.postmortem.signatures_postmortem.glial_w.metadata.txt")
+    )
+  }
+ 
+  res <- run_pmi_model(
+    data = celltype.df,
+    predictors = predictors,
+    results.dir = paste0(models.dir, "by_celltype/"),
+    save.figures = TRUE,
+    fig.name = paste0(celltype, "_PMI_vs_PMI.prediction_all.postmortem.signatures_no.metadata.pdf"),
+    save.model.summary = TRUE,
+    summary.name = paste0(celltype, "_PMI_model_summary_all.postmortem.signatures_no.metadata.txt")
+  )
+  
+  res <- run_pmi_model(
+    data = celltype.df,
+    predictors = c(predictors, metadata.vars),
+    results.dir = paste0(models.dir, "by_celltype/"),
+    save.figures = TRUE,
+    fig.name = paste0(celltype, "_PMI_vs_PMI.prediction_all.postmortem.signatures_w.metadata.pdf"),
+    save.model.summary = TRUE,
+    summary.name = paste0(celltype, "_PMI_model_summary_all.postmortem.signatures_w.metadata.txt")
+  )
+}
+```
+
+
+

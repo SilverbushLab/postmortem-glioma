@@ -1,0 +1,840 @@
+---
+title: "Figure_1.RMD"
+output: html_document
+date: "2026-02-08"
+---
+
+
+
+# Setup
+```{r}
+root.dir <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Projects/Jackie_post-mortem/"
+figures.dir <- paste0(root.dir, "Figures/", "Figure 1/")
+supp.figures.dir <- paste0(root.dir, "Figures/", "Figure 1/", "Supplemental/")
+
+suppressMessages(suppressWarnings(source(paste0(root.dir, "Code/", 'helper_functions.R'))))
+
+seurat.obj <- readRDS(paste0(root.dir, "ExternalData/", 'Sussman_2024/', 'SeuratObjsFromLevel3ByPatientFinal/', 'all.samples.merged.not.downsampled.seurat.obj.w.annotations.RDS'))
+```
+
+
+
+# Main: Timepoint vs percent of cells filtered out
+```{r}
+df <- seurat.obj@meta.data %>%
+  group_by(timepoint, sample.id) %>%
+  summarize(percent.filtered.out = 100 * (sum(low.quality.by.qc) / n())) %>%
+  ungroup()
+df$timepoint <- factor(df$timepoint, levels = timepoints)
+write.table(df, paste0(figures.dir, "sussman2024_percent_filtered_out_by_sample.tsv"), sep = "\t", quote = F, row.names = F)
+
+# these statistics go in main text
+df %>% group_by(timepoint) %>% summarize(median.percent.filtered.out = median(percent.filtered.out)) %>% print()
+
+stat.test <- df %>%
+  wilcox_test(percent.filtered.out ~ timepoint, ref.group = "Progressive (Autopsy)") %>%
+  add_significance() %>% 
+  adjust_pvalue(method = "fdr") %>%
+  add_xy_position(x = "timepoint")
+stat.test$p.label <- sapply(stat.test$p.adj, format.p.value)
+
+p <- ggplot(df, aes(timepoint, percent.filtered.out)) +
+  geom_boxplot(aes(fill = timepoint), outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.2), color = "black", alpha = 0.6) +
+  theme(legend.position="none") +
+  stat_pvalue_manual(stat.test, label = "p.label", label.size = 6) +
+  xlab("Timepoint") +
+  ylab("Percent of cells filtered out (%)") +
+  ylim(c(-5, 100)) +
+  timepoints.fill.scale +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+pdf(paste0(figures.dir, 'timepoint_vs_percent.filtered.out.pdf'), width=10, height=10)
+print(p)
+dev.off()
+```
+
+
+
+# Main: transcriptional noise by cell type (PCA)
+```{r}
+patient.id.use <- "C34809"
+seurat.obj.subset <- subset(seurat.obj, subset = (patient_id == patient.id.use) & (low.quality.by.qc == FALSE))
+outliers <- c("HTAN_pHGG_6477_Reg2_snRNA_CTTAGGAAGTCTGGTT-1")
+
+plot.list <- list()
+for (celltype.use in c("Lymphoid", "Myeloid", "Endothelial", "Malignant cluster")) { 
+  
+  seurat.obj.subset.celltype <- subset(seurat.obj.subset, subset = (annotation.l2.w.qc == celltype.use) & (cell.id %ni% outliers))
+  seurat.obj.subset.celltype <- FindVariableFeatures(seurat.obj.subset.celltype)
+  seurat.obj.subset.celltype <- ScaleData(seurat.obj.subset.celltype)
+  
+  set.seed(123)
+  seurat.obj.subset.celltype <- RunPCA(seurat.obj.subset.celltype, features = VariableFeatures(seurat.obj.subset), approx = T, seed.use = 42, npcs = 30)
+  
+  p <- DimPlot(seurat.obj.subset.celltype, group.by = "timepoint", shuffle = T, label = F, raster=F, reduction = "pca") + timepoints.color.scale + ggtitle(celltype.use) 
+  
+  plot.list[[celltype.use]] <- p
+  
+}
+
+p <- patchwork::wrap_plots(plot.list, ncol = 2) +
+  patchwork::plot_layout(guides = "collect") &
+  theme(
+    legend.position = "right",
+    legend.justification = "center"
+  )
+pdf(paste0(figures.dir, "sussman2024pHGG_", patient.id.use, "_pca_by_timepoint.pdf"), width=12, height=8)
+print(p)
+dev.off()
+
+rm(seurat.obj.subset)
+```
+
+
+
+
+
+
+# Supplementary Table S4: Sussman 2024 timepoint DEGs
+```{r}
+library(DESeq2)
+
+
+# 1. Identify which groups meet the 5-cell threshold
+cell_counts <- seurat.obj@meta.data %>%
+  group_by(sample.id, patient_id, timepoint, annotation.l1) %>%
+  summarise(n_cells = n(), .groups = 'drop') %>%
+  # Force hyphens to underscores to ensure a clean match later
+  mutate(column_id = paste(sample.id, patient_id, timepoint, annotation.l1, sep = "_")) %>%
+  mutate(column_id = gsub("-", "_", column_id))
+
+# 2. Generate pseudobulk data
+pb <- AggregateExpression(
+  seurat.obj,
+  assays = "RNA",
+  slot = "counts",
+  group.by = c("sample.id", "patient_id", "timepoint", "annotation.l1"),
+  return.seurat = FALSE
+)
+
+counts <- pb$RNA
+
+# 3. Align column names and filter
+# First, store the ORIGINAL colnames to split later, 
+# but create a temporary version with underscores to match cell_counts
+original_colnames <- colnames(counts)
+colnames_matched <- gsub("-", "_", original_colnames)
+
+# Identify which columns (using the matched naming) meet the threshold
+valid_indices <- which(colnames_matched %in% cell_counts$column_id[cell_counts$n_cells >= 5])
+
+# Subset the matrix using original names to keep your strsplit logic working
+counts_filtered <- counts[, valid_indices]
+
+# 4. Extract metadata from the filtered column names
+meta_list <- strsplit(colnames(counts_filtered), "_")
+meta <- as.data.frame(do.call(rbind, meta_list))
+colnames(meta) <- c("sample_id", "patient_id", "timepoint", "celltype")
+
+# Update terminology: Living -> Surgical
+meta <- meta %>%
+  mutate(status = ifelse(timepoint == "Progressive (Autopsy)", "Postmortem", "Surgical")) %>%
+  mutate(status = factor(status, levels = c("Surgical", "Postmortem")))
+
+# 5. Run DEG analysis per cell type
+results_list <- list()
+
+for (ct in unique(meta$celltype)) {
+  message("Analyzing: ", ct)
+  
+  keep_cols <- meta$celltype == ct
+  ct_counts <- counts_filtered[, keep_cols]
+  ct_meta   <- meta[keep_cols, ]
+  
+  if(length(unique(ct_meta$status)) < 2) {
+    message("  Skipping ", ct, ": Missing one of the status groups (n < 5 cells).")
+    next
+  }
+
+  dds <- DESeqDataSetFromMatrix(
+    countData = ct_counts,
+    colData   = ct_meta,
+    design    = ~ status
+  )
+
+  dds <- dds[rowSums(counts(dds) >= 10) >= 3, ]
+  dds <- DESeq(dds, quiet = TRUE)
+  
+  res <- results(dds, contrast = c("status", "Postmortem", "Surgical"))
+  
+  res_df <- as.data.frame(res)
+  res_df$gene <- rownames(res_df)
+  res_df$cell_type <- ct
+  results_list[[ct]] <- res_df
+}
+
+# 6. Combine and clean results
+all_results <- bind_rows(results_list)
+all_results$cell_type <- sapply(all_results$cell_type, function(x) ifelse(x == "Malignant cluster", "Malignant", x))
+
+# 7. Summary table
+all_results_summary <- all_results %>%
+  filter(padj < 0.05 & log2FoldChange > 0.5) %>%
+  group_by(gene) %>%
+  summarize(
+    n_cell_types = n(),
+    avg_log2fc = mean(log2FoldChange),
+    cell_types = paste(cell_type, collapse = ", ")
+  ) %>%
+  arrange(desc(n_cell_types))
+
+# 8. Export
+writexl::write_xlsx(
+  list(
+    "All DEGs" = all_results,
+    "Top postmortem DEGs" = all_results_summary
+  ),
+  paste0(root.dir, "Figures/", "Tables/", "Table S4 postmortem DEGs from Sussman 2024.xlsx")
+)
+```
+
+
+
+## Main: Postmortem gene signatures
+
+# Quantification of transcripts of postmortem signature genes
+```{r}
+run.chunk <- F
+
+if (run.chunk) {
+  library(biomaRt)
+  
+  ensembl <- useEnsembl(
+    biomart = "ensembl",
+    dataset = "hsapiens_gene_ensembl",
+    version = 109   # pick the Ensembl version matching your reference if possible
+  )
+  
+  tx_lengths <- getBM(
+    attributes = c(
+      "hgnc_symbol",
+      "ensembl_transcript_id",
+      "transcript_length",
+      "transcript_biotype"
+    ),
+    filters = "biotype",
+    values  = "protein_coding",
+    mart    = ensembl
+  )
+  
+  gene_length_summary <- tx_lengths %>%
+    filter(hgnc_symbol != "") %>%
+    group_by(hgnc_symbol) %>%
+    summarise(
+      n_isoforms   = n(),
+      min_tx_len   = min(transcript_length, na.rm = TRUE),
+      median_tx_len= median(transcript_length, na.rm = TRUE),
+      max_tx_len   = max(transcript_length, na.rm = TRUE)
+    )
+  
+  
+  signature.use <- "postmortem.sensitive"
+  postmortem.transcripts <- all.gene.signatures[[signature.use]]
+  
+  transcript_lengths <- gene_length_summary %>%
+    filter(hgnc_symbol %in% postmortem.transcripts)
+  
+  any(rowSums(seurat.obj) == 0)
+  
+  background_lengths <- gene_length_summary %>%
+    filter(!hgnc_symbol %in% postmortem.transcripts)
+  
+  quantile(transcript_lengths$median_tx_len)
+  quantile(transcript_lengths$max_tx_len)
+  quantile(transcript_lengths$n_isoforms)
+  
+  quantile(background_lengths$median_tx_len)
+  quantile(background_lengths$max_tx_len)
+  quantile(background_lengths$n_isoforms)
+  
+  
+  background_lengths$annotation <- "background"
+  transcript_lengths$annotation <- signature.use
+  df <- rbind(background_lengths, transcript_lengths)
+  
+  ggplot(df, aes(annotation, max_tx_len)) +
+    geom_boxplot() +
+    stat_compare_means(ref.group = "background", method.args = list(alternative = "two.sided"))
+  
+  ggplot(df, aes(annotation, min_tx_len)) +
+    geom_boxplot() +
+    stat_compare_means(ref.group = "background", method.args = list(alternative = "two.sided"))
+  
+  ggplot(df, aes(annotation, median_tx_len)) +
+    geom_boxplot()+
+    stat_compare_means(ref.group = "background", method.args = list(alternative = "two.sided"))
+  
+  ggplot(df, aes(annotation, n_isoforms)) +
+    geom_boxplot()+
+    stat_compare_means(ref.group = "background", method.args = list(alternative = "two.sided"))
+}
+```
+
+
+
+
+# Settings
+Run with with signatures.use = 3d_tensor_decomp_signatures (3D tensor decomposition signatures that gave us the postmortem signatures)   
+or signatures.use = 2d_nmf_signatures (2D NMF signatures as comparison)   
+```{r}
+update.gene.signature.names <- function(x) {
+  y <- case_when(
+    x == "postmortem.glial.factor.100" ~ "Postmortem glial\n(top 100 from factor)",
+    x == "postmortem.glial.factor.50" ~ "Postmortem glial\n(top 50 from factor)",
+    x == "postmortem.signature.factor" ~ "Postmortem enriched\n(top 100 from factor)",
+    x == "postmortem.sensitive.factor" ~ "Living enriched\n(top 100 from factor)",
+    x == "heat.shock.signature.9" ~ "Hypoxia heat shock\n(top 100 from factor, rank 9)",
+    x == "heat.shock.signature.10" ~ "Hypoxia heat shock\n(top 100 from factor, rank 10)",
+    x == "postmortem.glial" ~ "Postmortem glial",
+    x == "postmortem.signature" ~ "Postmortem enriched\n(refined)",
+    x == "postmortem.sensitive" ~ "Living enriched\n(refined)",
+    x == "heat.shock.signature" ~ "Hypoxia heat shock\n(refined)",
+    x == "liv.degs.all" ~ "Liharska 2025 LIV DEGs\n(n=7250)",
+    x == "pm.degs.all" ~ "Liharska 2025 PM DEGs\n(n=6771)",
+    x == "liv.degs" ~ "Liharska 2025 LIV DEGs\n(top 100)",
+    x == "pm.degs" ~ "Liharska 2025 PM DEGs\n(top 100)",
+    x == "malignant.factor" ~ "Malignant signature\n(top 100 from factor)",
+    x == "neurons.factor" ~ "Neuronal signature\n(top 100 from factor)",
+    x == "vascular.factor" ~ "Vascular signature\n(top 100 from factor)",
+    x == "glial.factor" ~ "Glial signature\n(top 100 from factor)",
+    x == "immune.factor" ~ "Immune signature\n(top 100 from factor)",
+    TRUE ~ x
+  )
+  return(y)
+}
+
+
+signatures.use <- "3d_tensor_decomp_signatures" # "3d_tensor_decomp_signatures", or "2d_nmf_signatures"
+
+if (signatures.use == "3d_tensor_decomp_signatures") {
+  gene.signatures <- all.gene.signatures[c("heat.shock.signature.9", "heat.shock.signature.10", "postmortem.sensitive.factor", "postmortem.signature.factor", "postmortem.glial.factor.100", "postmortem.glial.factor.50", "glial.factor", "immune.factor", "malignant.factor", "neurons.factor", "vascular.factor", "liv.degs.all", "pm.degs.all", "liv.degs", "pm.degs", "heat.shock.signature", "postmortem.sensitive", "postmortem.signature", "postmortem.glial")]
+} else if (signatures.use == "2d_nmf_signatures") {
+  MP_list_df <- read.csv(paste0(root.dir, "ProcessedData/", "Sussman2024/", "NMF/", "all.timepoints_all.cell.types_top.n.genes10000_nmf.methodRcppML/", "MP_list_df.tsv"), sep="\t")
+  gene.signatures <- list()
+  for (mp in names(MP_list_df)) {
+    gene.signatures[mp] <- MP_list_df[mp]
+  }
+}
+
+factors <- c(names(gene.signatures), "percent.mt")
+
+```
+
+
+
+# Save signatures as Excel file (supplementary table)
+```{r}
+save.signatures <- T
+
+if ((signatures.use == "3d_tensor_decomp_signatures") && (save.signatures)) {
+  gene.signatures.save <- all.gene.signatures[c("glial.factor", "immune.factor", "malignant.factor", "neurons.factor", "vascular.factor",  "postmortem.glial.factor.100", "postmortem.signature.factor", "postmortem.signature", "postmortem.sensitive.factor", "postmortem.sensitive", "heat.shock.signature.9", "heat.shock.signature.10", "heat.shock.signature")]
+  updated.colnames <- sapply(names(gene.signatures.save), update.gene.signature.names)
+  updated.colnames <- str_replace(updated.colnames, "\n", " ")
+  
+  # find the length of the longest signature
+  max_len <- max(sapply(gene.signatures.save, length))
+  
+  # pad shorter signatures with NA so they're all the same length
+  gene.signatures.save.padded <- lapply(gene.signatures.save, function(x) {
+    c(x, rep(NA, max_len - length(x)))
+  })
+  
+  # convert to a data frame and export as excel
+  gene.sigantures.save.df <- as.data.frame(gene.signatures.save.padded)
+  colnames(gene.sigantures.save.df) <- updated.colnames
+  openxlsx::write.xlsx(gene.sigantures.save.df, file = paste0(root.dir, "Figures/", "Tables/", "Table S5 postmortem signatures.xlsx"))
+}
+```
+
+
+
+# Main (text): Overlap of 3D tensor decomposition signatures with Liharska et al., 2025 postmortem/living DEGs
+```{r}
+
+results <- list()
+
+if (signatures.use == "3d_tensor_decomp_signatures") {
+
+  universe.genes <- rownames(seurat.obj)
+
+  results <- c(
+    results,
+    list(geneSetOverlapRow(
+      "heat.shock.signature.9",
+      "heat.shock.signature.10",
+      gene.signatures[["heat.shock.signature.9"]],
+      gene.signatures[["heat.shock.signature.10"]],
+      universe.genes
+    )),
+    list(geneSetOverlapRow(
+      "postmortem.signature.factor",
+      "pm.degs.all",
+      gene.signatures[["postmortem.signature.factor"]],
+      gene.signatures[["pm.degs.all"]],
+      universe.genes
+    )),
+    list(geneSetOverlapRow(
+      "postmortem.signature",
+      "pm.degs.all",
+      gene.signatures[["postmortem.signature"]],
+      gene.signatures[["pm.degs.all"]],
+      universe.genes
+    )),
+    list(geneSetOverlapRow(
+      "postmortem.sensitive.factor",
+      "liv.degs.all",
+      gene.signatures[["postmortem.sensitive.factor"]],
+      gene.signatures[["liv.degs.all"]],
+      universe.genes
+    )),
+    list(geneSetOverlapRow(
+      "postmortem.sensitive",
+      "liv.degs.all",
+      gene.signatures[["postmortem.sensitive"]],
+      gene.signatures[["liv.degs.all"]],
+      universe.genes
+    )),
+    list(geneSetOverlapRow(
+      "heat.shock.signature.9",
+      "pm.degs.all",
+      gene.signatures[["heat.shock.signature.9"]],
+      gene.signatures[["pm.degs.all"]],
+      universe.genes
+    )),
+    list(geneSetOverlapRow(
+      "heat.shock.signature.10",
+      "pm.degs.all",
+      gene.signatures[["heat.shock.signature.10"]],
+      gene.signatures[["pm.degs.all"]],
+      universe.genes
+    )),
+    list(geneSetOverlapRow(
+      "heat.shock.signature",
+      "pm.degs.all",
+      gene.signatures[["heat.shock.signature"]],
+      gene.signatures[["pm.degs.all"]],
+      universe.genes
+    ))
+  )
+}
+
+overlap.table <- do.call(rbind, results)
+
+
+write.table(overlap.table, paste0(figures.dir, "postmortem_signatures_liharska_gene_set_overlap_tests.csv"), sep = "\t", quote = F, col.names = TRUE, row.names = FALSE)
+```
+
+
+
+# Main: Timepoint vs metaprogram score by metaprogram
+```{r}
+seurat.obj <- add.module.score(seurat.obj, gene.signatures)
+seurat.obj$cell.type.annotation <- seurat.obj$annotation.l1
+celltypes.use <- sort(unique(seurat.obj$cell.type.annotation))
+
+df <- seurat.obj@meta.data
+df$Timepoint <- factor(df$Timepoint, levels = timepoints.broad)
+df.long <- df %>% pivot_longer(cols = c(all_of(factors), percent.mt), names_to = "metaprogram", values_to = "score")
+
+sample.df <- df.long %>% 
+  group_by(metaprogram, Timepoint, timepoint.original, sample.id) %>% 
+  summarize(mean.score = mean(score), count = n()) %>%
+  ungroup()
+
+plot.list <- list()
+for (i in factors) {
+  print(i)
+  temp.df <- sample.df %>% filter(metaprogram == i)
+  
+  metaprogram.name.updated <- update.gene.signature.names(i)
+  
+  stat.test <- temp.df %>%
+    wilcox_test(mean.score ~ Timepoint, ref.group = "Surgical") %>% 
+    adjust_pvalue(method = "fdr") %>%
+    add_significance("p") %>%
+    add_xy_position()
+  stat.test$p.label <- format.p.value(stat.test$p.adj)
+  
+  p <- ggplot(temp.df, aes(Timepoint, mean.score)) +
+    geom_boxplot(aes(fill = Timepoint), outlier.shape = NA) +
+    geom_point(color = "black", position = position_jitter(width = 0.2), alpha = 0.6) +
+    theme_classic() +
+    theme(legend.position="none", axis.text=element_text(size=16), axis.title=element_text(size=16,face="bold"), plot.title = element_text(size=16)) +
+    stat_pvalue_manual(stat.test, label = "p.label", label.size = 5) +
+    ggtitle(metaprogram.name.updated) +
+    xlab("Timepoint") +
+    ylab("Metaprogram score") +
+    timepoints.broad.fill.scale +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  plot.list[[i]] <- p
+}
+p <- cowplot::plot_grid(plotlist = plot.list)
+
+if (signatures.use == "3d_tensor_decomp_signatures") {
+  pdf(paste0(figures.dir, signatures.use, "_timepoint_vs_metaprogram_score_by_metaprogram.pdf"), width = 20, height=30)
+  print(p)
+  dev.off()
+} else if (signatures.use == "2d_nmf_signatures") {
+  pdf(paste0(figures.dir, signatures.use, "_timepoint_vs_metaprogram_score_by_metaprogram.pdf"), width = 20, height=24)
+  print(p)
+  dev.off()
+}
+```
+
+
+
+# Supplemental: Timepoint vs metaprogram score by metaprogram and cell type
+```{r}
+sample.celltype.df <- df.long %>% 
+  group_by(metaprogram, Timepoint, sample.id, cell.type.annotation) %>% 
+  summarize(mean.score = mean(score), count = n()) %>%
+  filter(count >= 10) %>%
+  ungroup()
+
+for (i in factors) {
+  factor.plot <- i
+  print(factor.plot)
+  metaprogram.name.updated <- update.gene.signature.names(i)
+  
+  plot.list <- list()
+  for (celltype in sort(unique(sample.celltype.df$cell.type.annotation))) {
+    print(celltype)
+    temp.df <- sample.celltype.df %>% filter(metaprogram == factor.plot, cell.type.annotation == celltype)
+    stat.test <- temp.df %>%
+        wilcox_test(mean.score ~ Timepoint, ref.group = "Surgical") %>%
+        adjust_pvalue(method = "fdr") %>%
+        add_significance("p") %>%
+        add_xy_position()
+    stat.test$p.label <- format.p.value(stat.test$p.adj)
+    
+    
+    p <- ggplot(temp.df, aes(Timepoint, mean.score)) +
+      geom_boxplot(aes(fill = Timepoint), outlier.shape = NA) +
+      geom_point(color = "black", position = position_jitter(width = 0.1), alpha = 0.6) +
+      theme_classic() +
+      theme(legend.position="none", axis.text=element_text(size=16), axis.title=element_text(size=16,face="bold"), plot.title = element_text(size=16), plot.subtitle = element_text(size = 16)) +
+      stat_pvalue_manual(stat.test, label = "p.label", label.size = 5) +
+      ggtitle(metaprogram.name.updated, subtitle = paste0("In ", tolower(ifelse(celltype == "Neurons", "neuronal", celltype)), " cells")) +
+      xlab("Timepoint") +
+      ylab("Metaprogram score") +
+      timepoints.broad.fill.scale +
+      theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+    
+    
+    plot.list[[celltype]] <- p
+  }
+  p <- cowplot::plot_grid(plotlist = plot.list)
+  pdf(paste0(supp.figures.dir, "metaprogram_scores_by_celltype/", signatures.use, "_", factor.plot, "_timepoint_vs_metaprogram_score_by_celltype.pdf"), width = 12, height=12)
+  print(p)
+  dev.off()
+}
+```
+
+
+
+# Supplemental: Cell type vs metaprogram score
+```{r}
+sample.celltype.df <- df.long %>% 
+  group_by(metaprogram, Timepoint, sample.id, cell.type.annotation) %>% 
+  summarize(mean.score = mean(score), count = n()) %>%
+  filter(count >= 10) %>%
+  ungroup()
+
+sample.celltype.df$cell.type.annotation <- factor(sample.celltype.df$cell.type.annotation, levels = celltypes.use)
+
+plot.list <- list()
+
+for (i in factors) {
+  factor.plot <- i
+  print(factor.plot)
+  
+  metaprogram.name.updated <- update.gene.signature.names(i)
+  
+  temp.df <- sample.celltype.df %>% filter(metaprogram == factor.plot)
+  stat.test <- temp.df %>%
+      wilcox_test(mean.score ~ cell.type.annotation) %>%
+      adjust_pvalue(method = "fdr") %>%
+      add_significance("p") %>%
+      add_xy_position()
+  stat.test$p.label <- format.p.value(stat.test$p.adj)
+  
+  p <- ggplot(temp.df, aes(cell.type.annotation, mean.score)) +
+    geom_boxplot(aes(fill = cell.type.annotation), outlier.shape = NA) +
+    geom_point(aes(color = Timepoint), position = position_jitter(width = 0.2), alpha = 0.6) +
+    theme(legend.position="none") +
+    stat_pvalue_manual(stat.test, label = "p.label", label.size = 5) +
+    ggtitle(metaprogram.name.updated) +
+    xlab("Cell type") +
+    ylab("Metaprogram score") +
+    timepoints.broad.color.scale +
+    cell.types.anotation_l1.w.quality.fill.scale +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+  
+  plot.list[[i]] <- p
+}
+p <- cowplot::plot_grid(plotlist = plot.list)
+pdf(paste0(supp.figures.dir, signatures.use, "_cell_type_vs_metaprogram_score_by_metaprogram.pdf"), width = 30, height=30)
+print(p)
+dev.off()
+```
+
+
+
+# Supplemental: Metaprograms in healthy datasets (Velmeshev 2019 and Herring 2022)
+```{r}
+# all Herring 2022 data no filter from raw coutns
+herring2022 <- readRDS(paste0(root.dir, "ExternalData/", 'Herring_2022/', 'processed/', 'all.sampled.merged.downsampled.seurat.obj.RDS'))
+herring2022 <- subset(herring2022, subset = is.sample.organoid_ == FALSE)
+
+herring2022 <- add.module.score(herring2022, gene.signatures)
+
+factors <- names(gene.signatures)
+df.long <- herring2022@meta.data %>% pivot_longer(cols = all_of(factors), names_to = "metaprogram", values_to = "score")
+df.long$celltype <- df.long$annotation_l1.w.qc
+
+cell.types.anotation_l1.w.quality.herring <- c(cell.types.anotation_l1.w.quality, c("Poor.Quality", "No.metadata"))
+cell.types.anotation_l1.w.quality.fill.scale.herring <- scale_fill_manual(breaks=cell.types.anotation_l1.w.quality.herring, values=c(palette.colors(palette = "Okabe-Ito")[2:(length(cell.types.anotation_l1)+1)], "#CC79A7", "#808080", "brown", "grey"))
+
+df <- df.long %>%
+  group_by(library.id_, celltype, metaprogram) %>%
+  summarize(mean.metaprogram.score = mean(score), count = n()) %>%
+  filter(count >= 10) %>%
+  ungroup()
+
+df$metaprogram <- factor(df$metaprogram, levels = factors)
+df$celltype <- factor(df$celltype, levels = cell.types.anotation_l1.w.quality.herring)
+
+p <- ggplot(df, aes(celltype, mean.metaprogram.score, fill = celltype)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.2), alpha = 0.5, shape = 21, color = "black") + 
+  facet_wrap(~metaprogram, scales = "free") + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  theme(legend.position="none") +
+  cell.types.anotation_l1.w.quality.fill.scale.herring +
+  ylab("Metaprogram score")
+pdf(paste0(supp.figures.dir, "herring2022_celltype_vs_metoprogram_score_by_metaprogram.pdf"), width = 30, height=30)
+print(p)
+dev.off()
+
+rm(herring2022)
+
+
+# all Velmeshev2019 data no filter from raw counts
+velmeshev2019 <- readRDS(paste0(root.dir, "ExternalData/", 'Velmeshev_2019_Autism/', 'SeuratObjects/', 'raw.velmeshev2019.autism.all.cells.seurat.obj.RDS'))
+
+velmeshev2019 <- add.module.score(velmeshev2019, gene.signatures)
+
+df.long <- velmeshev2019@meta.data %>% pivot_longer(cols = all_of(factors), names_to = "metaprogram", values_to = "score")
+df.long$celltype <- df.long$annotation_l1.w.qc
+
+df <- df.long %>%
+  group_by(sample, celltype, metaprogram) %>%
+  summarize(mean.metaprogram.score = mean(score), count = n()) %>%
+  filter(count >= 10) %>%
+  ungroup()
+
+df$metaprogram <- factor(df$metaprogram, levels = factors)
+df$celltype <- factor(df$celltype, levels = cell.types.anotation_l1.w.quality)
+
+p <- ggplot(df, aes(celltype, mean.metaprogram.score, fill = celltype)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.2), alpha = 0.5, shape = 21, color = "black") + 
+  facet_wrap(~metaprogram, scales = "free") + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  theme(legend.position="none") +
+  cell.types.anotation_l1.w.quality.fill.scale +
+  ylab("Metaprogram score")
+pdf(paste0(supp.figures.dir, "velmeshev2019_celltype_vs_metaprogram_score_by_metaprogram.pdf"), width = 30, height=30)
+print(p)
+dev.off()
+
+rm(velmeshev2019)
+```
+
+
+
+# Supplemental: Cell type metaprogram heatmap
+If R crashes here (too much memory), run 1) # Setup at the very top 2) # Main: Metaprograms # Settings (sets up gene signatures) and then run below here
+```{r}
+library(ComplexHeatmap)
+library(mclust)
+
+seurat.obj.downsample <- seurat.obj
+
+# downsample for speed/prevents crashing
+seurat.obj.downsample$downsample <- T
+Idents(seurat.obj.downsample) <- "annotation.l1"
+
+table(seurat.obj.downsample$annotation.l1)
+
+set.seed(123)
+seurat.obj.downsample <- subset(seurat.obj.downsample, subset = (downsample == T & low.quality.by.qc == FALSE), downsample = 1000)
+
+seurat.obj.downsample <- add.module.score(seurat.obj.downsample, gene.signatures)
+print(dim(seurat.obj.downsample))
+
+cell_type <- seurat.obj.downsample$annotation.l1
+cell_type <- factor(cell_type, 
+  levels = cell.types.anotation_l1
+)
+
+data <- seurat.obj.downsample@meta.data %>% dplyr::select(names(gene.signatures))
+data_scaled <- scale(data, center = TRUE, scale = TRUE)
+
+
+max_abs <- 3
+col_fun <- circlize::colorRamp2(
+  c(-max_abs, 0, max_abs),
+  c("blue", "white", "red")
+)
+
+annotation.colors <- cell.types.anotation_l1.w.quality.colors
+names(annotation.colors) <- cell.types.anotation_l1.w.quality
+
+row_ha <- rowAnnotation(
+  Annotation = cell_type,
+  col = list(Annotation = annotation.colors),
+  show_annotation_name = FALSE
+)
+
+if (signatures.use == "3d_tensor_decomp_signatures") {
+  
+  data_scaled <- data_scaled[, c("glial.factor", "immune.factor", "malignant.factor", "neurons.factor", "vascular.factor")]
+  colnames(data_scaled) <- c("Glial signature", "Immune signature", "Malignant signature", "Neuronal signature", "Vascular signature")
+  
+} else if (signatures.use == "2d_nmf_signatures") {
+    
+  data_scaled <- data_scaled[, c("MP_6", "MP_3", "MP_1", "MP_9", "MP_8", "MP_4", "MP_5", "MP_11", "MP_7", "MP_2")]
+
+}
+
+dist_matrix <- as.dist(1 - cor(t(data_scaled), method = "pearson"))
+hc <- hclust(dist_matrix, method = "average")
+clusters <- cutree(hc, k = 5)
+ari_score <- adjustedRandIndex(as.character(cell_type), clusters)
+print(ari_score)
+
+
+p <- Heatmap(data_scaled, name = "Cell type signatures", 
+             cluster_rows = hc, show_row_names = FALSE, row_title_rot = 0, 
+             cluster_columns = TRUE, column_names_centered = TRUE,  column_names_rot = 0, column_title = paste0("ARI=", round(ari_score, 2)),
+             col = col_fun, right_annotation = row_ha, row_split = 5)
+
+
+
+pdf(paste0(supp.figures.dir, signatures.use, "_cells_vs_metaprogram_heatmap_by_celltype.pdf"), width = 12, height=8)
+draw(p, padding = unit(c(20, 5, 5, 5), "mm"))
+dev.off()
+```
+
+
+
+# Supplemental: Timepoint metaprogram heatmap
+```{r}
+seurat.obj.downsample <- seurat.obj
+
+seurat.obj.downsample$downsample <- T
+Idents(seurat.obj.downsample) <- "Timepoint"
+set.seed(123)
+seurat.obj.downsample <- subset(seurat.obj.downsample, subset = (downsample == T), downsample = 1000)
+
+seurat.obj.downsample <- add.module.score(seurat.obj.downsample, gene.signatures)
+print(dim(seurat.obj.downsample))
+
+
+timepoint <- seurat.obj.downsample$Timepoint
+timepoint <- factor(timepoint, levels = timepoints.broad)
+names(timepoint) <- rownames(seurat.obj.downsample@meta.data)
+
+data <- seurat.obj.downsample@meta.data %>% dplyr::select(names(gene.signatures))
+data_scaled <- scale(data, center = TRUE, scale = TRUE)
+max_abs <- 3
+col_fun <- circlize::colorRamp2(
+  c(-max_abs, 0, max_abs),
+  c("blue", "white", "red")
+)
+
+annotation.colors <- timepoints.broad.colors
+names(annotation.colors) <- timepoints.broad
+
+row_ha <- rowAnnotation(
+  Annotation = timepoint,
+  col = list(Annotation = annotation.colors),
+  show_annotation_name = FALSE
+)
+
+
+
+if (signatures.use == "3d_tensor_decomp_signatures") {
+  
+  data_scaled <- data_scaled[, c("postmortem.sensitive", "postmortem.signature", "heat.shock.signature")]
+  colnames(data_scaled) <- c("Living enriched", "Posmortem enriched", "Hypoxia heat shock")
+  
+  dist_matrix <- as.dist(1 - cor(t(data_scaled), method = "pearson"))
+  hc <- hclust(dist_matrix, method = "average")
+  clusters <- cutree(hc, k = 2)
+  ari_score <- adjustedRandIndex(as.character(timepoint), clusters)
+  print(ari_score)
+  
+  p <- Heatmap(data_scaled, name = "Postmortem signatures",
+               cluster_rows = hc, show_row_names = FALSE, row_title_rot = 0, 
+               cluster_columns = TRUE, column_names_centered = TRUE,  column_names_rot = 0, column_title = paste0("ARI=", round(ari_score, 2)),
+               col = col_fun, right_annotation = row_ha, row_split=2)
+  
+  pdf(paste0(supp.figures.dir, signatures.use, "_cells_vs_metaprogram_heatmap_by_timepoint.pdf"), width = 8, height=8)
+  ht <- draw(p, padding = unit(c(20, 5, 5, 5), "mm"))
+  dev.off()
+  
+  
+} else if (signatures.use == "2d_nmf_signatures") {
+  
+  mp10 <- as.matrix(data_scaled[, "MP_10", drop = FALSE])
+  
+  ord <- order(mp10[, 1], decreasing = TRUE)
+  mp10_ord <- mp10[ord, , drop = FALSE]
+  
+  set.seed(123)
+  km <- kmeans(mp10_ord[, 1], centers = 2)
+  clusters <- factor(km$cluster)
+  
+  ari_score <- adjustedRandIndex(
+    as.character(timepoint[rownames(mp10_ord)]),
+    clusters
+  )
+  
+  p <- Heatmap(
+    mp10_ord,
+    name = "Postmortem signatures",
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    show_row_names = FALSE,
+    column_names_rot = 0,
+    column_names_centered = TRUE,
+    col = col_fun,
+    width = unit(2, "cm"),
+    right_annotation = row_ha[ord],
+    row_split = clusters,
+    column_title = paste0("ARI=", round(ari_score, 2))
+  )
+  
+  pdf(paste0(supp.figures.dir, signatures.use, "_cells_vs_metaprogram_heatmap_by_timepoint.pdf"), width = 8, height=8)
+  ht <- draw(p, padding = unit(c(20, 5, 5, 5), "mm"))
+  dev.off()
+
+}
+```
+
+
+
+
+

@@ -1,0 +1,1189 @@
+---
+title: "combined_external_datasets_oligo_analysis.RMD"
+output: html_document
+date: "2026-06-08"
+---
+
+
+# Setup
+```{r}
+library(tidyverse)
+library(Seurat)
+library(pals)
+library(rstatix)
+library(ggpubr)
+library(ggprism)
+library(cowplot)
+library(readxl)
+
+root.dir <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Projects/Jackie_post-mortem/"
+data.dir <- paste0(root.dir, "ExternalData/")
+processed.data.dir <- paste0(root.dir, "ProcessedData/")
+results.dir <- paste0(root.dir, "Results/")
+signatures.dir <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Shared_resources/Signatures/Neftel_GBM_cell_states/SingleCell_GBM/"
+gsea.dir <- paste0(root.dir, "ExternalData/", "GSEA_gene_sets/")
+
+suppressMessages(suppressWarnings(source(paste0(root.dir, "Code/", 'helper_functions.R'))))
+```
+
+
+
+# Helper functions
+```{r}
+read.in.data <- function(seurat.obj, dataset.id, sample.id.col, individual.id.col, diagnosis.col, timepoint.col, downsample = F, dataset.fine.col = NA, diagnosis.fine.col = NA) {
+  
+  seurat.obj$dataset.id <- dataset.id
+  
+  if (!is.na(dataset.fine.col)) {
+    if (dataset.fine.col %in% colnames(seurat.obj@meta.data)) {
+      seurat.obj$dataset.fine <- seurat.obj[[dataset.fine.col]]
+    } else {
+      seurat.obj$dataset.fine <- dataset.fine.col
+    }
+  } else {
+    seurat.obj$dataset.fine <- dataset.id
+  }
+  
+  if (sample.id.col %in% colnames(seurat.obj@meta.data)) {
+    seurat.obj$sample.id <- seurat.obj[[sample.id.col]]
+  } else {
+    seurat.obj$sample.id <- sample.id.col
+  }
+  
+  if (individual.id.col %in% colnames(seurat.obj@meta.data)) {
+    seurat.obj$individual.id <- seurat.obj[[individual.id.col]]
+  } else {
+    seurat.obj$individual.id <- individual.id.col
+  }
+  
+  if (diagnosis.col %in% colnames(seurat.obj@meta.data)) {
+    seurat.obj$diagnosis <- seurat.obj[[diagnosis.col]]
+  } else {
+    seurat.obj$diagnosis <- diagnosis.col
+  }
+  
+  if (!is.na(diagnosis.fine.col)) {
+    if (diagnosis.fine.col %in% colnames(seurat.obj@meta.data)) {
+      seurat.obj$diagnosis.fine <- seurat.obj[[diagnosis.fine.col]]
+    } else {
+      seurat.obj$diagnosis.fine <- diagnosis.fine.col
+    }
+  } else {
+    seurat.obj$diagnosis.fine <- seurat.obj$diagnosis
+  }
+  
+  if (timepoint.col %in% colnames(seurat.obj@meta.data)) {
+    seurat.obj$timepoint <- seurat.obj[[timepoint.col]]
+  } else {
+    seurat.obj$timepoint <- timepoint.col
+  }
+  
+  seurat.obj[["percent.mt"]] <- PercentageFeatureSet(seurat.obj, pattern = "^MT-") 
+  
+  if (dataset.id == "Velmeshev 2019") {
+    seurat.obj.subset <- subset(seurat.obj, subset = cluster == "Oligodendrocytes")
+  } else if (dataset.id == "Herring 2022") {
+    seurat.obj.subset <- subset(seurat.obj, subset = major_clust == "Oligo")
+  } else if (dataset.id == "Macnair 2024 MS") {
+    seurat.obj.subset <- subset(seurat.obj, subset = type_broad == "Oligodendrocytes")
+  } else if (dataset.id == "Garza 2023 TBI") {
+    seurat.obj.subset <- subset(seurat.obj, subset = seurat_clusters == "1")
+  } else if (dataset.id == "Sussman 2024") {
+    seurat.obj.subset <- subset(seurat.obj, subset = (annotation.l2 == "Oligodendrocytes"))
+  } else if (dataset.id == "This study") {
+    seurat.obj.subset <- subset(seurat.obj, subset = (predicted.annotation_l2 == "Oligodendrocytes"))
+  } else if (dataset.id == "Wang 2022") {
+    seurat.obj.subset <- subset(seurat.obj, subset = cell_type == "Oligodendrocyte")
+  } else if (dataset.id == "Nomura 2025") {
+    seurat.obj.subset <- subset(seurat.obj, subset = CellType == "Oligodendrocyte")
+  } else if (dataset.id == "Blanco-Carmona 2023") {
+    seurat.obj.subset <- subset(seurat.obj, subset = NMF_labelling == "Oligodendrocytes")
+  } else if (dataset.id == "Mikolajewicz 2026") {
+    seurat.obj.subset <- subset(seurat.obj, subset = cell_type == "oligodendrocyte")
+  } else {
+    stop(paste("unknown dataset id:", dataset.id))
+  }
+  
+  seurat.obj.subset$predicted.cell.type <- "Oligodendrocyte"
+  print(dim(seurat.obj.subset))
+  
+  if (downsample) {
+    seurat.obj.subset$dataset.celltype <- paste(seurat.obj.subset$dataset.id, seurat.obj.subset$predicted.cell.type)
+    Idents(seurat.obj.subset) <- "dataset.celltype"
+    seurat.obj.subset$downsample <- TRUE
+    seurat.obj.subset <- subset(seurat.obj.subset, subset = downsample == TRUE, downsample = 10000)
+  }
+  return(seurat.obj.subset)
+}
+```
+
+
+
+# MS (Macnair et al., 2024)
+```{r}
+seurat.obj <- readRDS(paste0(root.dir, "ProcessedData/", "Macnair_2024_MS/", "Mcnair_2024_MS.RDS"))
+seurat.obj <- subset(seurat.obj, subset = type_broad == "Oligodendrocytes")
+
+seurat.obj <- NormalizeData(seurat.obj)
+
+seurat.obj[["percent.mt"]] <- PercentageFeatureSet(seurat.obj, pattern = "^MT-") 
+seurat.obj$low.quality.by.qc <- apply(seurat.obj@meta.data, 1, function(row) (as.numeric(row[['nCount_RNA']]) < nCount_RNA.cutoff.low) | (as.numeric(row[['nFeature_RNA']]) < nFeature_RNA.cutoff.low) | (as.numeric(row[['percent.mt']]) > percent.mt.cutoff))
+
+seurat.obj$diagnosis.original <- seurat.obj$diagnosis
+seurat.obj$diagnosis.broad <- sapply(seurat.obj$diagnosis.original, function(x) case_when (x == "CTR" ~ "Control", 
+                                                                  x %in% c("SPMS", "PPMS", "RRMS") ~ "MS",
+                                                                  .default = x))
+seurat.obj$matter.original <- seurat.obj$matter
+seurat.obj$matter <- sapply(seurat.obj$matter.original, function(x) ifelse(x == "GM", "Grey Matter", "White Matter"))
+
+seurat.obj$diagnosis <- paste0(seurat.obj$diagnosis.broad, " ", seurat.obj$matter)
+seurat.obj$diagnosis.fine <- apply(seurat.obj@meta.data, 1, function(row) ifelse(row[["diagnosis.original"]] == "CTR", paste("Control", row[["matter"]]), paste(row[["diagnosis.original"]], row["matter"])))
+
+macnair2024.seurat.obj <- read.in.data(seurat.obj = seurat.obj,
+                          dataset.id = "Macnair 2024 MS",
+                          sample.id.col = "sample_id_anon",
+                          individual.id.col = "individual_id_anon",
+                          timepoint = "Postmortem",
+                          diagnosis.col = "diagnosis",
+                          dataset.fine.col = "sample_source",
+                          diagnosis.fine.col = "diagnosis.fine",
+                          downsample = F)
+
+macnair2024.seurat.obj <- add.module.score(macnair2024.seurat.obj, oligo.gene.signatures)
+
+
+
+
+VlnPlot(macnair2024.seurat.obj, group.by = "lesion_type", features = c("BCAS1", "ASPA", "OLIG2", "SOX10"), flip = T, stack = T, sort = T)  + stat_summary(fun.y = median, geom='point', size = 20, colour = "black", shape = 95)
+
+oligo.df <- macnair2024.seurat.obj@meta.data %>%
+  group_by(lesion_type, diagnosis, diagnosis.fine, individual.id, sample.id, sample_source, matter) %>%
+  summarize(mean.oligo.like = mean(reactive.oligo.general),
+            count = n()) %>%
+  ungroup()
+
+
+oligo.df$diagnosis <- factor(oligo.df$diagnosis, levels = c("Control Grey Matter", "MS Grey Matter", "Control White Matter", "MS White Matter"))
+p <- ggplot(oligo.df, aes(diagnosis, mean.oligo.like)) +
+  geom_boxplot(aes(fill=matter), outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.2)) +
+  theme(axis.text=element_text(size=16), axis.title=element_text(size=20,face="bold"), plot.title = element_text(size=24)) +
+  xlab("Lesion type") +
+  ylab("Reactive oligo signature\nin oligodendrocytes") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  stat_compare_means(ref.group = "Control White Matter", label = "p.format")
+pdf(paste0(results.dir, "DatasetsCombined/", "oligo_like_signature/", "oligodendrocytes/", "diagnosis_vs_mean.oligo.signature.pdf"), width = 12, height = 8)  
+print(p)
+dev.off()
+
+
+
+p <- ggplot(oligo.df, aes(diagnosis.fine, mean.oligo.like)) +
+  geom_boxplot(aes(fill=diagnosis), outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.2)) +
+  theme(axis.text=element_text(size=16), axis.title=element_text(size=20,face="bold"), plot.title = element_text(size=24)) +
+  xlab("Lesion type") +
+  ylab("Reactive oligo signature\nin oligodendrocytes") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  stat_compare_means(ref.group = "Control White Matter", label = "p.format")
+pdf(paste0(results.dir, "DatasetsCombined/", "oligo_like_signature/", "oligodendrocytes/", "diagnosis.fine_vs_mean.oligo.signature.pdf"), width = 16, height = 8)  
+print(p)
+dev.off()
+
+
+
+
+p <- ggplot(oligo.df, aes(lesion_type, mean.oligo.like)) +
+  geom_boxplot(aes(fill=diagnosis), outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.2)) +
+  theme(axis.text=element_text(size=16), axis.title=element_text(size=20,face="bold"), plot.title = element_text(size=24)) +
+  xlab("Lesion type") +
+  ylab("Reactive oligo signature\nin oligodendrocytes") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  stat_compare_means(ref.group = "WM", label = "p.format")
+pdf(paste0(results.dir, "DatasetsCombined/", "oligo_like_signature/", "oligodendrocytes/", "MS_lesion.type.all_vs_mean.oligo.signature_ref=WM.pdf"), width = 16, height = 8)  
+print(p)
+dev.off()
+
+
+
+p <- ggplot(oligo.df, aes(lesion_type, mean.oligo.like)) +
+  geom_boxplot(aes(fill=diagnosis), outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.2)) +
+  theme(axis.text=element_text(size=16), axis.title=element_text(size=20,face="bold"), plot.title = element_text(size=24)) +
+  xlab("Lesion type") +
+  ylab("Reactive oligo signature\nin oligodendrocytes") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  stat_compare_means(ref.group = "NAWM", label = "p.format")
+pdf(paste0(results.dir, "DatasetsCombined/", "oligo_like_signature/", "oligodendrocytes/", "MS_lesion.type.all_vs_mean.oligo.signature_ref=NAWM.pdf"), width = 16, height = 8)  
+print(p)
+dev.off()
+
+
+oligo.df.filter <- oligo.df %>% filter(lesion_type %in% c("WM", "NAWM", "CAL"))
+
+control.wm <- "Control\nwhite matter"
+ms.nawm <- "Multiple sclerosis normal-appearing\nwhite matter"
+ms.cal.wm <- "Multiple sclerosis chronic active\ndemyelinating lesion\nwhite matter"
+
+oligo.df.filter$diagnosis <- sapply(oligo.df.filter$lesion_type, function(x) case_when(
+  x == "WM" ~ control.wm,
+  x == "NAWM" ~ ms.nawm,
+  x == "CAL" ~ ms.cal.wm
+))
+oligo.df.filter$disease <- sapply(oligo.df.filter$lesion_type, function(x) ifelse(x == "WM", FALSE, TRUE))
+oligo.df.filter$diagnosis <- factor(oligo.df.filter$diagnosis, levels = c(control.wm, ms.nawm, ms.cal.wm))
+stat.test <- oligo.df.filter %>%
+    wilcox_test(mean.oligo.like ~ diagnosis, comparisons = list(c(control.wm, ms.cal.wm), c(ms.nawm, ms.cal.wm), c(control.wm, ms.nawm))) %>%
+    adjust_pvalue(method = "fdr") %>%
+    add_significance("p.adj") %>%
+    add_xy_position()
+stat.test$p.label <- paste0("p = ", stat.test$p.adj)
+stat.test.ms <- stat.test
+
+p <- ggplot(oligo.df.filter, aes(diagnosis, mean.oligo.like)) +
+  geom_boxplot(aes(fill = disease), outlier.shape = NA) +
+  geom_jitter(width = 0.2) +
+  theme(legend.position="none", axis.text=element_text(size=16), axis.title=element_text(size=20,face="bold"), plot.title = element_text(size=24)) +
+  xlab("Lesion type") +
+  ylab("Reactive oligo signature\nin oligodendrocytes") +
+  stat_pvalue_manual(stat.test, label = "p.label", label.size = 6)
+pdf(paste0(results.dir, "DatasetsCombined/", "oligo_like_signature/", "oligodendrocytes/", "MS_diagnosis_vs_mean.oligo.signature.pdf"), width = 12, height = 8)  
+print(p)
+dev.off()
+
+
+# Supplemental figure: white matter vs grey matter oligodendrocytes
+stat.test <- oligo.df %>%
+    wilcox_test(mean.oligo.like ~ diagnosis, comparisons = list(c("Control Grey Matter", "Control White Matter"), c("MS Grey Matter", "MS White Matter"))) %>%
+    adjust_pvalue(method = "fdr") %>%
+    add_significance("p.adj") %>%
+    add_xy_position()
+stat.test$p.label <- format.p.value(stat.test$p.adj)
+
+p <- ggplot(oligo.df, aes(diagnosis, mean.oligo.like)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(alpha = 0.6, width = 0.2) +
+  theme(legend.position="none") +
+  xlab("Sample") +
+  ylab("Reactive oligo signature\nin oligodendrocytes") +
+  stat_pvalue_manual(stat.test, label = "p.label", label.size = 6) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+pdf(paste0(root.dir, "Figures/", "Figure 4/", "Supplemental/", "white_matter_vs_grey_matter.pdf"), width = 12, height = 8)  
+print(p)
+dev.off()
+
+
+
+#p <- DotPlot(macnair2024.seurat.obj, features = c("reactive.oligo.general"), group.by = "type_fine")
+df <- macnair2024.seurat.obj@meta.data
+
+stat.test <- df %>%
+    wilcox_test(reactive.oligo.general ~ type_fine, ref.group = "Oligo_G") %>%
+    adjust_pvalue(method = "fdr") %>%
+    add_significance("p.adj") %>%
+    add_xy_position()
+stat.test$p.label <- format.p.value(stat.test$p.adj)
+
+p <- ggplot(df, aes(type_fine, reactive.oligo.general)) +
+  geom_boxplot() +
+  xlab("Macnair 2024 oligodendrocyte subtype") +
+  ylab("Reactive oligodendrocyte signature\nin oligodendrocytes") +
+  stat_summary(fun = "mean", geom = "point", shape = 23, size = 3, fill = "red") +
+  stat_pvalue_manual(stat.test, label = "p.label", label.size = 6)
+
+pdf(paste0(root.dir, "Figures/", "Figure 4/", "Supplemental/", "macnair_2024_oligo_subtype_vs_reactive.oligo.general.pdf"), width = 12, height = 8)  
+print(p)
+dev.off()
+```
+
+
+
+# TBI (Garza et al., 2023)
+```{r}
+tbi.results <- readRDS(paste0(data.dir, "Garza_2023_TBI/TBI_Garza_2023/output/merged/ALL_Harmony/results-merged.rds"))
+seurat.obj <- tbi.results[,1]$scds
+
+seurat.obj$diagnosis <- sapply(seurat.obj$sample, function(x) ifelse(grepl("HuBrainCTL", x), "Control", "Traumatic brain injury"))
+seurat.obj$individual.id <- sapply(seurat.obj$sample, function(x) str_replace(unlist(str_split(x, "_"))[3], "F|T", ""))
+seurat.obj$timepoint <- sapply(seurat.obj$sample, function(x) ifelse(grepl("HuBrainCTL", x), "Postmortem", "Initial"))
+
+tbi.seurat.obj <- read.in.data(seurat.obj = seurat.obj,
+                      dataset.id = "Garza 2023 TBI",
+                      sample.id.col = "sample",
+                      individual.id.col = "individual.id",
+                      timepoint.col = "timepoint",
+                      diagnosis.col = "diagnosis",
+                      downsample = F)
+tbi.seurat.obj[["RNA"]] <- as(object = tbi.seurat.obj[["RNA"]], Class = "Assay5") # convert from Seurat 4 to Seurat 5
+tbi.seurat.obj <- add.module.score(tbi.seurat.obj, oligo.gene.signatures)
+
+tbi.seurat.obj.oligo <- tbi.seurat.obj
+
+oligo.df <- tbi.seurat.obj.oligo@meta.data %>%
+  group_by(diagnosis, diagnosis.fine, individual.id, sample.id) %>%
+  summarize(mean.oligo.like = mean(reactive.oligo.general)) %>%
+  ungroup()
+oligo.df$disease <- sapply(oligo.df$diagnosis, function(x) x == "Traumatic brain injury")
+
+stat.test <- oligo.df %>%
+    wilcox_test(mean.oligo.like ~ diagnosis) %>%
+    adjust_pvalue(method = "fdr") %>%
+    add_significance("p.adj") %>%
+    add_xy_position()
+stat.test$p.label <- paste0("p = ", stat.test$p.adj)
+stat.test.tbi <- stat.test
+
+p <- ggplot(oligo.df, aes(diagnosis, mean.oligo.like)) +
+  geom_boxplot(aes(fill=diagnosis), outlier.shape = NA) +
+  geom_jitter(width = 0.2) +
+  theme(legend.position="none", axis.text=element_text(size=16), axis.title=element_text(size=20,face="bold"), plot.title = element_text(size=24)) +
+  xlab("Sample") +
+  ylab("Reactive oligo signature\nin oligodendrocytes") +
+  stat_pvalue_manual(stat.test, label = "p.label", label.size = 6)
+pdf(paste0(results.dir, "DatasetsCombined/", "oligo_like_signature/", "oligodendrocytes/", "TBI_diagnosis_vs_mean.oligo.signature.pdf"), width = 8, height = 6)  
+print(p)
+dev.off()
+```
+
+
+
+# MS and TBI combined one plot
+```{r}
+oligo.df.ms <- oligo.df.filter
+oligo.df.ms <- oligo.df.ms %>% dplyr::select(diagnosis, mean.oligo.like, disease)
+oligo.df.ms$dataset.id <- "Macnair et al. 2024 | multiple sclerosis"
+
+oligo.df.tbi <- oligo.df
+oligo.df.tbi <- oligo.df.tbi %>% dplyr::select(diagnosis, mean.oligo.like, disease)
+oligo.df.tbi$dataset.id <- "Garza et al. 2023 | traumatic brain injury"
+
+oligo.df <- rbind(oligo.df.ms, oligo.df.tbi)
+
+stat.test <- oligo.df %>%
+  group_by(dataset.id) %>%
+  wilcox_test(mean.oligo.like ~ diagnosis) %>%
+  adjust_pvalue(method = "fdr") %>%
+  add_significance("p.adj") %>%
+  add_xy_position()
+stat.test$p.label <- paste0("p = ", round(stat.test$p.adj, 3))
+stat.test$xmin[1] <- 1
+stat.test$xmax[1] <- 2
+
+p <- ggplot(oligo.df, aes(diagnosis, mean.oligo.like)) +
+  geom_boxplot(aes(fill=disease), outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.6) +
+  theme(legend.position="none", axis.text=element_text(size=16), axis.title=element_text(size=20,face="bold"), plot.title = element_text(size=24)) +
+  xlab("Sample") +
+  ylab("Reactive oligodendrocyte signature\nin oligodendrocytes") +
+  stat_pvalue_manual(stat.test, label = "p.label", label.size = 6) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45, 
+      hjust = 1 
+    )
+  ) +
+  facet_wrap(~dataset.id, scales = "free_x")
+
+
+# save this in the main figures dir
+pdf(paste0(root.dir, "Figures/", "Figure 4/", "MS_and_TBI_diagnosis_vs_reactive_oligo_signature.pdf"), width = 12, height = 9)  
+print(p)
+dev.off()
+```
+
+
+
+# Read in datasets and merging
+```{r}
+datasets <- list()
+
+
+
+##### Healthy/Control oligodendrocytes #####
+
+# Velmeshev 2019 healthy
+seurat.obj <- readRDS(paste0(root.dir, 'ExternalData/', 'Velmeshev_2019_Autism/', 'SeuratObjects/', "before.clean", '.velmeshev2019.autism.control.only.seurat.obj.RDS')) # only has cells with published metadata
+velmeshev2019.seurat.obj <- read.in.data(seurat.obj = seurat.obj,
+                      dataset.id = "Velmeshev 2019",
+                      sample.id.col = "sample",
+                      individual.id.col = "individual",
+                      timepoint = "Postmortem",
+                      diagnosis.col = "Control")
+
+
+data <- FetchData(velmeshev2019.seurat.obj, vars = c("BCAS1", "ASPA"))
+velmeshev2019.seurat.obj <- AddMetaData(velmeshev2019.seurat.obj, data)
+
+quantile(velmeshev2019.seurat.obj$BCAS1) 
+
+quantile(df$BCAS1)
+
+
+datasets[["Velmeshev 2019 Healthy Autopsy"]] <- velmeshev2019.seurat.obj
+
+
+# Herring 2022 healthy
+seurat.obj <- readRDS(paste0(root.dir, 'ExternalData/', 'Herring_2022/', 'processed/', "before.clean", '.all.sampled.merged.filtered.seurat.obj.RDS')) # only has cells with metadata
+# unique(seurat.obj$stage_id) -> can use this variable to subset by age #  "Fetal"       "Neonatal"    "Infancy"     "Childhood"   "Adolescence" "Adult"
+#seurat.obj <- subset(seurat.obj, subset = stage_id %in% c("Childhood", "Adolescence", "Adult")) # oligodendrocytes most matching other samples
+seurat.obj$dataset.fine <- paste("Herring 2022:", seurat.obj$stage_id)
+herring2022.seurat.obj <- read.in.data(seurat.obj = seurat.obj,
+                      dataset.id = "Herring 2022",
+                      sample.id.col = "library.id_",
+                      individual.id.col = "geo.sample.id_",
+                      timepoint = "Postmortem",
+                      diagnosis.col = "Control",
+                      dataset.fine.col = "dataset.fine")
+datasets[["Herring 2022 Healthy Autopsy"]] <- herring2022.seurat.obj
+
+
+
+##### Sussman 2024 pHGG #####
+
+seurat.obj <- readRDS(paste0(data.dir, 'Sussman_2024/', 'SeuratObjsFromLevel3ByPatientFinal/', 'all.samples.merged.not.downsampled.seurat.obj.w.annotations.RDS'))
+seurat.obj$sample.id <- paste0(seurat.obj$patient_id, "_", seurat.obj$timepoint.original)
+unique(seurat.obj$sample.id)
+
+seurat.obj$timepoint <- sapply(seurat.obj$timepoint,
+                                           function(x) case_when (x == "Initial CNS Tumor" ~ "Primary",
+                                                                  x == "Recurrence/Progressive (Non-Autopsy)" ~ "Recurrence",
+                                                                  x == "Progressive (Autopsy)" ~ "Postmortem",
+                                                                  TRUE ~ NA))
+seurat.obj$diagnosis.fine <- paste0("pHGG: ", seurat.obj$timepoint)
+sussman2024.seurat.obj <- read.in.data(seurat.obj = seurat.obj,
+                                       dataset.id = "Sussman 2024",
+                                       sample.id.col = "sample.id",
+                                       individual.id.col = "patient_id",
+                                       timepoint.col = "timepoint",
+                                       diagnosis.col = "pHGG",
+                                       diagnosis.fine.col = "diagnosis.fine")
+
+sussman2024.seurat.obj[["RNA"]] <- as(object = sussman2024.seurat.obj[["RNA"]], Class = "Assay5") # convert from Seurat 4 to Seurat 5
+datasets[["Sussman 2024 pHGG"]] <- sussman2024.seurat.obj
+
+
+
+
+##### This study #####
+seurat.obj <- readRDS(paste0(results.dir, "my_data/", "autopsy/", "all_postmortem_samples_cellbender.FALSE_denoise.heat.shock.signature_postmortem.sensitive_postmortem.signature_filter.FALSE_batch.correction.None/", "oligodendrocytes/", "all_postmortem_samples_oligodendrocytes.RDS"))
+seurat.obj$diagnosis <- apply(seurat.obj@meta.data, 1, function(row) case_when(
+  row[["sample.id"]] == "P4 A15" ~ "IDH-mut",
+  row[["location"]] == "Distal" ~ "Control",
+  TRUE ~ "GBM"
+))
+seurat.obj$diagnosis.fine <- apply(seurat.obj@meta.data, 1, function(row) case_when(
+  row[["sample.id"]] == "P4 A15" ~ "IDH-A: Postmortem",
+  row[["location"]] == "Distal" ~ "GBM: Control",
+  TRUE ~ "GBM: Postmortem"
+))
+
+autopsy.seurat.obj <- read.in.data(seurat.obj = seurat.obj,
+                      dataset.id = "This study",
+                      sample.id.col = "sample.id",
+                      individual.id.col = "patient",
+                      timepoint.col = "Postmortem",
+                      diagnosis.col = "diagnosis",
+                      dataset.fine.col = "Silverbush Lab Postmortem GBM", 
+                      diagnosis.fine.col = "diagnosis.fine")
+
+datasets[["Postmortem GBM"]] <- autopsy.seurat.obj
+
+
+##### Mikolajewicz 2026 GBM #####
+seurat.obj <- readRDS(paste0(root.dir, "ExternalData/", "Mikolajewicz_2026_GBM_OL/", "seurat_objects/", "seurat_object_mikolajewicz_cohort_280524.rds"))
+DefaultAssay(seurat.obj) <- "RNA"
+seurat.obj[["SCT"]] <- NULL
+
+
+seurat.obj <- NormalizeData(seurat.obj)
+seurat.obj$timepoint <- sapply(seurat.obj$primary_recurrent_status, function(x) ifelse(x == "P", "Primary", "Recurrence"))
+seurat.obj$individual.id <- sapply(seurat.obj$sample, function(x) substring(x, 2, nchar(x)))
+
+# seurat.obj$diagnosis.fine <- apply(seurat.obj@meta.data, 1, function(row) case_when(
+#   row[["idh_status"]] == "mutant" ~ paste0("IDH-A: ", row[["timepoint"]]),
+#   TRUE ~ paste0("GBM: ", row[["timepoint"]])
+# ))
+
+# Table S1 says all diagnoses are GBM, some IDH-mutant
+seurat.obj$diagnosis.fine <- paste0("GBM: ", seurat.obj$timepoint)
+
+
+mikolajewicz2026.seurat.obj <- read.in.data(seurat.obj = seurat.obj,
+                      dataset.id = "Mikolajewicz 2026",
+                      sample.id.col = "sample",
+                      individual.id.col = "individual.id",
+                      timepoint.col = "timepoint",
+                      diagnosis.col = "GBM",
+                      diagnosis.fine.col = "diagnosis.fine")
+datasets[["Mikolajewicz 2026 GBM"]] <- mikolajewicz2026.seurat.obj
+
+
+
+##### Wang 2022 Longitudinal GBM #####
+seurat.obj <- readRDS(paste0(root.dir, "ProcessedData/", "Wang_2022_logitudinal_GBM/", "seurat_objects/", "wang.2022.longitudinal.GBM.seurat.obj.RDS"))
+seurat.obj$timepoint <- sapply(seurat.obj$source, function(x) case_when (x == "Primary" ~ "Primary", x == "Recurrent" ~ "Recurrence", TRUE ~ NA))
+seurat.obj$diagnosis.fine <- paste0("GBM: ", seurat.obj$timepoint)
+wang2022.seurat.obj <- read.in.data(seurat.obj = seurat.obj,
+                      dataset.id = "Wang 2022",
+                      sample.id.col = "individual",
+                      individual.id.col = "Pair#",
+                      timepoint.col = "timepoint",
+                      diagnosis.col = "GBM",
+                      diagnosis.fine.col = "diagnosis.fine")
+datasets[["Wang 2022 Longitudinal GBM"]] <- wang2022.seurat.obj
+
+
+
+
+##### Nomura 2025 Longitudinal GBM #####
+seurat.obj <- readRDS(paste0(processed.data.dir, "Nomura_2025_GBM/", "Nomura_2025_GBM_merged_seurat_obj.RDS"))
+#seurat.obj <- readRDS(paste0(processed.data.dir, "Nomura_2025_GBM/", "Nomura_2025_GBM_merged_seurat_obj_downsample.RDS"))
+seurat.obj$no.metadata <- is.na(seurat.obj$Sample)
+seurat.obj <- subset(seurat.obj, subset = no.metadata == FALSE)
+
+
+seurat.obj$timepoint <- sapply(seurat.obj$Timepoint, function(x) ifelse(x == "T1", "Primary", "Recurrence"))
+seurat.obj$diagnosis.fine <- paste0("GBM: ", seurat.obj$timepoint)
+
+nomura2025.seurat.obj <- read.in.data(seurat.obj = seurat.obj,
+                      dataset.id = "Nomura 2025",
+                      sample.id.col = "Sample",
+                      individual.id.col = "Patient",
+                      timepoint.col = "timepoint",
+                      diagnosis.col = "GBM",
+                      diagnosis.fine.col = "diagnosis.fine")
+datasets[["Nomura 2025 Longitudinal GBM"]] <- nomura2025.seurat.obj
+
+
+
+
+##### Blanco-Carmona 2023 IDH-mutant glioma #####
+seurat.obj.o <- readRDS(paste0(root.dir, "ExternalData/", "Blanco-Carmona_2023_IDH_mutant_glioma/", "GSE205771_RAW/", "GSM6226122_oligodendroglioma_seurat_object.rds"))
+seurat.obj.o$timepoint <- "Primary"
+seurat.obj.o$diagnosis.fine <- paste0("IDH-O: ", seurat.obj.o$timepoint)
+seurat.obj.o$NMF_labelling <- seurat.obj.o$New_NMF_labelling
+
+DefaultAssay(seurat.obj.o) <- "RNA"
+seurat.obj.o[["SCT"]] <- NULL
+seurat.obj.o <- NormalizeData(seurat.obj.o)
+
+blanco.carmona.2023.o.seurat.obj <- read.in.data(seurat.obj = seurat.obj.o,
+                      dataset.id = "Blanco-Carmona 2023",
+                      sample.id.col = "orig.ident",
+                      individual.id.col = "orig.ident",
+                      timepoint.col = "timepoint",
+                      diagnosis.col = "IDH-mut",
+                      diagnosis.fine.col = "diagnosis.fine")
+datasets[["Blanco-Carmona 2023 IDH-mut-O"]] <- blanco.carmona.2023.o.seurat.obj
+
+
+seurat.obj.a <- readRDS(paste0(root.dir, "ExternalData/", "Blanco-Carmona_2023_IDH_mutant_glioma/", "GSE205771_RAW/", "GSM6261341_astrocytoma_paired_data_merged_seurat_object.rds"))
+
+unique(seurat.obj.a$gem_id)
+
+recurrent.samples <- c("NCH758A", "NCH678", "NCH645", "NCH2375", "NCH2367", "NCH2260")
+seurat.obj.a$timepoint <- sapply(seurat.obj.a$gem_id, function(x) ifelse(x %in% recurrent.samples, "Recurrence", "Primary"))
+seurat.obj.a$individual.id <- sapply(seurat.obj.a$gem_id, function(x) case_when(
+  x %in% c("NCH557", "NCH758A") ~ 1,
+  x %in% c("NCH511B", "NCH678") ~ 2,
+  x %in% c("NCH302", "NCH645") ~ 3,
+  x %in% c("NCH988", "NCH2375") ~ 4,
+  x %in% c("NCH740W", "NCH2367") ~ 5,
+  x %in% c("NCH673D", "NCH2260") ~ 6
+))
+
+seurat.obj.a$diagnosis.fine <- paste0("IDH-A: ", seurat.obj.a$timepoint)
+DefaultAssay(seurat.obj.a) <- "RNA"
+seurat.obj.a[["SCT"]] <- NULL
+seurat.obj.a <- NormalizeData(seurat.obj.a)
+
+blanco.carmona.2023.a.seurat.obj <- read.in.data(seurat.obj = seurat.obj.a,
+                      dataset.id = "Blanco-Carmona 2023",
+                      sample.id.col = "gem_id",
+                      individual.id.col = "individual.id",
+                      timepoint.col = "timepoint",
+                      diagnosis.col = "IDH-mut",
+                      diagnosis.fine.col = "diagnosis.fine")
+datasets[["Blanco-Carmona 2023 IDH-mut-A"]] <- blanco.carmona.2023.a.seurat.obj
+
+
+
+overlapping.genes <- c()
+for (x in datasets) {
+  print(DefaultAssay(x))
+  DefaultAssay(x) <- "RNA"
+  x[["SCT"]] <- NULL
+  if (length(overlapping.genes) == 0) {
+    overlapping.genes <- rownames(x)
+  } else {
+    overlapping.genes <- intersect(overlapping.genes, rownames(x))
+  }
+}
+print(length(overlapping.genes))
+
+
+
+
+merged.seurat.obj <- merge(datasets[[1]], datasets[2:length(datasets)], add.cell.ids = names(datasets), merge.data = F)
+merged.seurat.obj[["RNA"]] <- JoinLayers(merged.seurat.obj[["RNA"]])
+merged.seurat.obj <- merged.seurat.obj[overlapping.genes, ]
+merged.seurat.obj <- NormalizeData(merged.seurat.obj)
+
+set.seed(123)
+oligo.jakel2019.signatures[["Oligo4"]] <- NULL # missing gene
+merged.seurat.obj <- add.module.score(merged.seurat.obj, oligo.gene.signatures)
+merged.seurat.obj <- add.module.score(merged.seurat.obj, gene.signatures)
+merged.seurat.obj <- add.module.score(merged.seurat.obj, oligo.jakel2019.signatures)
+merged.seurat.obj <- add.module.score(merged.seurat.obj, gene.signatures.gsea)
+merged.seurat.obj <- add.module.score(merged.seurat.obj, myelination.signatures)
+merged.seurat.obj <- add.module.score(merged.seurat.obj, fgfr.gene.signatures)
+
+
+saveRDS(merged.seurat.obj, paste0(results.dir, "DatasetsCombined/", "merged.oligo.seurat.obj.RDS"))
+```
+
+
+
+# Group by sample
+```{r}
+merged.seurat.obj <- readRDS(paste0(results.dir, "DatasetsCombined/", "merged.oligo.seurat.obj.RDS"))
+
+
+
+# for plotting
+timepoints.label <- c("Primary", "Recurrence", "Postmortem", "Unknown")
+timepoints.label.color.scale <- scale_color_manual(breaks=timepoints.label, values=c("#FFB000", "#FE6100", "#785EF0", "grey"))
+
+data <- FetchData(merged.seurat.obj, vars = c("OLIG2", "SOX10", "MBP", "MOG", "PLP1", "ASPA", "BCAS1", "PDGFRA", "CD44", "VEGFA", "FGFR1", "FGFR2", "B2M", "HLA-A"))
+merged.seurat.obj <- AddMetaData(merged.seurat.obj, data)
+
+df <- merged.seurat.obj@meta.data %>%
+  group_by(dataset.id, dataset.fine, diagnosis, diagnosis.fine, individual.id, timepoint, sample.id, predicted.cell.type) %>%
+  summarize(mean.reactive.oligo.general = mean(reactive.oligo.general),
+            mean.reactive.oligo.non.tumor = mean(reactive.oligo.non.tumor),
+            mean.reactive.oligo.specific = mean(reactive.oligo.specific),
+            mean.apoptosis = mean(apoptosis.signature),
+            mean.necrosis = mean(necrosis.signature),
+            mean.hypoxia = mean(hypoxia.signature),
+            mean.inflmmatory = mean(inflammatory.signature),
+            mean.OLIG2 = mean(OLIG2),
+            mean.SOX10 = mean(SOX10),
+            mean.MBP = mean(MBP),
+            mean.MOG = mean(MOG),
+            mean.ASPA = mean(ASPA),
+            mean.BCAS1 = mean(BCAS1),
+            mean.PDGFRA = mean(PDGFRA),
+            mean.CD44 = mean(CD44),
+            mean.VEGFA = mean(VEGFA),
+            mean.FGFR1 = mean(FGFR1),
+            mean.FGFR2 = mean(FGFR2),
+            mean.B2M = mean(B2M),
+            mean.HLA.A = mean(`HLA-A`),
+            count = n()) %>%
+  ungroup()
+
+
+# filter low n (number of cells/oligodendrocytes)
+df <- df %>% filter(count >= 10)
+
+
+unique(df$dataset.id)
+unique(df$sample.id) %>% length()
+
+df %>% filter(dataset.id %in% c("Blanco-Carmona 2023", "Mikolajewicz 2026", "Nomura 2025", "Sussman 2024", "Wang 2022")) %>% pull(sample.id) %>% unique() %>% length()
+
+unique(df$diagnosis)
+unique(df$timepoint)
+unique(df$diagnosis.fine)
+unique(df$dataset.id)
+
+df$diagnosis <- factor(df$diagnosis, levels = c("Control", "IDH-mut", "pHGG", "GBM"))
+df$timepoint <- factor(df$timepoint, levels = c("Primary", "Recurrence", "Postmortem"))
+
+df$diagnosis.fine <- factor(df$diagnosis.fine, levels = c("Control", "GBM: Control", "pHGG: Primary", "pHGG: Recurrence", "pHGG: Postmortem", "IDH-O: Primary", "IDH-A: Primary", "IDH-A: Recurrence", "IDH-A: Postmortem", "GBM: Primary", "GBM: Recurrence", "GBM: Postmortem"))
+
+df$diagnosis_dataset <- paste0(df$diagnosis, "\n(", df$dataset.id, ")")
+unique(df$diagnosis_dataset)
+df$diagnosis_dataset <- factor(df$diagnosis_dataset, levels = c(
+  "Control\n(Velmeshev 2019)",
+  "Control\n(Herring 2022)",
+  "Control\n(This study)",
+  "IDH-mut\n(Blanco-Carmona 2023)",
+  "IDH-mut\n(This study)",
+  "pHGG\n(Sussman 2024)",
+  "GBM\n(Wang 2022)",  
+  "GBM\n(Nomura 2025)",
+  "GBM\n(Mikolajewicz 2026)",
+  "GBM\n(This study)"
+))
+
+df$diagnosis_fine_dataset <- paste0(df$diagnosis.fine, "\n(", df$dataset.id, ")")
+df$diagnosis_fine_dataset <- factor(df$diagnosis_fine_dataset, levels = c(
+  "Control\n(Velmeshev 2019)",
+  "Control\n(Herring 2022)",
+  "GBM: Control\n(This study)",
+  "IDH-O: Primary\n(Blanco-Carmona 2023)",
+  "IDH-A: Primary\n(Blanco-Carmona 2023)",
+  "IDH-A: Recurrence\n(Blanco-Carmona 2023)",
+  "IDH-A: Postmortem\n(This study)",
+  "pHGG: Primary\n(Sussman 2024)",
+  "pHGG: Recurrence\n(Sussman 2024)",
+  "pHGG: Postmortem\n(Sussman 2024)",
+  "GBM: Primary\n(Wang 2022)",  
+  "GBM: Recurrence\n(Wang 2022)",  
+  "GBM: Primary\n(Nomura 2025)",
+  "GBM: Recurrence\n(Nomura 2025)",
+  "GBM: Primary\n(Mikolajewicz 2026)",
+  "GBM: Recurrence\n(Mikolajewicz 2026)",
+  "GBM: Postmortem\n(This study)"
+))
+
+
+write.table(df, paste0(root.dir, "Figures/", "Figure 4/", "merged.oligo.seurat.obj.metadata.tsv"), sep = "\t", quote = F, row.names = F, col.names = T)
+
+print(length(unique(df$dataset.id)))
+print(nrow(df))
+unique(df$dataset.id)
+df %>% filter(dataset.id %in% c("Velmeshev 2019", "Herring 2022", "This study")) %>% nrow()
+
+
+df %>% filter(dataset.id %ni% c("This study")) %>% nrow()
+```
+
+
+
+# Figure 4: Diagnosis vs reactive oligodendrocyte signature
+```{r}
+oligo.df <- df
+
+stat.test <- oligo.df %>%
+  wilcox_test(
+    mean.reactive.oligo.general ~ diagnosis,
+  ) %>%
+  adjust_pvalue(method = "fdr") %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "diagnosis")
+stat.test$p.label <- format.p.value(stat.test$p.adj)
+
+p <- ggplot(oligo.df, aes(diagnosis, mean.reactive.oligo.general, color = dataset.id)) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_point(position = position_jitterdodge(jitter.width = 0.2), alpha = 0.6) + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  xlab("Diagnosis") +
+  ylab("Reactive oligodendrocyte signature\nin oligodendrocytes") +
+  stat_pvalue_manual(
+    stat.test,
+    label = "p.label",
+    size = 6
+  ) +
+  scale_color_manual(values = as.character(polychrome(length(unique(oligo.df$dataset.id))))) +
+  labs(color = "Dataset")
+pdf(paste0(root.dir, "Figures/", "Figure 4/", "diagnosis_vs_reactive_oligo_signature_in_glioma_datasets.pdf"), width = 12, height = 9)  
+print(p)
+dev.off()
+
+
+# by disease and dataset
+stat.test <- oligo.df %>%
+  wilcox_test(
+    mean.reactive.oligo.general ~ diagnosis_dataset
+  ) %>%
+  adjust_pvalue(method = "fdr") %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "diagnosis_dataset")
+stat.test <- stat.test %>% filter(p.adj < 0.05)
+stat.test$p.label <- format.p.value(stat.test$p.adj)
+
+p <- ggplot(oligo.df, aes(diagnosis_dataset, mean.reactive.oligo.general, color = diagnosis_dataset)) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_point(position = position_jitterdodge(jitter.width = 0.2), alpha = 0.6) + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  xlab("Diagnosis") +
+  ylab("Reactive oligodendrocyte signature\nin oligodendrocytes") +
+  theme(legend.position="none") +
+  stat_pvalue_manual(
+    stat.test,
+    label = "p.label",
+    size = 6
+  ) 
+pdf(paste0(root.dir, "Figures/", "Figure 4/", "Supplemental/", "diagnosis_dataset_vs_reactive_oligo_signature_in_glioma_datasets.pdf"), width = 12, height = 12)  
+print(p)
+dev.off()
+
+
+# by disease, dataset, and timepoint
+stat.test <- oligo.df %>%
+  wilcox_test(
+    mean.reactive.oligo.general ~ diagnosis_fine_dataset) %>%
+  adjust_pvalue(method = "fdr") %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "diagnosis_fine_dataset")
+stat.test <- stat.test %>% filter(p.adj < 0.05)
+stat.test$p.label <- format.p.value(stat.test$p.adj)
+
+p <- ggplot(oligo.df, aes(diagnosis_fine_dataset, mean.reactive.oligo.general, color = diagnosis_fine_dataset)) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_point(position = position_jitterdodge(jitter.width = 0.2), alpha = 0.6) + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  xlab("Diagnosis") +
+  ylab("Reactive oligodendrocyte signature\nin oligodendrocytes") +
+  theme(legend.position="none")
+pdf(paste0(root.dir, "Figures/", "Figure 4/", "Supplemental/", "diagnosis_fine_vs_reactive_oligo_signature_in_glioma_datasets.pdf"), width = 12, height = 8)  
+print(p)
+dev.off()
+```
+
+ 
+
+# Figure 5: Reactive oligodendrocyte signature, primary vs recurrence (matched by patient)
+```{r}
+# Sussman 2024
+sussman2024.oligo.df <- oligo.df %>% filter(dataset.id == "Sussman 2024")
+sussman2024.oligo.df <- sussman2024.oligo.df %>% mutate(timepoint = ifelse(timepoint == "Primary", "Primary", "Recurrence/Postmortem"))
+sussman2024.pairs <- sussman2024.oligo.df %>% group_by(individual.id) %>% summarize(count = n_distinct(timepoint)) %>% filter(count == 2) %>% pull(individual.id)
+  
+df <- sussman2024.oligo.df %>% filter(individual.id %in% sussman2024.pairs) %>% arrange(individual.id, timepoint)
+stat.test <- df %>%
+  wilcox_test(
+    mean.reactive.oligo.general ~ timepoint,
+    paired = T
+  ) %>%
+  add_xy_position(x = "timepoint")
+stat.test$p.label <- format.p.value(stat.test$p)
+
+p <- ggplot(df, aes(timepoint, mean.reactive.oligo.general)) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_line(aes(group = individual.id)) +
+  geom_point(alpha = 0.6) + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  xlab("Timepoint") +
+  ylab("Reactive oligodendrocyte signature\nin oligodendrocytes") +
+  stat_pvalue_manual(
+    stat.test,
+    label = "p.label",
+    size = 6
+  ) +
+  ggtitle("Sussman 2024 pHGG")
+
+pdf(paste0(root.dir, "Figures/", "Figure 5/", "timepoint_vs_reactive_oligo_signature_sussman2024.pdf"), width = 8, height = 8)  
+print(p)
+dev.off()
+
+
+
+# Blanco-Carmona 2023, Astrocytoma
+blanco2023.oligo.df <- oligo.df %>% filter(dataset.id == "Blanco-Carmona 2023", diagnosis.fine %in% c("IDH-A: Primary", "IDH-A: Recurrence"))
+blanco2023.pairs <- blanco2023.oligo.df %>% group_by(individual.id) %>% summarize(count = n_distinct(timepoint)) %>% filter(count == 2) %>% pull(individual.id)
+  
+df <- blanco2023.oligo.df %>% filter(individual.id %in% blanco2023.pairs) %>% arrange(individual.id, timepoint)
+stat.test <- df %>%
+  wilcox_test(
+    mean.reactive.oligo.general ~ timepoint,
+    paired = T
+  ) %>%
+  add_xy_position(x = "timepoint")
+stat.test$p.label <- format.p.value(stat.test$p)
+
+p <- ggplot(df, aes(timepoint, mean.reactive.oligo.general)) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_line(aes(group = individual.id)) +
+  geom_point(alpha = 0.6) + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  xlab("Timepoint") +
+  ylab("Reactive oligodendrocyte signature\nin oligodendrocytes") +
+  stat_pvalue_manual(
+    stat.test,
+    label = "p.label",
+    size = 6
+  ) +
+  ggtitle("Blanco-Carmona 2023 IDH-A")
+
+pdf(paste0(root.dir, "Figures/", "Figure 5/", "timepoint_vs_reactive_oligo_signature_blancocarmona2023.pdf"), width = 8, height = 8)  
+print(p)
+dev.off()
+
+
+# Wang 2022
+wang2022.oligo.df <- oligo.df %>% filter(dataset.id == "Wang 2022")
+wang2022.pairs <- wang2022.oligo.df %>% 
+  group_by(individual.id) %>% 
+  summarize(count = n_distinct(timepoint)) %>% 
+  filter(count == 2) %>%
+  pull(individual.id)
+
+df <- wang2022.oligo.df %>% filter(individual.id %in% wang2022.pairs) %>% arrange(individual.id, timepoint)
+stat.test <- df %>%
+  wilcox_test(
+    mean.reactive.oligo.general ~ timepoint,
+    paired = T
+  ) %>%
+  add_xy_position(x = "timepoint")
+stat.test$p.label <- format.p.value(stat.test$p)
+
+p <- ggplot(df, aes(timepoint, mean.reactive.oligo.general)) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_line(aes(group = individual.id)) +
+  geom_point(alpha = 0.6) + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  xlab("Timepoint") +
+  ylab("Reactive oligodendrocyte signature\nin oligodendrocytes") +
+  stat_pvalue_manual(
+    stat.test,
+    label = "p.label",
+    size = 6
+  ) +
+  ggtitle("Wang 2022 GBM")
+
+pdf(paste0(root.dir, "Figures/", "Figure 5/", "timepoint_vs_reactive_oligo_signature_wang2022.pdf"), width = 8, height = 8)  
+print(p)
+dev.off()
+
+
+# Nomura 2025 GBM
+nomura2025.metadata.df <- read_excel(paste0(root.dir, "ExternalData/", "Nomura_2025_GBM/", "41588_2025_2167_MOESM2_ESM.xlsx"), sheet = 1, skip = 2)
+
+nomura2025.oligo.df <- merged.seurat.obj@meta.data %>% 
+  filter(dataset.id == "Nomura 2025", Timepoint %in% c("T1", "T2")) %>%
+  group_by(individual.id, sample.id, Timepoint, timepoint) %>%
+  summarize(count = n(),
+            mean.reactive.oligo.general = mean(reactive.oligo.general)) %>%
+  ungroup() %>%
+  filter(count >= 10)
+nomura2025.oligo.df$`Sample ID` <- paste0(nomura2025.oligo.df$individual.id, nomura2025.oligo.df$Timepoint)
+nomura2025.oligo.df <- nomura2025.oligo.df %>% left_join(nomura2025.metadata.df, by = "Sample ID")
+
+nomura2025.pairs <- nomura2025.oligo.df %>% group_by(individual.id) %>% summarize(count = n_distinct(timepoint)) %>% filter(count == 2) %>% pull(individual.id)
+
+df <- nomura2025.oligo.df %>% filter(individual.id %in% nomura2025.pairs) %>% arrange(individual.id, timepoint)
+
+stat.test <- df %>%
+  wilcox_test(
+    mean.reactive.oligo.general ~ timepoint,
+    paired = T
+  ) %>%
+  add_xy_position(x = "timepoint")
+stat.test$p.label <- format.p.value(stat.test$p)
+
+p <- ggplot(df, aes(timepoint, mean.reactive.oligo.general)) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_line(aes(group = individual.id)) +
+  geom_point(alpha = 0.6) + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  xlab("Timepoint") +
+  ylab("Reactive oligodendrocyte signature\nin oligodendrocytes") +
+  stat_pvalue_manual(
+    stat.test,
+    label = "p.label",
+    size = 6
+  ) +
+  ggtitle("Nomura 2025 GBM")
+
+pdf(paste0(root.dir, "Figures/", "Figure 5/", "timepoint_vs_reactive_oligo_signature_nomura2025.pdf"), width = 8, height = 8)  
+print(p)
+dev.off()
+
+
+# Mikolajewicz 2026 GBM
+mikolajewicz2026.oligo.df <- oligo.df %>% filter(dataset.id == "Mikolajewicz 2026")
+mikolajewicz2026.pairs <- mikolajewicz2026.oligo.df %>% group_by(individual.id) %>% summarize(count = n_distinct(timepoint)) %>% filter(count == 2) %>% pull(individual.id)
+  
+df <- mikolajewicz2026.oligo.df %>% filter(individual.id %in% mikolajewicz2026.pairs) %>% arrange(individual.id, timepoint)
+stat.test <- df %>%
+  wilcox_test(
+    mean.reactive.oligo.general ~ timepoint,
+    paired = T
+  ) %>%
+  add_xy_position(x = "timepoint")
+stat.test$p.label <- format.p.value(stat.test$p)
+
+p <- ggplot(df, aes(timepoint, mean.reactive.oligo.general)) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_line(aes(group = individual.id)) +
+  geom_point(alpha = 0.6) + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  xlab("Diagnosis") +
+  ylab("Reactive oligodendrocyte signature\nin oligodendrocytes") +
+  stat_pvalue_manual(
+    stat.test,
+    label = "p.label",
+    size = 6
+  ) +
+  ggtitle("Mikolajewicz 2026 GBM")
+
+pdf(paste0(root.dir, "Figures/", "Figure 5/", "timepoint_vs_reactive_oligo_signature_mikolajewicz2026.pdf"), width = 8, height = 8)  
+print(p)
+dev.off()
+
+```
+
+
+
+# Figure 4 Supplemental: Other factors affecting/not affecting reactive oligo signature
+```{r}
+# grade vs oligo signature (Blanco-Carmona 2023 IDH-mutant glioma)
+df <- merged.seurat.obj@meta.data %>% 
+  filter(dataset.id == "Blanco-Carmona 2023") %>% 
+  group_by(dataset.id, individual.id, sample.id, grade, diagnosis, diagnosis.fine) %>% 
+  summarize(mean.reactive.oligo.general = mean(reactive.oligo.general), count = n()) %>%
+  ungroup() %>%
+  filter(count >= 10)
+df$diagnosis <- sapply(df$diagnosis.fine, function(x) ifelse(x == "IDH-O: Primary", "IDH-O", "IDH-A"))
+
+df$grade <- sapply(df$grade, function(x) str_replace(x, "grade", ""))
+stat.test <- df %>%
+  wilcox_test(
+    mean.reactive.oligo.general ~ grade,
+    comparisons = list(c("2", "3"))
+  ) %>%
+  add_xy_position(x = "grade")
+stat.test$p.label <- format.p.value(stat.test$p)
+
+p <- ggplot(df, aes(grade, mean.reactive.oligo.general)) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_point(alpha = 0.6, position = position_jitter(width = 0.2)) + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  xlab("Grade") +
+  ylab("Reactive oligodendrocyte signature\nin oligodendrocytes") +
+  stat_pvalue_manual(
+    stat.test,
+    label = "p.label",
+    size = 6
+  ) +
+  ggtitle("Blanco-Carmona 2023 IDH-mutant glioma")
+pdf(paste0(root.dir, "Figures/", "Figure 4/", "Supplemental/", "grade_vs_reactive_oligo_signature_blancocarmona2023.pdf"), width = 8, height = 8)  
+print(p)
+dev.off()
+
+
+
+# age (Herring 2022)
+df <- merged.seurat.obj@meta.data %>% 
+  filter(dataset.id == "Herring 2022") %>% 
+  group_by(dataset.id, individual.id, sample.id, stage_id, diagnosis, diagnosis.fine) %>% 
+  summarize(mean.reactive.oligo.general = mean(reactive.oligo.general), count = n()) %>%
+  ungroup() %>%
+  filter(count >= 10)
+
+stat.test <- df %>%
+  wilcox_test(
+    mean.reactive.oligo.general ~ stage_id
+  ) %>%
+  add_xy_position(x = "stage_id")
+stat.test$p.label <- format.p.value(stat.test$p)
+
+df$stage_id <- factor(df$stage_id, levels = c("Fetal", "Neonatal", "Infancy", "Childhood", "Adolescence", "Adult"))
+p <- ggplot(df, aes(stage_id, mean.reactive.oligo.general)) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_point(alpha = 0.6, position = position_jitter(width = 0.2)) + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  xlab("Stage") +
+  ylab("Reactive oligodendrocyte signature\nin oligodendrocytes") +
+  stat_compare_means(method = "kruskal", size = 6) +
+  ggtitle("Herring 2022")
+pdf(paste0(root.dir, "Figures/", "Figure 4/", "Supplemental/", "stage_vs_reactive_oligo_signature_herring2022.pdf"), width = 12, height = 8)  
+print(p)
+dev.off()
+
+
+# age (Velmeshev 2019)
+df <- merged.seurat.obj@meta.data %>% 
+  filter(dataset.id == "Velmeshev 2019") %>% 
+  group_by(dataset.id, individual.id, sample.id, age, diagnosis, diagnosis.fine) %>% 
+  summarize(mean.reactive.oligo.general = mean(reactive.oligo.general), count = n()) %>%
+  ungroup() %>%
+  filter(count >= 10)
+df$age <- as.numeric(df$age)
+p <- ggplot(df, aes(age, mean.reactive.oligo.general)) +
+  geom_point(alpha = 0.6) +
+  stat_cor(method = correlation.method.use, size = 6) +
+  xlab("Age (years)") +
+  ylab("Reactive oligodendrocyte signature\nin oligodendrocytes") +
+  ggtitle("Velmeshev 2019")
+pdf(paste0(root.dir, "Figures/", "Figure 4/", "Supplemental/", "age_vs_reactive_oligo_signature_velmeshev2019.pdf"), width = 10, height = 8)  
+print(p)
+dev.off()
+
+
+# Nomura et al. metadata analaysis (samples at initial diagnosis)
+df <- nomura2025.oligo.df %>% filter(Timepoint == "T1")
+
+# not associated with processing
+p <- ggplot(df, aes(`Tissue source`, mean.reactive.oligo.general)) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_point(alpha = 0.6, position = position_jitter(width = 0.2)) + 
+  theme(axis.text.x = element_text(angle = 45, hjust=1)) +
+  ylab("Reactive oligodendrocyte signature\nin oligodendrocytes") +
+  ggtitle("Nomura 2025 GBM") +
+  stat_compare_means(size = 6)
+
+p <- ggplot(df, aes(`Lab processed`, mean.reactive.oligo.general)) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_point(alpha = 0.6, position = position_jitter(width = 0.2)) + 
+  theme(axis.text.x = element_text(angle = 45, hjust=1)) +
+  ylab("Reactive oligodendrocyte signature\nin oligodendrocytes") +
+  ggtitle("Nomura 2025 GBM") +
+  stat_compare_means(size = 6)
+
+
+
+# metadata says "Gender" not sure if it's gender or sex
+stat.test <- df %>%
+  wilcox_test(
+    mean.reactive.oligo.general ~ Gender
+  ) %>%
+  add_xy_position(x = "Gender")
+stat.test$p.label <- format.p.value(stat.test$p)
+p <- ggplot(df, aes(Gender, mean.reactive.oligo.general)) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_point(alpha = 0.6, position = position_jitter(width = 0.2)) + 
+  theme(axis.text.x = element_text(angle = 45, hjust=1)) +
+  xlab("Gender") +
+  ylab("Reactive oligodendrocyte signature\nin oligodendrocytes") +
+  ggtitle("Nomura 2025 GBM") +
+  stat_pvalue_manual(
+    stat.test,
+    label = "p.label",
+    size = 6
+  ) 
+pdf(paste0(root.dir, "Figures/", "Figure 4/", "Supplemental/", "gender_vs_reactive_oligo_signature_nomura2025_primary.pdf"), width = 10, height = 8)  
+print(p)
+dev.off()
+
+p <- ggplot(df, aes(`Tumor location`, mean.reactive.oligo.general)) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_point(alpha = 0.6, position = position_jitter(width = 0.2)) + 
+  theme(axis.text.x = element_text(angle = 45, hjust=1)) +
+  xlab("Tumor location") +
+  ylab("Reactive oligodendrocyte signature\nin oligodendrocytes") +
+  ggtitle("Nomura 2025 GBM") +
+  stat_compare_means(size = 6, hjust = -0.1)
+pdf(paste0(root.dir, "Figures/", "Figure 4/", "Supplemental/", "tumor_location_vs_reactive_oligo_signature_nomura2025_primary.pdf"), width = 14, height = 8)  
+print(p)
+dev.off()
+
+p <- ggplot(df, aes(`Age at initial diagnosis`, mean.reactive.oligo.general)) +
+  geom_point(alpha = 0.6) + 
+  xlab("Age at diagnosis (years)") +
+  ylab("Reactive oligodendrocyte signature\nin oligodendrocytes") +
+  ggtitle("Nomura 2025 GBM") +
+  stat_cor(method = correlation.method.use, size = 6)
+pdf(paste0(root.dir, "Figures/", "Figure 4/", "Supplemental/", "age_diagnosis_vs_reactive_oligo_signature_nomura2025_primary.pdf"), width = 10, height = 8)  
+print(p)
+dev.off()
+
+
+
+df <- nomura2025.oligo.df %>% filter(Timepoint == "T2")
+df$`Surgical interval (month)` <- as.numeric(df$`Surgical interval (month)`)
+p <- ggplot(df, aes(`Surgical interval (month)`, mean.reactive.oligo.general)) +
+  geom_point(alpha = 0.6) + 
+  xlab("Surgical interval (months)") +
+  ylab("Reactive oligodendrocyte signature\nin oligodendrocytes") +
+  ggtitle("Nomura 2025 GBM") +
+  stat_cor(method = correlation.method.use, size = 6)
+pdf(paste0(root.dir, "Figures/", "Figure 4/", "Supplemental/", "surgical_interval_vs_reactive_oligo_signature_nomura2025_primary.pdf"), width = 10, height = 8)  
+print(p)
+dev.off()
+```
+

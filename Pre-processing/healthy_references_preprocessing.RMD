@@ -1,0 +1,516 @@
+---
+title: "healthy_references_preprocessing.RMD"
+output: html_document
+date: "2026-04-23"
+---
+
+
+
+# Setup
+```{r}
+root.dir <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Projects/Jackie_post-mortem/"
+suppressMessages(suppressWarnings(source(paste0(root.dir, "Code/", 'helper_functions.R'))))
+data.dir <- paste0(root.dir, 'ExternalData/')
+results.dir <- paste0(root.dir, 'Results/')
+
+
+denoise.vars.to.regress <- c("heat.shock.signature", "postmortem.sensitive", "postmortem.signature")
+set.seed(123)
+```
+
+
+
+# Velmeshev 2019
+
+#### Create Seurat object
+```{r}
+counts <- ReadMtx(
+  mtx = paste0(data.dir, 'Velmeshev_2019_Autism/', 'rawMatrix/', 'matrix.mtx'), 
+  features = paste0(data.dir, 'Velmeshev_2019_Autism/', 'rawMatrix/', 'genes.tsv'),
+  cells = paste0(data.dir, 'Velmeshev_2019_Autism/', 'rawMatrix/', 'barcodes.tsv')
+)
+
+metadata.df <- read.csv(paste0(data.dir, 'Velmeshev_2019_Autism/', 'rawMatrix/', 'meta.txt'), sep="\t")
+rownames(metadata.df) <- metadata.df$cell
+
+seurat.obj <- CreateSeuratObject(counts = counts)
+seurat.obj <- AddMetaData(seurat.obj, metadata.df)
+
+get.l1.cell.types <- function(x) {
+  if (x %in% c("AST-FB", "AST-PP", "OPC", "Oligodendrocytes")) {
+    return("Glial")
+  } else if (x %in% c("Neu-NRGN-I", "Neu-NRGN-II", "Neu-mat", "IN-PV", "IN-SST", "IN-SV2C", "IN-VIP", "L2/3", "L4", "L5/6", "L5/6-CC")) {
+    return("Neurons")
+  } else if (x == "Microglia") {
+    return("Immune")
+  } else if (x == "Endothelial") {
+    return("Vascular")
+  } else {
+    stop(paste('unknown cell type', x))
+  }
+}
+
+get.l2.cell.types <- function(x) {
+  if (x %in% c("AST-FB", "AST-PP")) {
+    return("Astrocytes")
+  } else if (x %in% c("IN-PV", "IN-SST", "IN-SV2C", "IN-VIP")) {
+    return("Inhibitory neurons")
+  } else if (x %in% c("L2/3", "L4", "L5/6", "L5/6-CC", "Neu-mat", "Neu-NRGN-I", "Neu-NRGN-II")) {
+    return("Excitatory neurons")
+  } else if (x == "Microglia") {
+    return("Myeloid")
+  } else if (x == "Endothelial") {
+    return("Vascular")
+  } else if (x == "OPC") { 
+    return("OPC")
+  } else if (x == "Oligodendrocytes") {
+    return("Oligodendrocytes")
+  } else {
+    stop(paste('unknown cell type', x))
+  }
+}
+
+seurat.obj$annotation_l1 <- sapply(seurat.obj$cluster, function(x) get.l1.cell.types(x))
+seurat.obj$annotation_l2 <- sapply(seurat.obj$cluster, function(x) get.l2.cell.types(x))
+seurat.obj$annotation_l3 <- seurat.obj$cluster
+
+seurat.obj <- NormalizeData(seurat.obj)
+seurat.obj[["percent.mt"]] <- PercentageFeatureSet(seurat.obj, pattern = "^MT-")
+
+# very low quality cells (none for Velmeshev 2019 because I think it was already filtered)
+seurat.obj$filter.out <- apply(seurat.obj@meta.data, 1, function(row) (as.numeric(row[['nCount_RNA']]) < nCount_RNA.cutoff.filter.out) | (as.numeric(row[['percent.mt']]) > percent.mt.cutoff.filter.out))
+
+# low quality cells
+seurat.obj$low.quality.by.qc <- apply(seurat.obj@meta.data, 1, function(row) (as.numeric(row[['nCount_RNA']]) < nCount_RNA.cutoff.low) | (as.numeric(row[['nFeature_RNA']]) < nFeature_RNA.cutoff.low) | (as.numeric(row[['percent.mt']]) > percent.mt.cutoff))
+  
+
+seurat.obj$annotation_l1.w.qc <- apply(seurat.obj@meta.data, 1, function(row) ifelse(row[["filter.out"]], "Filtered out", ifelse(row[["low.quality.by.qc"]], "Low quality", row[["annotation_l1"]])))
+seurat.obj$annotation_l2.w.qc <- apply(seurat.obj@meta.data, 1, function(row) ifelse(row[["filter.out"]], "Filtered out", ifelse(row[["low.quality.by.qc"]], "Low quality", row[["annotation_l2"]])))
+seurat.obj$annotation_l3.w.qc <- apply(seurat.obj@meta.data, 1, function(row) ifelse(row[["filter.out"]], "Filtered out", ifelse(row[["low.quality.by.qc"]], "Low quality", row[["annotation_l3"]])))
+
+
+saveRDS(seurat.obj, paste0(data.dir, 'Velmeshev_2019_Autism/', 'SeuratObjects/', 'raw.velmeshev2019.autism.all.cells.seurat.obj.RDS'))
+
+unique(seurat.obj$diagnosis)
+print(dim(seurat.obj))
+seurat.obj.subset <- subset(seurat.obj, subset = diagnosis == 'Control')
+print(dim(seurat.obj.subset))
+
+saveRDS(seurat.obj.subset, paste0(data.dir, 'Velmeshev_2019_Autism/', 'SeuratObjects/', 'raw.velmeshev2019.autism.control.only.seurat.obj.RDS'))
+
+print('done!')
+```
+
+
+
+# Process Seurat object control only
+```{r process seurat obj}
+for (clean in c('before.clean', 'after.clean')) { # 'after.clean'
+  print(clean)
+  
+  seurat.obj <- readRDS(paste0(data.dir, 'Velmeshev_2019_Autism/', 'SeuratObjects/', 'raw.velmeshev2019.autism.control.only.seurat.obj.RDS'))
+  print(dim(seurat.obj))
+  
+  seurat.obj <- subset(seurat.obj, subset = low.quality.by.qc == FALSE) # remove low quality
+  
+  # cell cycle scoring
+  s.genes <- cc.genes$s.genes
+  g2m.genes <- cc.genes$g2m.genes
+  seurat.obj <- CellCycleScoring(seurat.obj, s.features = s.genes, g2m.features = g2m.genes)
+  
+  seurat.obj <- NormalizeData(seurat.obj)
+  seurat.obj <- FindVariableFeatures(seurat.obj)
+  
+  seurat.obj <- add.module.score(seurat.obj, gene.signatures)
+  
+  if (clean == "after.clean") {
+    seurat.obj <- ScaleData(seurat.obj, vars.to.regress = denoise.vars.to.regress)
+  } else {
+    seurat.obj <- ScaleData(seurat.obj)
+  }
+  
+  set.seed(123)
+  seurat.obj <- RunPCA(seurat.obj)
+  ElbowPlot(seurat.obj, ndims = 50)
+  seurat.obj <- RunUMAP(seurat.obj, dims=1:20, return.model = T)
+
+  p1 <- DimPlot(seurat.obj, group.by='annotation_l1', label=T, shuffle=T)
+  p2 <- DimPlot(seurat.obj, group.by='annotation_l2', label=T, shuffle=T)
+  p3 <- DimPlot(seurat.obj, group.by='annotation_l3', label=T, shuffle=T)
+  p4 <- DimPlot(seurat.obj, group.by='individual', label=F, shuffle=T) + NoLegend()
+  p5 <- DimPlot(seurat.obj, group.by='sample', label=F, shuffle=T) + NoLegend()
+  p6 <- DimPlot(seurat.obj, group.by='diagnosis', label=F, shuffle=T)
+  p7 <- DimPlot(seurat.obj, group.by='sex', label=F, shuffle=T)
+  p8 <- DimPlot(seurat.obj, group.by='region', label=F, shuffle=T)
+  p9 <- DimPlot(seurat.obj, group.by='Seqbatch', label=F, shuffle=T)
+  p10 <- DimPlot(seurat.obj, group.by='Capbatch', label=F, shuffle=T)
+  p11 <- DimPlot(seurat.obj, group.by='Phase', label=F, shuffle=T)
+  p12 <- DimPlot(seurat.obj, group.by='low.quality.by.qc', label=F, shuffle=T)
+  p <- p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9 + p10 + p11 + p12
+  pdf(paste0(results.dir, 'Velmeshev2019Autism/', clean, '.control.only.UMAP.pdf'), width=28, height=14)
+  print(p)
+  dev.off()
+  
+  cells.order.random <- sample(Cells(seurat.obj))
+  p <- FeaturePlot(seurat.obj, features=c('post.mortem.interval..hours.', 'RNA.mitochondr..percent', 'percent.mt', 'RNA.ribosomal.percent', 'RNA.Integrity.Number', 'age', 'nFeature_RNA', 'postmortem.signature', 'heat.shock.signature', 'postmortem.sensitive', 'postmortem.glial'), cells = cells.order.random)
+  pdf(paste0(results.dir, 'Velmeshev2019Autism/', clean, '.control.only.FeaturePlot.UMAP.pdf'), width=24, height=12)
+  print(p)
+  dev.off()
+  
+  saveRDS(seurat.obj, paste0(data.dir, 'Velmeshev_2019_Autism/', 'SeuratObjects/', clean, '.velmeshev2019.autism.control.only.seurat.obj.RDS'))
+}
+print('done!')
+```
+
+
+
+
+# Herring 2022
+
+### Pre-processing and Seurat object generation
+```{r herring 2022 preprocess}
+# # create seurat object from combined matrix (publically available and downloaded) # I don't think this is raw counts, so use uncommented out code below instead
+# herring.2022.ad <- read_h5ad(paste0(data.dir, 'Herring_2022/', 'processed/', 'Processed_data_RNA-all_full-counts-and-downsampled-CPM.h5ad'))
+# 
+# obs.df <- read.csv(paste0(data.dir, 'Herring_2022/', 'processed/', 'Processed_data_RNA-all_BCs-meta-data.csv')) # cell metadata
+# rownames(obs.df) <- obs.df$X
+# var.df <- read.csv(paste0(data.dir, 'Herring_2022/', 'processed/', 'Processed_data_RNA-all_genes-meta-data.csv')) # gene metadata
+# 
+# m <- herring.2022.ad$X
+# mt <- t(m)
+# 
+# herring.2022 <- CreateSeuratObject(counts = mt)
+# herring.2022 <- AddMetaData(
+#   object = herring.2022,
+#   metadata = obs.df
+# )
+# 
+# # downsample and save as RDS
+# herring.2022$downsample <- TRUE
+# Idents(herring.2022) <- 'downsample'
+# herring.2022.downsample <- subset(herring.2022, subset = downsample == TRUE, downsample = 10000)
+# saveRDS(herring.2022.downsample, paste0(data.dir, 'Herring_2022/', 'processed/', 'Processed_data_RNA-all_full-counts-and-downsampled-CPM.downsampled.seurat.obj.RDS'))
+
+
+
+# functions for standardizing cell type
+get.l1.cell.types <- function(x) {
+  if (x %in% c("Astro", "Oligo", "OPC")) {
+    return("Glial")
+  } else if (x %in% c("L2-3_CUX2", "L4_RORB", "L5-6_THEMIS", "L5-6_TLE4", "PN_dev", "CGE_dev", "ID2", "LAMP5_NOS1", "MGE_dev", "PV", "PV_SCUBE3", "SST", "VIP")) {
+    return("Neurons")
+  } else if (x == "Micro") {
+    return("Immune")
+  } else if (x == "Vas") {
+    return("Vascular")
+  } else if (x == "Poor-Quality") {
+    return("Poor.Quality")
+  } else {
+    stop(paste('unknown cell type', x))
+  }
+}
+  
+get.l2.cell.types <- function(x) {
+  if (x %in% c("Astro")) {
+    return("Astrocytes")
+  } else if (x %in% c("CGE_dev", "ID2", "LAMP5_NOS1", "MGE_dev", "PV", "PV_SCUBE3",  "SST", "VIP")) {
+    return("Inhibitory neurons")
+  } else if (x %in% c("L2-3_CUX2", "L4_RORB", "L5-6_THEMIS", "L5-6_TLE4", "PN_dev")) {
+    return("Excitatory neurons")
+  } else if (x == "Micro") {
+    return("Myeloid")
+  } else if (x == "Vas") {
+    return("Vascular")
+  } else if (x == "Oligo") { 
+    return("Oligodendrocytes")
+  } else if (x == "OPC") {
+    return("OPC")
+  } else if (x == "Poor-Quality") {
+    return("Poor.Quality")
+  } else {
+    stop(paste('unknown cell type', x))
+  }
+}
+
+
+
+herring.2022.supp.metadata <- readxl::read_excel(paste0(data.dir, 'Herring_2022/', 'TableS1_1-s2.0-S0092867422012582-mmc1.xlsx'), sheet = "sample.metadata.JP.modified")
+
+files <- list.files(paste0(data.dir, 'Herring_2022/', 'GSE168408_RAW/'))
+seurat.obj.list <- list()
+for (f in files) {
+  print(f)
+  counts <- Read10X_h5(filename = paste0(data.dir, 'Herring_2022/', 'GSE168408_RAW/', f))
+  seurat.obj <- CreateSeuratObject(counts = counts)
+  seurat.obj <- NormalizeData(seurat.obj)
+  seurat.obj[["percent.mt"]] <- PercentageFeatureSet(seurat.obj, pattern = "^MT-")
+  geo.sample.id <- unlist(str_split(f, "_"))[1]
+  library.id <- unlist(str_split(f, "_"))[2]
+  age <- unlist(str_split(f, "_"))[3]
+  seurat.obj$geo.sample.id_ <- geo.sample.id # _ denotes I added while making seurat object
+  seurat.obj$library.id_ <- library.id
+  seurat.obj$age_ <- age
+  
+  organoid <- unlist(str_split(f, "_"))[4]
+  if (organoid == 'organoid') {
+    is.sample.organoid <- TRUE
+    PMI <- NA
+  } else {
+    is.sample.organoid <- FALSE
+    temp <- herring.2022.supp.metadata %>% filter(`snRNA-seq library ID` == library.id)
+    PMI <- temp$PMI
+  }
+  
+  seurat.obj$is.sample.organoid_ <- is.sample.organoid
+  seurat.obj$PMI_ <- PMI
+  
+  Idents(seurat.obj) <- 'library.id_'
+  
+  #saveRDS(seurat.obj, paste0(data.dir, 'Herring_2022/', 'processed/', library.id, '.seurat.obj.RDS'))
+  
+  #seurat.obj.downsample <- subset(seurat.obj, subset = library.id_ == library.id, downsample = 1000)
+  seurat.obj.list[[library.id]] <- seurat.obj#seurat.obj.downsample
+}
+seurat.obj.merged <- merge(seurat.obj.list[[1]], seurat.obj.list[2:length(seurat.obj.list)], add.cell.ids = names(seurat.obj.list), merge.data=TRUE)
+seurat.obj.merged[["RNA"]] <- JoinLayers(seurat.obj.merged[["RNA"]])
+seurat.obj.merged <- NormalizeData(seurat.obj.merged)
+
+
+##### Add published metadata #####
+obs.df <- read.csv(paste0(data.dir, 'Herring_2022/', 'processed/', 'Processed_data_RNA-all_BCs-meta-data.csv'))
+
+get.cell.barcode <- function(x) {
+  temp <- unlist(str_split(x, "-"))
+  barcode <- temp[1]
+  library.id <- unlist(str_split(temp[2], "_"))[1]
+  return(paste0(library.id, "_", barcode, "-1"))
+}
+
+obs.df$cell.barcode <- sapply(obs.df$X, function(x) get.cell.barcode(x))
+rownames(obs.df) <- obs.df$cell.barcode
+seurat.obj.merged <- AddMetaData(seurat.obj.merged, obs.df)
+seurat.obj.merged$no.published.metadata <- is.na(seurat.obj.merged$RL.)
+
+
+
+# very low quality cells 
+seurat.obj.merged$filter.out <- apply(seurat.obj.merged@meta.data, 1, function(row) (as.numeric(row[['nCount_RNA']]) < nCount_RNA.cutoff.filter.out) | (as.numeric(row[['percent.mt']]) > percent.mt.cutoff.filter.out))
+
+# low quality cells
+seurat.obj.merged$low.quality.by.qc <- apply(seurat.obj.merged@meta.data, 1, function(row) (as.numeric(row[['nCount_RNA']]) < nCount_RNA.cutoff.low) | (as.numeric(row[['nFeature_RNA']]) < nFeature_RNA.cutoff.low) | (as.numeric(row[['percent.mt']]) > percent.mt.cutoff))
+
+# standardize cell types
+seurat.obj.merged$annotation_l1 <- sapply(seurat.obj.merged$major_clust, function(x) ifelse(is.na(x), "No.metadata", get.l1.cell.types(x)))
+seurat.obj.merged$annotation_l2 <- sapply(seurat.obj.merged$major_clust, function(x) ifelse(is.na(x), "No.metadata", get.l2.cell.types(x)))
+seurat.obj.merged$annotation_l3 <- seurat.obj.merged$major_clust
+
+# cell types with qc
+seurat.obj.merged$annotation_l1.w.qc <- apply(seurat.obj.merged@meta.data, 1, function(row) ifelse(row[["filter.out"]], "Filtered out", ifelse(row[["low.quality.by.qc"]], "Low quality", row[["annotation_l1"]])))
+seurat.obj.merged$annotation_l2.w.qc <- apply(seurat.obj.merged@meta.data, 1, function(row) ifelse(row[["filter.out"]], "Filtered out", ifelse(row[["low.quality.by.qc"]], "Low quality", row[["annotation_l2"]])))
+seurat.obj.merged$annotation_l3.w.qc <- apply(seurat.obj.merged@meta.data, 1, function(row) ifelse(row[["filter.out"]], "Filtered out", ifelse(row[["low.quality.by.qc"]], "Low quality", row[["annotation_l3"]])))
+
+
+saveRDS(seurat.obj.merged, paste0(data.dir, 'Herring_2022/', 'processed/', 'all.sampled.merged.seurat.obj.RDS'))
+
+
+Idents(seurat.obj.merged) <- 'library.id_'
+seurat.obj.merged$downsample <- TRUE
+seurat.obj.merged.downsample <- subset(seurat.obj.merged, subset = downsample == TRUE, downsample = 1000)
+saveRDS(seurat.obj.merged.downsample, paste0(data.dir, 'Herring_2022/', 'processed/', 'all.sampled.merged.downsampled.seurat.obj.RDS'))
+
+print('done!')
+```
+
+
+
+#### Process data
+```{r}
+
+for (clean in c('before.clean', 'after.clean')) { # 'after.clean'
+  
+  print(clean)
+  
+  seurat.obj <- readRDS(paste0(data.dir, 'Herring_2022/', 'processed/', 'all.sampled.merged.seurat.obj.RDS'))
+  
+  # remove poor-quality, only keep cells that have metadata
+  seurat.obj <- subset(seurat.obj, subset = (cell_type != 'Poor-Quality') & (no.published.metadata == FALSE) & (low.quality.by.qc == FALSE))
+  
+  seurat.obj <- NormalizeData(seurat.obj)
+  seurat.obj <- FindVariableFeatures(seurat.obj)
+  
+  seurat.obj <- add.module.score(seurat.obj, gene.signatures)
+  
+  if (clean == "after.clean") {
+    seurat.obj <- ScaleData(seurat.obj, vars.to.regress = denoise.vars.to.regress)
+  } else {
+    seurat.obj <- ScaleData(seurat.obj)
+  }
+  
+  set.seed(123)
+  seurat.obj <- RunPCA(seurat.obj)
+  ElbowPlot(seurat.obj, ndims = 50)
+  seurat.obj <- RunUMAP(seurat.obj, dims=1:20, return.model = T)
+  
+  seurat.obj$Oxygen.No.Oxygen <- sapply(seurat.obj$Oxygen.No.Oxygen, function(x) ifelse(x == "No oxygen", "No Oxygen", x))
+  cells.order.random <- sample(Cells(seurat.obj))
+  
+  p.library <- DimPlot(seurat.obj, group.by = 'library.id_', shuffle=T)
+  p.individual <- DimPlot(seurat.obj, group.by = 'geo.sample.id_', shuffle=T)
+  p.stage <- DimPlot(seurat.obj, group.by = 'stage_id', shuffle=T)
+  p.race <- DimPlot(seurat.obj, group.by = 'Race', shuffle=T)
+  p.sex <- DimPlot(seurat.obj, group.by = 'Sex', shuffle=T)
+  p.brain.regions <- DimPlot(seurat.obj, group.by = 'Brain.Regions.', shuffle=T)
+  p.oxygen <- DimPlot(seurat.obj, group.by = 'Oxygen.No.Oxygen', shuffle=T)
+  p.chem <- DimPlot(seurat.obj, group.by = 'chem', shuffle=T)
+  p.batch <- DimPlot(seurat.obj, group.by = 'batch', shuffle=T)
+  p.annotation_l1 <- DimPlot(seurat.obj, group.by = 'annotation_l1', label=T, shuffle=T, label.size=2)
+  p.annotation_l2 <- DimPlot(seurat.obj, group.by = 'annotation_l2', label=T, shuffle=T, label.size=2)
+  p.annotation_l3 <- DimPlot(seurat.obj, group.by = 'annotation_l3', label=T, shuffle=T, label.size=2)
+  p.low.quality <- DimPlot(seurat.obj, group.by = 'low.quality.by.qc', shuffle=T)
+  p.filter.out <- DimPlot(seurat.obj, group.by = 'filter.out', shuffle=T)
+  p.pmi <- FeaturePlot(seurat.obj, features = 'PMI', cells=cells.order.random)
+  p.percent.mt <- FeaturePlot(seurat.obj, features = 'percent.mt', cells=cells.order.random)
+  p.nCount_RNA <- FeaturePlot(seurat.obj, features = 'nCount_RNA', cells=cells.order.random)
+  p.nFeature_RNA <- FeaturePlot(seurat.obj, features = 'nFeature_RNA', cells=cells.order.random)
+  p.postmortem.signature <- FeaturePlot(seurat.obj, features = 'postmortem.signature', cells=cells.order.random)
+  p.heat.shock.signature <- FeaturePlot(seurat.obj, features = 'heat.shock.signature', cells=cells.order.random)
+  p.postmortem.sensitive <- FeaturePlot(seurat.obj, features = 'postmortem.sensitive', cells=cells.order.random)
+  p.postmortem.glial <- FeaturePlot(seurat.obj, features = 'postmortem.glial', cells=cells.order.random)
+  p <- p.library + p.individual + p.stage + p.race + p.sex + p.brain.regions + p.oxygen + p.chem + p.batch +
+    p.annotation_l1 + p.annotation_l2 + p.annotation_l3 + p.low.quality + p.filter.out + p.pmi + p.percent.mt + p.nCount_RNA + p.nFeature_RNA + 
+    p.postmortem.signature + p.heat.shock.signature + p.postmortem.sensitive + p.postmortem.glial
+  
+  pdf(paste0(results.dir, 'Herring2022/', clean, '.filtered.UMAP.pdf'), width=36, height=24)
+  print(p)
+  dev.off()
+  
+  saveRDS(seurat.obj, paste0(data.dir, 'Herring_2022/', 'processed/', clean, '.all.sampled.merged.filtered.seurat.obj.RDS'))
+}
+
+print('done')
+```
+
+
+
+# CD45+ Satija
+```{r}
+## create Seurat object from raw data in GEO (Daniel's file and downloaded file don't have raw counts)
+counts <- ReadMtx(
+  mtx = paste0(data.dir, 'Satija_2021_PBMC/', 'GSE164378_RAW/', 'GSM5008737_RNA_3P-matrix.mtx.gz'), 
+  features = paste0(data.dir, 'Satija_2021_PBMC/', 'GSE164378_RAW/', 'GSM5008737_RNA_3P-features.tsv.gz'),
+  cells = paste0(data.dir, 'Satija_2021_PBMC/', 'GSE164378_RAW/', 'GSM5008737_RNA_3P-barcodes.tsv.gz')
+)
+
+metadata <- read.csv(paste0(data.dir, 'Satija_2021_PBMC/', 'GSE164378_RAW/', 'GSE164378_sc.meta.data_3P.csv'), row.names = 1)
+
+satija2021.ref <- CreateSeuratObject(counts = counts)
+satija2021.ref <- NormalizeData(satija2021.ref)
+satija2021.ref <- AddMetaData(satija2021.ref, metadata)
+satija2021.ref[["percent.mt"]] <- PercentageFeatureSet(satija2021.ref, pattern = "^MT-")
+
+# remove doublets
+satija2021.ref <- subset(satija2021.ref, subset = celltype.l2 != "Doublet")
+
+update.cell.type.l2 <- function(x) {
+  if (x %in% c("Mono", "DC")) {
+    return("Myeloid")
+  } else if (x %in% c("CD4 T", "CD8 T", "other T", "B", "NK")) {
+    return("Lymphoid")
+  } else if (x %in% c("other")) {
+    return("Other immune")
+  } else {
+    stop(paste('unknown cell type', x))
+  }
+}
+
+update.cell.type.l3 <- function(x) {
+  if (x %in% c("Mono", "DC")) {
+    return("Myeloid")
+  } else if (x %in% c("CD4 T", "CD8 T", "other T")) {
+    return("T")
+  } else if (x == "B") {
+    return("B")
+  } else if (x == "NK") {
+    return("NK")
+  } else if (x %in% c("other")) {
+    return("Other immune")
+  } else {
+    stop(paste('unknown cell type', x))
+  }
+}
+
+update.cell.type.l4 <- function(x) {
+  if (x %in% c("CD14 Mono", "CD16 Mono")) {
+    return("Monocytes")
+  } else if (x %in% c("pDC", "cDC2", "Eryth", "Platelet", "cDC1", "ASDC")) {
+    return("Other myeloid")
+  } else if (x %in% c("B intermediate", "B naive", "B memory", "Plasmablast")) {
+    return("B")
+  } else if (x %in% c("CD4 TCM", "CD4 Naive", "CD4 CTL", "CD4 TEM", "CD4 Proliferating")) {
+    return("CD4 T")
+  } else if (x %in% c("CD8 Naive", "CD8 TEM", "CD8 TCM", "CD8 Proliferating")) {
+    return("CD8 T")
+  } else if (x %in% c("Treg", "MAIT", "gdT", "dnT")) {
+    return("Other T")
+  } else if (x %in% c("NK", "NK_CD56bright", "MAIT", "gdT", "dnT", "NK Proliferating")) {
+    return("NK")
+  } else if (x %in% c("HSPC", "ILC")) {
+    return("Other immune")
+  } else {
+    stop(paste('unknown cell type', x))
+  }
+}
+
+satija2021.ref$annotation_l1 <- "Immune"
+satija2021.ref$annotation_l2 <- sapply(satija2021.ref$celltype.l1, function(x) update.cell.type.l2(x))
+satija2021.ref$annotation_l3 <- sapply(satija2021.ref$celltype.l1, function(x) update.cell.type.l3(x))
+satija2021.ref$annotation_l4 <- sapply(satija2021.ref$celltype.l2, function(x) update.cell.type.l4(x))
+
+# very low quality cells 
+satija2021.ref$filter.out <- apply(satija2021.ref@meta.data, 1, function(row) (as.numeric(row[['nCount_RNA']]) < nCount_RNA.cutoff.filter.out) | (as.numeric(row[['percent.mt']]) > percent.mt.cutoff.filter.out))
+
+# low quality cells
+satija2021.ref$low.quality.by.qc <- apply(satija2021.ref@meta.data, 1, function(row) (as.numeric(row[['nCount_RNA']]) < nCount_RNA.cutoff.low) | (as.numeric(row[['nFeature_RNA']]) < nFeature_RNA.cutoff.low) | (as.numeric(row[['percent.mt']]) > percent.mt.cutoff))
+
+
+satija2021.ref <- subset(satija2021.ref, subset = (low.quality.by.qc == FALSE) & (filter.out == FALSE))
+
+satija2021.ref <- FindVariableFeatures(satija2021.ref)
+
+# metaprogram scores
+satija2021.ref <- add.module.score(satija2021.ref, gene.signatures)
+
+satija2021.ref <- ScaleData(satija2021.ref)
+
+set.seed(123)
+satija2021.ref <- RunPCA(satija2021.ref)
+ElbowPlot(satija2021.ref, ndims=50)
+
+satija2021.ref <- RunUMAP(satija2021.ref, dims=1:20, return.model=T)
+
+p1 <- DimPlot(satija2021.ref, group.by='celltype.l1', label=T, label.size=4, shuffle = T)
+p2 <- DimPlot(satija2021.ref, group.by='celltype.l2', label=T, label.size=2, shuffle = T) + NoLegend()
+p3 <- DimPlot(satija2021.ref, group.by='celltype.l3', label=T, label.size=2, shuffle = T) + NoLegend()
+p4 <- DimPlot(satija2021.ref, group.by='annotation_l1', label=T, label.size=4, shuffle = T)
+p5 <- DimPlot(satija2021.ref, group.by='annotation_l2', label=T, label.size=4, shuffle = T)
+p6 <- DimPlot(satija2021.ref, group.by='annotation_l3', label=T, label.size=4, shuffle = T)
+p7 <- FeaturePlot(satija2021.ref, features=c('postmortem.signature'), order = T)
+p8 <- FeaturePlot(satija2021.ref, features=c('heat.shock.signature'), order = T)
+p9 <- FeaturePlot(satija2021.ref, features=c('postmortem.sensitive'), order = T)
+p10 <- FeaturePlot(satija2021.ref, features=c('postmortem.glial'), order = T)
+p11 <- FeaturePlot(satija2021.ref, features=c('percent.mt'), order = T)
+p12 <- DimPlot(satija2021.ref, group.by='filter.out', shuffle = T)
+p13 <- DimPlot(satija2021.ref, group.by='low.quality.by.qc', shuffle = T)
+p <- p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9 + p10 + p11 + p12 + p13
+pdf(paste0(results.dir, 'HealthyReference/', 'satija2021.healthy.reference.UMAP.pdf'), width=24, height=16)
+print(p)
+dev.off()
+
+
+saveRDS(satija2021.ref, paste0(data.dir, 'Satija_2021_PBMC/multi.seurat.obj.RDS'))
+```
+
+
+
+
+

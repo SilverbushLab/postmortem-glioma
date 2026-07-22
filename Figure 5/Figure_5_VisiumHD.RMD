@@ -1,0 +1,557 @@
+---
+title: "Figure_5_VisiumHD.RMD"
+output: html_document
+date: "2026-07-06"
+---
+
+
+
+# Setup
+```{r}
+library(ggnewscale) 
+
+root.dir <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Projects/Jackie_post-mortem/"
+suppressWarnings(source(paste0(root.dir, "Code/", 'helper_functions.R')))
+
+raw.data.dir <- paste0(root.dir, "RawData/", "spaceranger_output/")
+processed.data.dir <- paste0(root.dir, "ProcessedData/", "my_data/", "autopsy/")
+results.dir <- paste0(root.dir, "Results/", "my_data/", "autopsy/", "visium/")
+
+sample.id <- "P2_S1"
+
+if (sample.id == "P2_S1") {
+  microns_per_pixel <- 0.5034168114587909
+} else if (sample.id == "P1_A5") {
+  microns_per_pixel <- 0.5033895166215644
+} else if (sample.id == "P2_S8") {
+  microns_per_pixel <- 0.503392923917596
+} else if (sample.id == "P2_S11") {
+  microns_per_pixel <- 0.5034411112485763
+}
+
+
+filter <- T
+denoise <- F
+denoise.vars.to.regress <- c("heat.shock.signature", "postmortem.sensitive", "postmortem.signature")
+denoise.vars.to.regress <- sort(denoise.vars.to.regress)
+
+if (denoise) {
+  denoise.label <- paste0(denoise.vars.to.regress, collapse = "_")
+} else {
+  denoise.label <- FALSE
+}
+
+output.dir <- paste0(results.dir, sample.id, "/")
+dir.create(output.dir)
+
+output.dir <- paste0(output.dir, sample.id, "_denoise.", denoise.label, "_filter.", filter, "/")
+dir.create(output.dir)
+dir.create(paste0(output.dir, "qc/"))
+dir.create(paste0(output.dir, "oligos/"))
+dir.create(paste0(output.dir, "markers/"))
+dir.create(paste0(output.dir, "inferCNV/"))
+dir.create(paste0(output.dir, "malignant/"))
+dir.create(paste0(output.dir, "clusters/"))
+dir.create(paste0(output.dir, "ligand_receptor/"))
+dir.create(paste0(output.dir, "seurat_objs/"))
+dir.create(paste0(output.dir, "segmented/"))
+dir.create(paste0(output.dir, "segmented/", "qc/"))
+dir.create(paste0(output.dir, "segmented/", "oligos/"))
+dir.create(paste0(output.dir, "segmented/", "spatial/"))
+dir.create(paste0(output.dir, "segmented/", "spatial/", "oligos_only/"))
+dir.create(paste0(output.dir, "segmented/", "spatial/", "interactions/"))
+dir.create(paste0(output.dir, "segmented/", "spatial/", "by_gene/"))
+dir.create(paste0(output.dir, "segmented/", "by_cluster/"))
+dir.create(paste0(output.dir, "segmented/", "by_gene/"))
+dir.create(paste0(output.dir, "segmented/", "spatial/", "features/"))
+dir.create(paste0(output.dir, "seurat_objs/"))
+
+
+oligo.jakel2019.signatures[["Oligo4"]] <- NULL # not enough genes
+
+set.seed(123)
+
+if (sample.id %in% c("P1_A5", "P2_S1")) {
+  visium.data.dir <- paste0(raw.data.dir, "HTS_SO187/")
+} else {
+  visium.data.dir <- paste0(raw.data.dir, "HTS_SO231/")
+}
+
+spatial.featureplot.scale.fill <- scale_fill_viridis_c(option = "inferno")
+spatial.featureplot.scale.color <- scale_color_viridis_c(option = "inferno")
+
+radius.use.spatial <- 100
+
+figures.dir <- paste0(root.dir, "Figures/", "Figure 5/", "VisiumHD/")
+```
+
+
+
+# Read in annotated Seurat object
+```{r}
+seurat.obj <- readRDS(paste0(output.dir, "seurat_objs/", "segmented.seurat.obj.w.annotations.RDS"))
+
+seurat.obj@meta.data <- seurat.obj@meta.data %>% dplyr::mutate(celltype = case_when(
+  celltype %in% c("MES-like", "AC-like", "OPC-like", "NPC-like") ~ "Malignant",
+  celltype %in% c("Oligodendrocytes/Malignant", "Myeloid/Malignant", "Vascular/Oligodendrocytes", "Myeloid/Oligodendrocytes", "Neuronal") ~ "Ambiguous",
+  TRUE ~ celltype
+))
+
+data <- FetchData(seurat.obj, vars = c("FGF1", "FGF2", "FGFR1", "FGFR2"))
+seurat.obj <- AddMetaData(seurat.obj, data)
+
+metadata.df <- seurat.obj@meta.data
+```
+
+
+
+# Read in H&E image
+```{r}
+# capture area of Visium HD
+x.min <- range(seurat.obj$x)[1]
+x.max <- range(seurat.obj$x)[2]
+y.min <- range(seurat.obj$y)[1]
+y.max <- range(seurat.obj$y)[2]
+
+if (sample.id == "P2_S1") {
+  he.dir <- paste0(root.dir, "RawData/", "visium_images/", "P1_A5_P2_S1/", "HE/")
+  r <- rast(paste0(he.dir, "HTS_SO187_08_P2_S1_Visium_HD_Lane_2.tif"))
+} else if (sample.id == "P1_A5") {
+  he.dir <- paste0(root.dir, "RawData/", "visium_images/", "P1_A5_P2_S1/", "HE/")
+  r <- rast(paste0(he.dir, "HTS_SO187_07_P1_A5_Visium_HD_Lane_2.tif"))
+} else if (sample.id == "P2_S8") {
+  he.dir <- paste0(root.dir, "RawData/", "visium_images/",  "P2_S11_P2_S8/", "HE/")
+  r <- rast(paste0(he.dir, "HTS_SO231_01_Visium_HD_P2_S8_S1_L001_HE.tif"))
+} else if (sample.id == "P2_S11") {
+  he.dir <- paste0(root.dir, "RawData/", "visium_images/",  "P2_S11_P2_S8/", "HE/")
+  r <- rast(paste0(he.dir, "HTS_SO231_02_Visium_HD_P2_S11_S2_L001_HE.tif"))
+}
+
+# crop to Visium HD capture area
+crop_ext <- ext(
+  x.min, x.max,
+  y.min, y.max
+)
+
+r_crop <- crop(r, crop_ext)
+r_df <- as.data.frame(r_crop, xy = TRUE)
+colnames(r_df)[1:5] <- c("x", "y", "r", "g", "b")
+r_df %>% head()
+r_df <- na.omit(r_df)
+range(r_df$x)
+
+r_small <- aggregate(r, fact = 4, fun = mean)
+r_small_crop <- crop(r_small, crop_ext)
+r_small_df <- as.data.frame(r_small_crop, xy = TRUE)
+colnames(r_small_df)[1:5] <- c("x", "y", "r", "g", "b")
+r_small_df %>% head()
+
+
+save.tiff <- F
+if (save.tiff) {
+  r_flipped <- flip(r_crop, direction = "vertical")
+  terra::writeRaster(r_flipped, paste0(he.dir, sample.id, "_HE_cropped.tif"), 
+                     overwrite = TRUE,
+                     datatype = "INT1U", 
+                     gdal = c("COMPRESS=LZW", "TILING=YES"))
+}
+
+```
+
+
+
+# Spatial plot by cell type
+```{r}
+# --- New Dedicated Helper Function ---
+get.ordered.count.labels <- function(metadata.col, mapping, breaks_order) {
+  cell.counts <- table(metadata.col)
+  existing_breaks <- breaks_order[breaks_order %in% names(cell.counts)]
+  
+  labels.w.counts <- paste0(
+    existing_breaks,
+    " (n=", as.integer(cell.counts[existing_breaks]), ")"
+  )
+  names(labels.w.counts) <- existing_breaks
+  
+  color.scale.w.counts <- scale_color_manual(
+    labels = labels.w.counts,
+    breaks = existing_breaks,
+    values = mapping[existing_breaks]
+  )
+  return(color.scale.w.counts)
+}
+
+# --- 1. LEGEND ORDER (Strict and Ordered, NOT Shuffled) ---
+# Get all types, pull "Ambiguous", and sort the rest cleanly (e.g., alphabetically or default)
+all_types <- unique(as.character(seurat.obj$celltype))
+other_types_ordered <- sort(all_types[all_types != "Ambiguous"]) 
+
+# Combine them so "Ambiguous" is strictly at the bottom of the legend
+new_legend_order <- c(other_types_ordered, "Ambiguous")
+seurat.obj$celltype <- factor(seurat.obj$celltype, levels = new_legend_order)
+
+# --- 2. Color Mapping Definition ---
+new.annotation.colors <- c(
+  "Ambiguous"                  = "#EEEEEE", 
+  "Malignant"                  = "#D55E00", 
+  "Astrocytes"                 = "#228B22",  
+  "Oligodendrocytes"           = "#A6D854",
+  "OPC"                        = "#F0E442",
+  "Neurons"                    = "#8EE5EE",  
+  "Myeloid"                    = "#084594",  
+  "Vascular"                   = "#7A0177",  
+  "Immune/Vascular/Stromal"    = "#888888"   
+)
+
+# --- 3. Generate Scales ---
+celltypes.color.scale <- get.ordered.count.labels(
+  metadata.col = seurat.obj$celltype, 
+  mapping = new.annotation.colors, 
+  breaks_order = levels(seurat.obj$celltype)
+)
+
+# --- 4. Plotting Loop ---
+for (y in c("celltype")) {
+  
+  if (y == "celltype") {
+    color.scale.use <- celltypes.color.scale
+    color.labs.use <- "Cell type"
+  } else if (y == "celltype.by.cluster.fine") {
+    color.scale.use <- celltypes.fine.color.scale
+    color.labs.use <- y
+  } else {
+    color.scale.use <- celltypes.split.color.scale
+    color.labs.use <- y
+  }
+  
+  # --- CRITICAL FIX FOR THE DOTS ---
+  plot_df <- seurat.obj@meta.data
+  
+  # 1. Split the data frame into Ambiguous vs the rest
+  ambig_df <- plot_df[plot_df[[y]] == "Ambiguous", ]
+  others_df <- plot_df[plot_df[[y]] != "Ambiguous", ]
+  
+  # 2. Randomly shuffle the row order of all the OTHER cell types 
+  # This stops them from stacking uniformly and mixes their dots on the plot
+  others_df <- others_df[sample(nrow(others_df)), ]
+  
+  # 3. Bind them back together with Ambiguous FIRST 
+  # Because it's first in the data frame, ggplot draws Ambiguous at the very bottom layer of dots
+  plot_df_final <- rbind(ambig_df, others_df)
+  
+  p <- ggplot() +
+    geom_raster(
+      data = r_small_df,
+      aes(
+        x = x * microns_per_pixel,
+        y = y * microns_per_pixel,
+        fill = rgb(r, g, b, maxColorValue = 255)
+      )
+    ) +
+    scale_fill_identity() +
+    geom_point(
+      data = plot_df_final, # Using the precisely ordered/shuffled data frame
+      aes(x = x * microns_per_pixel, 
+          y = y * microns_per_pixel, 
+          color = .data[[y]]),
+      size = 0.4,
+      alpha = 0.9
+    ) +
+    color.scale.use +
+    guides(color = guide_legend(override.aes = list(size = 5))) +
+    coord_equal(expand = FALSE) +
+    scale_y_reverse() +
+    xlab("x (microns)") +
+    ylab("y (microns)") +
+    labs(color = color.labs.use) +
+    ggtitle(sample.id)
+  
+  pdf(paste0(figures.dir, sample.id, "_spatialplot_by_", y, ".pdf"), width = 11, height = 8)
+  print(p)
+  dev.off()
+}
+```
+
+
+
+# Signatures in oligodendrocytes with tumor in red as reference
+```{r}
+for (y in c("reactive.oligo.general", "acute.demyelination", "acute.de.re.myelination")) {
+  
+  y.title <- case_when(
+    y == "reactive.oligo.general" ~ "Reactive OL sig\nin OLs",
+    y == "acute.demyelination" ~ "Demyelination sig\nin OLs",
+    y == "acute.de.re.myelination" ~ "Remyelination sig\nin OLs",
+    TRUE ~ y
+  )
+  
+  data <- metadata.df
+  data$score <- data[[y]]
+  
+  # tumor cells
+  tumor_data <- data %>% dplyr::filter(celltype == "Malignant")
+  
+  # oligodendrocytes
+  oligo_data <- data %>% filter(celltype == "Oligodendrocytes")
+  oligo_data <- oligo_data %>% dplyr::arrange(score)
+  
+  # 3. Define Background
+  background_cells <- data %>%
+    filter(!(cell_id %in% tumor_data$cell_id) & !(cell_id %in% oligo_data$cell_id))
+  
+  # 4. Create Plot
+  plot_title <- paste0(sample.id)
+  
+  p <- ggplot() +
+    # 1. DISCRETE LAYER: Background & Tumor (Mapped inside aes)
+    geom_point(data = background_cells, aes(x.microns, y.microns, color = "Background"), size = 0.4) +
+    geom_point(data = tumor_data, aes(x.microns, y.microns, color = "Malignant"), size = 0.4) +
+    
+    # Define colors for the discrete labels and drop 'Background' from legend if desired
+    scale_color_manual(name = "Cell Type", 
+                       values = c("Background" = "gray15", "Malignant" = "#E41A1C"),
+                       breaks = c("Malignant")) + # Only 'Malignant' will show in this legend
+    
+    # 2. RESET THE COLOR SCALE HERE
+    new_scale_color() +
+    
+    # 3. CONTINUOUS LAYER: Oligodendrocytes
+    geom_point(data = oligo_data, aes(x.microns, y.microns, color = score), size = 0.8) +
+    scale_color_gradientn(colors = c("#000044", "#377EB8", "#A6CEE3"), 
+                          name = paste(y.title),
+                          limits = quantile(oligo_data$score, c(0.01, 0.99), na.rm = TRUE),
+                          oob = scales::squish) +
+    
+    coord_fixed() +
+    theme(
+      plot.background = element_rect(fill = "black", color = NA),
+      panel.background = element_rect(fill = "black", color = NA),
+      legend.text = element_text(color = "white"),
+      legend.title = element_text(color = "white"),
+      plot.title = element_text(color = "white"),
+      plot.margin = margin(10, 10, 10, 10),
+      axis.text.x = element_text(colour = "white"),
+      axis.text.y = element_text(colour = "white"),
+      axis.title.x = element_text(colour = "white"),
+      axis.title.y = element_text(colour = "white"),
+      legend.background = element_rect(fill = "transparent", color = NA),
+      legend.box.background = element_rect(fill = "transparent", color = NA),
+      legend.key = element_rect(fill = "transparent", color = NA)
+    ) +
+    labs(title = plot_title) +
+    scale_y_reverse() +
+    xlab("x (microns)") +
+    ylab("y (microns)")
+  
+  pdf(paste0(figures.dir, sample.id, "_spatial_", y, ".pdf"), 
+      width = 11, height = 8)
+  print(p)
+  dev.off()
+}
+```
+
+
+
+# Interaction plotting
+```{r}
+data <- metadata.df
+ligands <- c("FGF1", "FGF2")
+receptors <- c("FGFR1", "FGFR2")
+
+ligand_data <- data %>% dplyr::filter(celltype == "Malignant")
+
+# Calculate Ligand Score (Average if multiple)
+ligand_label <- paste(ligands, collapse = "+")
+if (length(ligands) > 1) {
+  ligand_data$ligand_score <- rowSums(ligand_data[, ligands, drop = FALSE], na.rm = TRUE)
+} else {
+  ligand_data$ligand_score <- ligand_data[[ligands]]
+}
+
+ligand_signal <- ligand_data %>% filter(ligand_score > 0) %>% arrange(ligand_score)
+
+# 2. Filter Receptor Cells (Oligos)
+oligo_data <- data %>% filter(celltype == "Oligodendrocytes")
+
+# Calculate Receptor Score (Average if multiple)
+receptor_label <- paste(receptors, collapse = "+")
+if (length(receptors) > 1) {
+  oligo_data$receptor_score <- rowSums(oligo_data[, receptors, drop = FALSE], na.rm = TRUE)
+} else {
+  oligo_data$receptor_score <- oligo_data[[receptors]]
+}
+
+oligo_signal <- oligo_data %>% filter(receptor_score > 0) %>% arrange(receptor_score)
+
+# 3. Define Background
+background_cells <- data %>%
+  filter(!(cell_id %in% ligand_signal$cell_id) & !(cell_id %in% oligo_signal$cell_id))
+
+# 4. Create Plot
+plot_title <- sample.id#paste0("GBM ", " (", ligand_label, ") -> OL (", receptor_label, ")")
+
+p <- ggplot() +
+  # Background
+  geom_point(data = background_cells, aes(x.microns, y.microns), color = "gray15", size = 0.4) +
+  
+  # Receptor Layer (Blue)
+  geom_point(data = ligand_signal, aes(x.microns, y.microns, color = ligand_score), size = 0.8) +
+  scale_color_gradientn(colors = c("#440000", "#E41A1C", "#FB9A99"), 
+                        name = paste(ligand_label, "\nin GBM"),
+                        limits = quantile(ligand_signal$ligand_score, c(0.05, 0.95), na.rm = TRUE),
+                        oob = scales::squish) +
+
+  # Ligand Layer (Red)
+  new_scale_color() +
+  geom_point(data = oligo_signal, aes(x.microns, y.microns, color = receptor_score), size = 0.8) +
+  scale_color_gradientn(colors = c("#000044", "#377EB8", "#A6CEE3"), 
+                        name = paste(receptor_label, "\nin OLs"),
+                        limits = quantile(oligo_signal$receptor_score, c(0.05, 0.95), na.rm = TRUE),
+                        oob = scales::squish) +  
+  
+  coord_fixed() +
+  theme(
+    plot.background = element_rect(fill = "black", color = NA),
+    panel.background = element_rect(fill = "black", color = NA),
+    legend.text = element_text(color = "white"),
+    legend.title = element_text(color = "white"),
+    plot.title = element_text(color = "white"),
+    plot.margin = margin(10, 10, 10, 10),
+    axis.text.x = element_text(colour = "white"),
+    axis.text.y = element_text(colour = "white"),
+    axis.title.x = element_text(colour = "white"),
+    axis.title.y = element_text(colour = "white"),
+    legend.background = element_rect(fill = "transparent", color = NA),
+    legend.box.background = element_rect(fill = "transparent", color = NA),
+    legend.key = element_rect(fill = "transparent", color = NA)
+  ) +
+  labs(title = plot_title) +
+  scale_y_reverse() +
+  xlab("x (microns)") +
+  ylab("y (microns)")
+
+
+pdf(paste0(figures.dir, sample.id, "_spatial_FGF_FGFR.pdf"), width = 11, height = 8)
+print(p)
+dev.off()
+```
+
+
+
+# Neighborhood, GBM- vs GBM+
+```{r}
+radius.use <- radius.use.spatial
+neighborhood.dir <- paste0(root.dir, "Results/", "my_data/", "autopsy/", "visium/", sample.id, "/", sample.id, "_denoise.FALSE_filter.TRUE/", "segmented/", "neighborhood_radius=", radius.use, "_microns/")
+oligos.metadata.df <- read.csv(paste0(neighborhood.dir, sample.id, "_FGFFGF1.FGF2_oligos.metadata_FGF.tsv"), sep = "\t", row.names = 1)
+
+oligos.metadata.df$GBM_frac <- oligos.metadata.df$FGFneg_GBM_nb_frac + oligos.metadata.df$FGFpos_GBM_nb_frac
+oligos.metadata.df$neighborhood.annotation <- case_when(
+  oligos.metadata.df[["GBM_frac"]] > 0 ~ "GBM+",
+  TRUE ~ "GBM-"
+)
+
+for (y in c("reactive.oligo.general", "acute.demyelination", "acute.de.re.myelination")) {
+  
+  y.label <- case_when(
+    y %in% c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific") ~ "Reactive oligodendrocyte signature\nin oligodendrocytes",
+    y == "acute.demyelination" ~ "Demyelination signature\nin oligodendrocytes",
+    y == "acute.remyelination" ~ "Remyelination signature\nin oligodendrocytes",
+    y == "acute.de.re.myelination" ~ "Remyelination signature\nin oligodendrocytes",
+    TRUE ~ ""
+  )
+  
+  do.boxplot(
+      oligos.metadata.df,
+      x.variable = "neighborhood.annotation",
+      y.variable = y,
+      boxplot.fill.variable = NULL,
+      fill.scale = NULL,
+      xlab.label = "Neighborhood (100 microns)",
+      ylab.label = y.label,
+      ggtitle.label = NULL,
+      show.points = FALSE,
+      points.alpha = 0.6,
+      outlier.shape = TRUE,
+      comparisons = list(c("GBM-", "GBM+")),
+      alternative = "less",
+      y.adjust = 0,             
+      step.increase = 0.1,      
+      p.adj.method = "fdr",
+      save.figure = TRUE,
+      output.filepath = paste0(figures.dir, sample.id, "_neighborhood.annotation_vs_", y, ".pdf"),
+      image.width = 8,
+      image.height = 6,
+      return.plot = FALSE,
+      verbose = FALSE,
+      facet.by = NULL,
+      vars.to.regress = NULL,
+      free_y = TRUE,
+      facet.nrow = 1
+  ) 
+}
+
+```
+
+
+
+# All samples, Neighborhood, GBM- vs GBM+ FGF-, GBM+ FGF+
+```{r}
+radius.use <- radius.use.spatial
+y <- "reactive.oligo.general"
+y.label <- "Reactive oligodendrocyte signature\nin oligodendrocytes"
+
+df <- data.frame()
+
+for (sample.id in c("P2_S1", "P1_A5", "P2_S11")) { # c("P2_S1", "P1_A5", "P2_S11")
+  neighborhood.dir <- paste0(root.dir, "Results/", "my_data/", "autopsy/", "visium/", sample.id, "/", sample.id, "_denoise.FALSE_filter.TRUE/", "segmented/", "neighborhood_radius=", radius.use, "_microns/")
+  oligos.metadata.df <- read.csv(paste0(neighborhood.dir, sample.id, "_FGFFGF1.FGF2_oligos.metadata_FGF.tsv"), sep = "\t", row.names = 1)
+  row.df <- oligos.metadata.df %>% dplyr::select(reactive.oligo.general, neighborhood.annotation, sample.id)
+  df <- rbind(df, row.df)
+}
+df$neighborhood.annotation <- sapply(df$neighborhood.annotation, function(x) case_when(
+  x == "GBM FGF1.FGF2-" ~ "GBM FGF1/2-",
+  x == "GBM FGF1.FGF2+" ~ "GBM FGF1/2+",
+  TRUE ~ x
+))
+df$sample.desc <- sapply(df$sample.id, function(x) case_when(
+  x == "P1_A5" ~ "GBM 1 Edge",
+  x == "P2_S1" ~ "GBM 2 Core",
+  x == "P2_S11" ~ "GBM 2 Brainstem",
+  TRUE ~ x
+))
+df$neighborhood.annotation <- factor(df$neighborhood.annotation, levels = c("GBM-", "GBM FGF1/2-", "GBM FGF1/2+"))
+df$sample.desc <- factor(df$sample.desc, levels = c("GBM 1 Edge", "GBM 2 Core", "GBM 2 Brainstem"))
+
+do.boxplot(
+    df,
+    x.variable = "neighborhood.annotation",
+    y.variable = y,
+    boxplot.fill.variable = NULL,
+    fill.scale = NULL,
+    xlab.label = "Neighborhood (100 microns)",
+    ylab.label = y.label,
+    ggtitle.label = NULL,
+    show.points = FALSE,
+    points.alpha = 0.6,
+    outlier.shape = TRUE,
+    comparisons = list(c("GBM-", "GBM FGF1/2-"), c("GBM-", "GBM FGF1/2+"), c("GBM FGF1/2-", "GBM FGF1/2+")),
+    alternative = "less",
+    y.adjust = 0,             
+    step.increase = 0.1,      
+    p.adj.method = "fdr",
+    save.figure = TRUE,
+    output.filepath = paste0(figures.dir, "neighborhood.annotation.FGF_vs_", y, ".pdf"),
+    image.width = 16,
+    image.height = 6,
+    return.plot = FALSE,
+    verbose = FALSE,
+    facet.by = "sample.desc",
+    vars.to.regress = NULL,
+    free_y = F,
+    facet.nrow = 1
+) 
+
+
+```
+
+

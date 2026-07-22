@@ -1,0 +1,1012 @@
+---
+title: "my_data_preprocessing.RMD"
+output: html_document
+date: "2026-04-23"
+---
+
+
+# Setup
+```{r}
+library(tidyverse)
+library(readxl)
+library(Seurat)
+library(infercnv)
+library(pals)
+library(ggrepel)
+library(ggprism)
+library(ggpubr)
+library(RColorBrewer)
+library(DoubletFinder)
+library(rstatix)
+library(liana)
+
+
+root.dir <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Projects/Jackie_post-mortem/"
+
+suppressMessages(suppressWarnings(source(paste0(root.dir, "Code/", 'helper_functions.R'))))
+
+
+results.dir <- paste0(root.dir, "Results/", "my_data/", "autopsy/")
+processed.data.dir <- paste0(root.dir, "ProcessedData/", "my_data/", "autopsy/")
+
+sample.id <- "all_postmortem_samples" 
+
+if (sample.id == "all_postmortem_samples") {
+  sample.info.df <- read_excel(paste0(root.dir, "RawData/", "autopsy_sample_information.xlsx"), sheet = 1) %>% filter(`Patient` %in% c("P1", "P2", "P4"))
+  cluster.info.df <- read_excel(paste0(root.dir, "RawData/", "autopsy_sample_information.xlsx"), sheet = 2) %>% filter(`Patient` == "all_postmortem_samples")
+} else {
+  sample.info.df <- read_excel(paste0(root.dir, "RawData/", "autopsy_sample_information.xlsx"), sheet = 1) %>% filter(`Patient` == sample.id)
+  cluster.info.df <- read_excel(paste0(root.dir, "RawData/", "autopsy_sample_information.xlsx"), sheet = 2) %>% filter(`Patient` == sample.id)
+}
+
+set.seed(123)
+```
+
+
+
+# Settings 
+```{r}
+cd45.neg.ref.use  <- "velmeshev2019"
+start.from.scratch <- F
+
+denoise           <- F
+denoise.vars.to.regress <- c("heat.shock.signature", "postmortem.sensitive", "postmortem.signature")
+
+
+filter            <- F
+if (denoise && filter) {
+  filter.low.qc   <- T # if TRUE filter the same as not denoising
+}
+
+cellbender        <- F
+batch.correction  <- "None"
+
+if (denoise) {
+  denoise.label <- paste0(denoise.vars.to.regress, collapse = "_")
+} else {
+  denoise.label <- "FALSE"
+}
+
+if (filter) {
+  if (denoise && filter.low.qc) {
+    filter.label <- "TRUE.low.qc"
+  } else {
+    filter.label <- "TRUE"
+  } 
+} else {
+  filter.label <- "FALSE"
+}
+
+
+# make output directories
+output.dir <- paste0(sample.id, "_cellbender.", cellbender, "_denoise.", denoise.label, "_filter.", filter, "_batch.correction.", batch.correction, "/")
+dir.create(paste0(results.dir, output.dir))
+dir.create(paste0(results.dir, output.dir, "qc/"))
+dir.create(paste0(results.dir, output.dir, "umap/"))
+dir.create(paste0(results.dir, output.dir, "pca/"))
+dir.create(paste0(results.dir, output.dir, "markers/"))
+dir.create(paste0(results.dir, output.dir, "malignant/"))
+dir.create(paste0(results.dir, output.dir, "malignant/", "neftel/"))
+dir.create(paste0(results.dir, output.dir, "malignant/", "tirosh/"))
+dir.create(paste0(results.dir, output.dir, "celltype_prediction/"))
+dir.create(paste0(results.dir, output.dir, "oligodendrocytes/"))
+dir.create(paste0(results.dir, output.dir, "interactions/"))
+
+cd45.neg.refs <- c("velmeshev2019", "herring2022")
+for (ref in cd45.neg.refs) {
+  dir.create(paste0(results.dir, output.dir, "celltype_prediction/", ref, "/"))
+  dir.create(paste0(results.dir, output.dir, "celltype_prediction/", ref, "/", "celltype_composition/"))
+  dir.create(paste0(results.dir, output.dir, "celltype_prediction/", ref, "/", "celltypes_by_cluster/"))
+  dir.create(paste0(results.dir, output.dir, "celltype_prediction/", ref, "/", "filtered_out_by_celltype/"))
+  dir.create(paste0(results.dir, output.dir, "celltype_prediction/", ref, "/", "prediction_scores/"))
+}
+dir.create(paste0(results.dir, output.dir, "by_sample_id/"))
+dir.create(paste0(results.dir, output.dir, "metaprograms/"))
+dir.create(paste0(results.dir, output.dir, "inferCNV/"))
+
+dir.create(paste0(processed.data.dir, output.dir))
+dir.create(paste0(processed.data.dir, output.dir, "seurat_objects/"))
+dir.create(paste0(processed.data.dir, output.dir, "seurat_objects/", "scalopOutput/"))
+```
+
+
+
+
+
+# Standard Seurat pipeline on data
+```{r}
+# use saved object before filter if exists
+output.dir.save <- paste0(sample.id, "_cellbender.", cellbender, "_denoise.", "FALSE", "_filter.", filter, "_batch.correction.", batch.correction, "/")
+seurat.obj.save <- paste0(processed.data.dir, output.dir.save, "seurat_objects/", sample.id, "_save.RDS")
+
+
+set.seed(123)
+if (!start.from.scratch && file.exists(seurat.obj.save)) {
+  print(paste0("Reading in seurat object from ", seurat.obj.save))
+  seurat.obj <- readRDS(seurat.obj.save)  
+} else {
+  # read in data for each sample and merge
+  seurat.obj.list <- list()
+  for (i in 1:nrow(sample.info.df)) {
+    sample.df <- sample.info.df[i, ]
+    full.sample.id <- sample.df$`Sample ID`
+    
+    print("=====")
+    print(full.sample.id)
+    
+    if (cellbender) {
+      counts.data <- Read10X_h5(paste0(root.dir, sample.df$`Cell Ranger output path`, "post_cellbender_feature_bc_matrix_filtered_seurat.h5"), use.names = TRUE)
+    } else {
+      counts.data <- Read10X_h5(paste0(root.dir, sample.df$`Cell Ranger output path`, "filtered_feature_bc_matrix.h5"))
+    }
+    
+    # downsample to save space
+    if (ncol(counts.data) > 10000) {
+      counts.data <- counts.data[, sample(ncol(counts.data), 10000)]
+    }
+    
+    seurat.obj <- CreateSeuratObject(counts.data)
+    print(paste('count matrix # of genes:', dim(seurat.obj)[1]))
+    print(paste('count matrix # of cells:', dim(seurat.obj)[2]))
+    
+    patient.id <- sample.df$`Patient`
+    seurat.obj$patient <- patient.id
+    patient.desc <- case_when(
+      patient.id == "P1" ~ "GBM 1",
+      patient.id == "P2" ~ "GBM 2",
+      patient.id == "P4" ~ "IDH-mut 1",
+      TRUE ~ NA
+    )
+    
+    seurat.obj$patient.desc <- patient.desc
+    seurat.obj$section <- sample.df$Section
+    seurat.obj$patient.section <- paste(seurat.obj$patient, seurat.obj$section)
+    seurat.obj$sample.id <- full.sample.id
+    seurat.obj$method <- sample.df$Method
+    seurat.obj$location <- sample.df$`Location`
+    seurat.obj$sample.desc <- paste(seurat.obj$patient.desc, seurat.obj$location)
+    seurat.obj$sample.desc.method <- paste(seurat.obj$sample.desc, seurat.obj$method)
+    
+    print("unique(seurat.obj$sample.desc)")
+    print(unique(seurat.obj$sample.desc))
+    
+    # add percent.mt
+    seurat.obj[["percent.mt"]] <- PercentageFeatureSet(seurat.obj, pattern = "^MT-") 
+    seurat.obj[["percent.mt"]] <- sapply(seurat.obj[["percent.mt"]], function(x) ifelse(is.na(x), 0, x)) # set percent.mt NA to zero for now (for cellbender)
+    
+    
+    seurat.obj <- NormalizeData(seurat.obj)
+    seurat.obj.list[[full.sample.id]] <- seurat.obj
+  }
+  
+  
+  if (length(seurat.obj.list) > 1) {
+    seurat.obj <- merge(seurat.obj.list[[1]], seurat.obj.list[2:length(seurat.obj.list)], add.cell.ids=names(seurat.obj.list), merge.data=T)
+    seurat.obj[["RNA"]] <- JoinLayers(seurat.obj[["RNA"]])
+  }
+  
+  seurat.obj <- NormalizeData(seurat.obj)
+  
+  set.seed(123)
+  seurat.obj <- add.module.score(seurat.obj, gene.signatures)
+  
+  print("Number of cells unfiltered")
+  print(dim(seurat.obj))
+  
+  
+  # QC plot
+  assay.use <- "RNA"
+  p1 <- VlnPlot(seurat.obj, pt.size=0, features = c("nFeature_RNA"), ncol = 1, group.by = "sample.id", assay = assay.use) + geom_hline(yintercept = nFeature_RNA.cutoff.low, color='red') + geom_hline(yintercept = nFeature_RNA.cutoff.high, color='red') + NoLegend()
+  p2 <- VlnPlot(seurat.obj, pt.size=0, features = c("nCount_RNA"), ncol = 1, group.by = "sample.id", assay = assay.use) + geom_hline(yintercept = nCount_RNA.cutoff.low, color='red') +  geom_hline(yintercept = nCount_RNA.cutoff.high, color='red') + NoLegend()
+  p3 <- VlnPlot(seurat.obj, pt.size=0, features = c("percent.mt"), ncol = 1, group.by = "sample.id", assay = assay.use) + geom_hline(yintercept = percent.mt.cutoff, color='red') + geom_hline(yintercept = percent.mt.cutoff.filter.out, color='red') + NoLegend()
+  p4 <- VlnPlot(seurat.obj, pt.size=0, features = c("postmortem.signature"), ncol = 1, group.by = "sample.id", assay = assay.use) + geom_hline(yintercept = post.mortem.noise.cutoff, color='red') + NoLegend()
+  p5 <- VlnPlot(seurat.obj, pt.size=0, features = c("postmortem.sensitive"), ncol = 1, group.by = "sample.id", assay = assay.use) + NoLegend()
+  p6 <- VlnPlot(seurat.obj, pt.size=0, features = c("postmortem.glial"), ncol = 1, group.by = "sample.id", assay = assay.use) + NoLegend()
+  p7 <- VlnPlot(seurat.obj, pt.size=0, features = c("heat.shock.signature"), ncol = 1, group.by = "sample.id", assay = assay.use) + NoLegend()
+  
+  p <- p1 + p2 + p3 + p4 + p5 + p6 + p7
+  pdf(paste0(results.dir, output.dir, "qc/", sample.id, "_QC.before.filter.pdf"), width=8, height=32)
+  print(p)
+  dev.off()
+  
+  
+  # remove very low quality cells
+  seurat.obj$filter.out <- apply(seurat.obj@meta.data, 1, function(row) (as.numeric(row[['nCount_RNA']]) < nCount_RNA.cutoff.filter.out) | (as.numeric(row[['percent.mt']]) > percent.mt.cutoff.filter.out))
+  
+  seurat.obj <- subset(seurat.obj, subset = (filter.out == FALSE))
+  print("After removing very low quality cells:")
+  print(dim(seurat.obj))
+  
+  
+  
+  # QC plot after filter
+  p1 <- VlnPlot(seurat.obj, pt.size=0, features = c("nFeature_RNA"), ncol = 1, group.by = "sample.id", assay = assay.use) + geom_hline(yintercept = nFeature_RNA.cutoff.low, color='red') + geom_hline(yintercept = nFeature_RNA.cutoff.high, color='red') + NoLegend()
+  p2 <- VlnPlot(seurat.obj, pt.size=0, features = c("nCount_RNA"), ncol = 1, group.by = "sample.id", assay = assay.use) + geom_hline(yintercept = nCount_RNA.cutoff.low, color='red') +  geom_hline(yintercept = nCount_RNA.cutoff.high, color='red') + NoLegend()
+  p3 <- VlnPlot(seurat.obj, pt.size=0, features = c("percent.mt"), ncol = 1, group.by = "sample.id", assay = assay.use) + geom_hline(yintercept = percent.mt.cutoff, color='red') + geom_hline(yintercept = percent.mt.cutoff.filter.out, color='red') + NoLegend()
+  p4 <- VlnPlot(seurat.obj, pt.size=0, features = c("postmortem.signature"), ncol = 1, group.by = "sample.id", assay = assay.use) + geom_hline(yintercept = post.mortem.noise.cutoff, color='red') + NoLegend()
+  p5 <- VlnPlot(seurat.obj, pt.size=0, features = c("postmortem.sensitive"), ncol = 1, group.by = "sample.id", assay = assay.use) + NoLegend()
+  p6 <- VlnPlot(seurat.obj, pt.size=0, features = c("postmortem.glial"), ncol = 1, group.by = "sample.id", assay = assay.use) + NoLegend()
+  p7 <- VlnPlot(seurat.obj, pt.size=0, features = c("heat.shock.signature"), ncol = 1, group.by = "sample.id", assay = assay.use) + NoLegend()
+  
+  p <- p1 + p2 + p3 + p4 + p5 + p6 + p7
+  pdf(paste0(results.dir, output.dir, "qc/", sample.id, "_QC.after.filter.pdf"), width=8, height=32)
+  print(p)
+  dev.off()
+  
+  
+  
+  # define low-quality cells
+  seurat.obj$low.quality.by.qc <- apply(seurat.obj@meta.data, 1, function(row) (as.numeric(row[['nCount_RNA']]) < nCount_RNA.cutoff.low) | (as.numeric(row[['nFeature_RNA']]) < nFeature_RNA.cutoff.low) | (as.numeric(row[['percent.mt']]) > percent.mt.cutoff))
+  
+  seurat.obj$high.postmortem.noise <- apply(seurat.obj@meta.data, 1, function(row) (as.numeric(row[["postmortem.signature"]]) > post.mortem.noise.cutoff))
+  
+  table(seurat.obj$low.quality.by.qc) 
+  table(seurat.obj$high.postmortem.noise) 
+  
+  
+  # filter out low-quality/high-postmortem-noise cells
+  if (filter) {
+    if (denoise) {
+      if (filter.low.qc) {
+        seurat.obj <- subset(seurat.obj, subset = (low.quality.by.qc == FALSE))
+      } else {
+        seurat.obj <- subset(seurat.obj, subset = (high.postmortem.noise == FALSE))
+      }
+    } else {
+      seurat.obj <- subset(seurat.obj, subset = (low.quality.by.qc == FALSE))
+    }
+  }
+  
+  
+  # remove doublets
+  use.doublet.finder <- T
+  if (use.doublet.finder) {
+    print("Using doublet finder")
+    n.dims.use <- 30
+    seurat.obj.list <- list()
+    for (sample.id.i in sort(unique(seurat.obj$sample.id))) {
+      print(sample.id.i)
+      sample.dir <- paste0(results.dir, output.dir, "qc/", sample.id.i, "/")
+      dir.create(sample.dir)
+      seurat.obj.sample <- subset(seurat.obj, subset = sample.id == sample.id.i)
+      print(dim(seurat.obj.sample))
+      
+      # just use doublet finder for samples with > 25k nuclei
+      if (sample.id.i %in% c("P2 S16 10X", "P2 S16 Invent")) {
+        print("Using doublet finder")
+        seurat.obj.sample <- NormalizeData(seurat.obj.sample)
+        seurat.obj.sample <- find.doublets(seurat.obj.sample, pcs.use.doublet.finder=1:n.dims.use, qc.output.dir = sample.dir)
+        seurat.obj.sample <- subset(seurat.obj.sample, subset = (doubFind_res == "Singlet"))
+      } else {
+        seurat.obj.sample$potential.doublet <- apply(seurat.obj.sample@meta.data, 1, function(row) (as.numeric(row[['nCount_RNA']]) > nCount_RNA.cutoff.high) | (as.numeric(row[['nFeature_RNA']]) > nFeature_RNA.cutoff.high))
+        seurat.obj.sample <- subset(seurat.obj.sample, subset = (potential.doublet == FALSE))
+      }
+      
+      
+      seurat.obj.list[[sample.id.i]] <- seurat.obj.sample
+    }
+    seurat.obj <- merge(seurat.obj.list[[1]], seurat.obj.list[2:length(seurat.obj.list)])
+    seurat.obj[["RNA"]] <- JoinLayers(seurat.obj[["RNA"]])
+    
+  } else {
+    print("Not using doublet finder")
+    seurat.obj$potential.doublet <- apply(seurat.obj@meta.data, 1, function(row) (as.numeric(row[['nCount_RNA']]) > nCount_RNA.cutoff.high) | (as.numeric(row[['nFeature_RNA']]) > nFeature_RNA.cutoff.high))
+    seurat.obj <- subset(seurat.obj, subset = (potential.doublet == FALSE))
+  }
+  
+  
+  print("After doublet removal:")
+  print(dim(seurat.obj))
+  
+  
+  # cell cycle scoring
+  s.genes <- cc.genes$s.genes
+  g2m.genes <- cc.genes$g2m.genes
+  seurat.obj <- CellCycleScoring(seurat.obj, s.features = s.genes, g2m.features = g2m.genes, search = T)
+  
+  
+  
+  saveRDS(seurat.obj, paste0(processed.data.dir, output.dir, "seurat_objects/", sample.id, "_save.RDS"))
+}
+
+
+print("Starting Seurat pipeline")
+seurat.obj$tumor.adjacent <- sapply(seurat.obj$sample.id, function(x) x %ni% healthy.sections)
+
+
+# add postmortem signatures and other signatures
+seurat.obj <- add.module.score(seurat.obj, gene.signatures)
+
+
+DefaultAssay(seurat.obj) <- "RNA"
+seurat.obj <- FindVariableFeatures(seurat.obj)
+
+
+if (denoise) {
+  seurat.obj <- ScaleData(seurat.obj, vars.to.regress = denoise.vars.to.regress)
+} else {
+  seurat.obj <- ScaleData(seurat.obj)
+}
+
+set.seed(123)
+seurat.obj <- RunPCA(seurat.obj, approx=T, seed.use=42)
+p <- ElbowPlot(seurat.obj, ndims=50)
+pdf(paste0(results.dir, output.dir, "qc/", sample.id, "_elbowplot.pdf"), height=6, width=8)
+print(p)
+dev.off()
+
+
+
+num.dims <- cluster.info.df %>% filter(CellBender == cellbender, Denoise == denoise.label, Filter == filter) %>% pull(`Number of dimensions for clustering`)
+clustering.res <- cluster.info.df %>% filter(CellBender == cellbender, Denoise == denoise.label, Filter == filter) %>% pull(`Resolution for clustering`)
+
+
+seurat.obj <- FindNeighbors(seurat.obj, dims = 1:num.dims, nn.method = "rann")
+random.seed.use <- 0
+seurat.obj <- FindClusters(seurat.obj, resolution = clustering.res, random.seed = random.seed.use)
+
+
+seurat.obj$seurat_clusters <- as.character(seurat.obj$seurat_clusters)
+seurat.obj <- RunUMAP(seurat.obj, dims = 1:num.dims, n.neighbors=30, min.dist = 0.1, seed.use=42)
+
+seurat.obj$sample.id <- factor(seurat.obj$sample.id, levels = sample.ids)
+seurat.obj$patient.section <- factor(seurat.obj$patient.section, levels = patient.sections)
+seurat.obj$sample.desc <- factor(seurat.obj$sample.desc, levels = sample.descs)
+
+
+# UMAP
+if (dim(seurat.obj)[2] > 50000) {
+  do.raster <- T
+} else {
+  do.raster <- F
+}
+
+
+celltype.features <- c("PTPRC", "ITGAM", "CD247", "CD3E", "RBFOX3", "GAD1", "SLC17A7", "GFAP", "AQP4", "ALDH1L1", "OLIG2", "SOX10", "PDGFRA", "CSPG4", "MBP", "MOG", "ASPA", "ACTA2", "CLDN5", "CDK4", "MDM2", "EGFR", "MKI67")
+
+p.clusters <- DimPlot(seurat.obj, group.by = "seurat_clusters", label=T, shuffle=T, raster=F) + ggtitle("Cluster")
+p.patient <- DimPlot(seurat.obj, group.by = "patient", label=F, shuffle=T, raster=do.raster) + ggtitle("Donor")
+p.sample <- DimPlot(seurat.obj, group.by = "sample.id", label=F, shuffle=T, raster=do.raster) + ggtitle("Sample ID") + sample.ids.color.scale
+p.patient.section <- DimPlot(seurat.obj, group.by = "patient.section", label=F, shuffle=T, raster=do.raster) + ggtitle("Patient + section") + patient.sections.color.scale
+p.sample.desc <- DimPlot(seurat.obj, group.by = "sample.desc", label=F, shuffle=T, raster=F) + ggtitle("Sample description") + sample.descs.color.scale
+p.method <- DimPlot(seurat.obj, group.by = "method", label=F, shuffle=T, raster=do.raster) + ggtitle("Method")
+p.tumor.adj <- DimPlot(seurat.obj, group.by = "tumor.adjacent", label=F, shuffle=T, raster=do.raster) + ggtitle("Tumor-adjacent") + scale_color_manual(breaks=c(FALSE, TRUE), values=c("grey", "red"))
+
+p.phase <- DimPlot(seurat.obj, group.by = "Phase", shuffle=T, raster=do.raster) + ggtitle("Predicted Cell Cycle Phase")
+p.low.quality.qc <- DimPlot(seurat.obj, group.by = "low.quality.by.qc", order=T, raster=do.raster) + ggtitle("Low-quality") + scale_color_manual(breaks=c(FALSE, TRUE), values=c("grey", "red"))
+#p.doublet <- DimPlot(seurat.obj, group.by = "potential.doublet", order=T, raster=do.raster) + ggtitle("Doublet") + scale_color_manual(breaks=c(FALSE, TRUE), values=c("grey", "red"))
+p.high.postmortem.noise <- DimPlot(seurat.obj, group.by = "high.postmortem.noise", order=T, raster=do.raster) + ggtitle("High postmortem noise") + scale_color_manual(breaks=c(FALSE, TRUE), values=c("grey", "red"))
+
+p.percent.mt <- FeaturePlot(seurat.obj, features = c("percent.mt"), order=T, raster=do.raster) 
+p.ncount.rna <- FeaturePlot(seurat.obj, features = c("nCount_RNA"), order=T, raster=do.raster) 
+p.nfeature.rna <- FeaturePlot(seurat.obj, features = c("nFeature_RNA"), order=T, raster=do.raster)
+p.postmortem.noise <- FeaturePlot(seurat.obj, features = c("postmortem.signature"), order=T, raster=do.raster) + ggtitle("Postmortem noise")
+p.heat.shock <- FeaturePlot(seurat.obj, features = c("heat.shock.signature"), order=T, raster=do.raster) + ggtitle("Heat shock")
+p.postmortem.sensitive <- FeaturePlot(seurat.obj, features = c("postmortem.sensitive"), order=T, raster=do.raster) + ggtitle("Postmortem sensitive")
+p.postmortem.glial <- FeaturePlot(seurat.obj, features = c("postmortem.glial"), order=T, raster=do.raster) + ggtitle("Postmortem glial")
+p.oligo.like <- FeaturePlot(seurat.obj, features = c("oligo.like"), order=T, raster=do.raster) + ggtitle("Tumor-adjacent oligodendrocyte signature")
+
+p <- p.clusters + p.patient + p.sample + p.patient.section + p.sample.desc + p.method + p.tumor.adj +
+  p.phase + p.low.quality.qc + p.high.postmortem.noise +
+  p.percent.mt + p.ncount.rna + p.nfeature.rna + p.postmortem.noise + p.heat.shock + p.postmortem.sensitive + p.postmortem.glial + p.oligo.like
+ 
+for (g in celltype.features) {
+  p <- p + FeaturePlot(seurat.obj, features = c(g), order=T, raster=do.raster)
+}
+
+pdf(paste0(results.dir, output.dir, "umap/", sample.id, "_UMAP.pdf"), width=50, height=40)
+print(p)
+dev.off()
+
+
+
+p <- DotPlot(seurat.obj, features = celltype.features, cluster.idents = T) + coord_flip()
+pdf(paste0(results.dir, output.dir, "qc/", sample.id, "_dotplot.pdf"), width=14, height=8)
+print(p)
+dev.off()
+
+
+p <- FeaturePlot(seurat.obj, features = celltype.features, reduction = "pca", order = T)
+pdf(paste0(results.dir, output.dir, "pca/", sample.id, "_pca.pdf"), width=20, height=18)
+print(p)
+dev.off()
+
+
+
+saveRDS(seurat.obj, paste0(processed.data.dir, output.dir, "seurat_objects/", sample.id, ".RDS"))
+```
+
+
+
+
+# Find cluster markers
+```{r}
+Idents(seurat.obj) <- 'seurat_clusters'
+
+seurat.obj.downsample <- seurat.obj
+seurat.obj.downsample$downsample <- TRUE
+seurat.obj.downsample <- subset(seurat.obj.downsample, subset = downsample == TRUE, downsample = 1000)
+
+markers <- FindAllMarkers(seurat.obj.downsample, only.pos = TRUE, slot = "data", logfc.threshold = 0.25, min.pct = 0.1) # takes too long if using regressed out data
+
+write.table(markers, paste0(results.dir, output.dir, "markers/", sample.id, "_markers.tsv"), sep="\t", quote=F, row.names=F, col.names=T)
+
+markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 0.25, pct.1 > 0.1, p_val_adj < 0.05) %>%
+    slice_head(n = 10) %>%
+    ungroup() -> top10
+seurat.obj.downsample <- ScaleData(seurat.obj.downsample, features = top10$gene)
+p <- DoHeatmap(seurat.obj.downsample, features = top10$gene, raster = F) + NoLegend()
+pdf(paste0(results.dir, output.dir, 'markers/', sample.id, '_heatmap.pdf'), width=24, height=18)
+print(p)
+dev.off()
+```
+
+
+
+# Cell types by cluster
+```{r}
+seurat.obj <- readRDS(paste0(processed.data.dir, output.dir, "seurat_objects/", sample.id, ".RDS"))
+
+all.clusters <- unique(seurat.obj$seurat_clusters)
+cd45.pos.clusters <- cluster.info.df %>% filter(CellBender == cellbender, Denoise == denoise.label, Filter == filter) %>% pull(`CD45+ Clusters`) %>% str_split(", ") %>% unlist()
+malignant.clusters <- cluster.info.df %>% filter(CellBender == cellbender, Denoise == denoise.label, Filter == filter) %>% pull(`Malignant Clusters`) %>% str_split(", ") %>% unlist()
+
+
+astro.clusters <- cluster.info.df %>% filter(CellBender == cellbender, Denoise == denoise.label, Filter == filter) %>% pull(Astrocytes) %>% str_split(", ") %>% unlist()
+oligo.clusters <- cluster.info.df %>% filter(CellBender == cellbender, Denoise == denoise.label, Filter == filter) %>% pull(Oligodendrocytes) %>% str_split(", ") %>% unlist()
+opc.clusters <- cluster.info.df %>% filter(CellBender == cellbender, Denoise == denoise.label, Filter == filter) %>% pull(OPC) %>% str_split(", ") %>% unlist()
+exc.neuron.clusters <- cluster.info.df %>% filter(CellBender == cellbender, Denoise == denoise.label, Filter == filter) %>% pull(`Excitatory neurons`) %>% str_split(", ") %>% unlist()
+inh.neuron.clusters <- cluster.info.df %>% filter(CellBender == cellbender, Denoise == denoise.label, Filter == filter) %>% pull(`Inhibitory neurons`) %>% str_split(", ") %>% unlist()
+myeloid.clusters <- cluster.info.df %>% filter(CellBender == cellbender, Denoise == denoise.label, Filter == filter) %>% pull(Myeloid) %>% str_split(", ") %>% unlist()
+lymphoid.clusters <- cluster.info.df %>% filter(CellBender == cellbender, Denoise == denoise.label, Filter == filter) %>% pull(Lymphoid) %>% str_split(", ") %>% unlist()
+endothelial.clusters <- cluster.info.df %>% filter(CellBender == cellbender, Denoise == denoise.label, Filter == filter) %>% pull(Endothelial) %>% str_split(", ") %>% unlist()
+mural.clusters <- cluster.info.df %>% filter(CellBender == cellbender, Denoise == denoise.label, Filter == filter) %>% pull(Mural) %>% str_split(", ") %>% unlist()
+vascular.clusters <- cluster.info.df %>% filter(CellBender == cellbender, Denoise == denoise.label, Filter == filter) %>% pull(Vascular) %>% str_split(", ") %>% unlist()
+
+seurat.obj$celltype.by.cluster <- sapply(seurat.obj$seurat_clusters, function(x) case_when(
+  x %in% astro.clusters ~ "Astrocytes",
+  x %in% oligo.clusters ~ "Oligodendrocytes",
+  x %in% opc.clusters ~ "OPC",
+  x %in% exc.neuron.clusters ~ "Excitatory neurons",
+  x %in% inh.neuron.clusters ~ "Inhibitory neurons",
+  x %in% myeloid.clusters ~ "Myeloid",
+  x %in% lymphoid.clusters ~ "Lymphoid",
+  x %in% endothelial.clusters ~ "Endothelial",
+  x %in% mural.clusters ~ "Mural",
+  x %in% vascular.clusters ~ "Vascular",
+  x %in% malignant.clusters ~ "Malignant cluster",
+  TRUE ~ "Other"
+))
+
+DimPlot(seurat.obj, group.by = "seurat_clusters", label = T) 
+DimPlot(seurat.obj, group.by = "celltype.by.cluster") + cell.types.anotation_l2.w.quality.color.scale
+```
+
+
+
+# Cell type projection Velmeshev 2019
+```{r}
+
+# load reference
+if (denoise) {
+  reference <- readRDS(paste0(root.dir, 'ExternalData/', 'Velmeshev_2019_Autism/', 'SeuratObjects/', 'after.clean', '.velmeshev2019.autism.control.only.seurat.obj.RDS'))
+} else {
+  reference <- readRDS(paste0(root.dir, 'ExternalData/', 'Velmeshev_2019_Autism/', 'SeuratObjects/', 'before.clean', '.velmeshev2019.autism.control.only.seurat.obj.RDS'))
+}
+
+
+# use all cells. CD45+ and malignant cells are overlaid
+seurat.obj.subset <- seurat.obj#subset(seurat.obj, subset = seurat_clusters %in% setdiff(all.clusters, c(malignant.clusters, cd45.pos.clusters)))
+print(paste('cd45- cells:', dim(seurat.obj.subset)[2]))
+
+# project all cells
+anchors <- FindTransferAnchors(
+  reference = reference,
+  query = seurat.obj.subset,
+  reduction = 'pcaproject',
+  reference.reduction = "pca",
+  dims = 1:20
+)
+
+seurat.obj.subset <- MapQuery(
+  anchorset = anchors,
+  query = seurat.obj.subset,
+  reference = reference,
+  refdata = list(
+    annotation_l1 = "annotation_l1",
+    annotation_l2 = "annotation_l2",
+    annotation_l3 = "annotation_l3"
+  ),
+  reference.reduction = "pca",
+  reduction.model = "umap"
+)
+
+DimPlot(seurat.obj.subset, group.by = "predicted.annotation_l1")
+DimPlot(seurat.obj.subset, group.by = "predicted.annotation_l2")
+DimPlot(reference, group.by = "annotation_l2", reduction = "pca")
+
+write.table(seurat.obj.subset@meta.data, paste0(processed.data.dir, output.dir, 'seurat_objects/', sample.id, '_w_celltypes.non.malignant.cd45.neg.velmeshev2019.tsv'), sep = "\t", row.names = T, col.names = T)
+```
+
+
+
+# Cell type projection non-malignant CD45+ 
+```{r cd45+}
+
+# load reference
+reference <- readRDS(paste0(root.dir, 'ExternalData/', 'Satija_2021_PBMC/', 'multi.seurat.obj.RDS'))
+
+seurat.obj.subset <- subset(seurat.obj, subset = seurat_clusters %in% cd45.pos.clusters)
+print(paste('cd45+ cells:', dim(seurat.obj.subset)[2]))
+
+# project all cells
+anchors <- FindTransferAnchors(
+  reference = reference,
+  query = seurat.obj.subset,
+  reduction = 'pcaproject',
+  reference.reduction = "pca",
+  dims = 1:20
+)
+
+seurat.obj.subset <- MapQuery(
+  anchorset = anchors,
+  query = seurat.obj.subset,
+  reference = reference,
+  refdata = list(
+    annotation_l1 = "annotation_l1",
+    annotation_l2 = "annotation_l2",
+    annotation_l3 = "annotation_l3"
+  ),
+  reference.reduction = "pca",
+  reduction.model = "umap"
+)
+
+DimPlot(seurat.obj.subset, group.by = "predicted.annotation_l3")
+
+write.table(seurat.obj.subset@meta.data, paste0(processed.data.dir, output.dir, 'seurat_objects/', sample.id, '_w_celltypes.non.malignant.cd45.pos.tsv'), sep = "\t", row.names = T, col.names = T)
+```
+
+
+
+# Malignant subtypes
+```{r }
+seurat.obj.malignant <- subset(seurat.obj, subset = (seurat_clusters %in% malignant.clusters)) #  & (sample.id %ni% healthy.sections)
+seurat.obj.malignant$seurat_clusters.original <- seurat.obj.malignant$seurat_clusters
+
+
+seurat.obj.gbm <- subset(seurat.obj.malignant, subset = patient %in% c("P1", "P2"))
+seurat.obj.idh <- subset(seurat.obj.malignant, subset = patient %in% c("P4"))
+
+
+# malignant state scoring 
+seurat.obj.idh <- score.idh.mutant.state(seurat.obj.idh)
+seurat.obj.idh$idh.mutant.state <- paste0(seurat.obj.idh$idh.mutant.state, " (Tirosh)")
+seurat.obj.idh$malignant.state <- seurat.obj.idh$idh.mutant.state
+seurat.obj.gbm <- score.neftel(seurat.obj.gbm)
+seurat.obj.gbm$neftel_type <- paste0(seurat.obj.gbm$neftel_type, " (Neftel)")
+seurat.obj.gbm$malignant.state <- seurat.obj.gbm$neftel_type
+
+seurat.obj.malignant <- AddMetaData(seurat.obj.malignant, seurat.obj.idh@meta.data %>% dplyr::select(`stem-like1`, `AC-like IDH-A2`, `OC-like IDH-A3`, `AC-like IDH-O4`, `OC-like IDH-O5`, ac.score, oc.score, stemness.score, lineage.score, lineage.score.plot, idh.mutant.state, malignant.state))
+seurat.obj.malignant <- AddMetaData(seurat.obj.malignant, seurat.obj.gbm@meta.data %>% dplyr::select(ac_sig.21, mes1_sig.22, mes2_sig.23, npc1_sig.24, npc2_sig.25, opc_sig.26, ac_sig, opc_sig, mes_sig, npc_sig, stemness, neftel_x, neftel_y, neftel_type, malignant.state))
+
+
+quality.metric <- "Low quality"
+seurat.obj.gbm$neftel_type_w_quality <- apply(seurat.obj.gbm@meta.data, 1, function(row) ifelse(row[['low.quality.by.qc']], quality.metric, row[["neftel_type"]]))
+seurat.obj.idh$idh.mutant.state_w_quality <- apply(seurat.obj.idh@meta.data, 1, function(row) ifelse(row[['low.quality.by.qc']], quality.metric, row[["idh.mutant.state"]]))
+
+
+# neftel plot with additional quality annotation
+if (!filter) {
+  p <- ggplot(seurat.obj.gbm@meta.data, aes(neftel_x, neftel_y, color=neftel_type_w_quality)) + 
+    geom_point(alpha=0.6) +
+    xlab("Relative meta-module score") +
+    ylab("Relative meta-module score") +
+    facet_wrap(~sample.id) +
+    xlim(-1.6, 1.6) +
+    ylim(-1.6, 1.6) +
+    labs(color = "Malignant subtype") +
+    malignant.state.color.scale
+    
+  pdf(paste0(results.dir, output.dir, 'malignant/', 'neftel/', sample.id, '.neftel.plot.w.quality.pdf'), width = 18, height = 10)
+  print(p)
+  dev.off()
+  
+  p <- ggplot(seurat.obj.idh@meta.data, aes(lineage.score.plot, stemness.score, color=idh.mutant.state)) + 
+    geom_point(alpha=0.6) +
+    xlab("Relative meta-module score") +
+    ylab("Relative meta-module score") +
+    facet_wrap(~sample.id) +
+    xlim(-2, 2) +
+    ylim(-2, 2) +
+    labs(color = "Malignant subtype") +
+    malignant.state.color.scale 
+  
+  pdf(paste0(results.dir, output.dir, 'malignant/', 'tirosh/', sample.id, '.tirosh.plot.w.quality.pdf'), width = 7, height = 7)
+  print(p)
+  dev.off()
+}
+
+
+# neftel plot
+p <- ggplot(seurat.obj.gbm@meta.data, aes(neftel_x, neftel_y, color=neftel_type)) + 
+  geom_point(alpha=0.6) +
+  xlab("Relative meta-module score") +
+  ylab("Relative meta-module score") +
+  facet_wrap(~sample.id) +
+  xlim(-1.6, 1.6) +
+  ylim(-1.6, 1.6) +
+  labs(color = "Malignant subtype") +
+  malignant.state.color.scale 
+pdf(paste0(results.dir, output.dir, 'malignant/', 'neftel/', sample.id, '.neftel.plot.pdf'), width = 18, height = 10)
+print(p)
+dev.off()
+
+barplot.df <- seurat.obj.gbm@meta.data %>%
+  count(sample.desc, neftel_type) %>%
+  group_by(sample.desc) %>%
+  mutate(
+    percent = 100 * (n / sum(n)),
+    label = paste0(n, " (", round(percent, 0), "%)"),
+    ypos = cumsum(percent),
+    sample.desc.count = paste0(sample.desc, "\n(n=", sum(n), ")")
+  )
+
+p <- ggplot(barplot.df, aes(x = sample.desc.count, y = percent, fill = neftel_type)) + 
+  geom_bar(stat = "identity", position = "stack") +
+  xlab("Sample") +
+  ylab("Percent of malignant") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  labs(fill = "Malignant subtype") +
+  malignant.state.fill.scale 
+pdf(paste0(results.dir, output.dir, 'malignant/', 'neftel/', sample.id, '.neftel.composition.pdf'), width = 10, height = 6)
+print(p)
+dev.off()
+
+
+# tirosh plot
+p <- ggplot(seurat.obj.idh@meta.data, aes(lineage.score.plot, stemness.score, color=idh.mutant.state)) + 
+  geom_point(alpha=0.6) +
+  xlab("Relative meta-module score") +
+  ylab("Relative meta-module score") +
+  facet_wrap(~sample.id) +
+  xlim(-2, 2) +
+  ylim(-2, 2) +
+  labs(color = "Malignant subtype") +
+  malignant.state.color.scale 
+pdf(paste0(results.dir, output.dir, 'malignant/', 'tirosh/', sample.id, '.tirosh.plot.pdf'), width = 7, height = 7)
+print(p)
+dev.off()
+
+barplot.df <- seurat.obj.idh@meta.data %>%
+  count(sample.desc, idh.mutant.state) %>%
+  group_by(sample.desc) %>%
+  mutate(
+    percent = 100 * (n / sum(n)),
+    label = paste0(n, " (", round(percent, 0), "%)"),
+    ypos = cumsum(percent),
+    sample.desc.count = paste0(sample.desc, "\n(n=", sum(n), ")")
+  )
+
+p <- ggplot(barplot.df, aes(x = sample.desc.count, y = percent, fill = idh.mutant.state)) + 
+  geom_bar(stat = "identity", position = "stack") +
+  xlab("Sample") +
+  ylab("Percent of malignant") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  labs(fill = "Malignant subtype") +
+  malignant.state.fill.scale 
+pdf(paste0(results.dir, output.dir, 'malignant/', 'tirosh/', sample.id, '.tirosh.composition.pdf'), width = 6, height = 6)
+print(p)
+dev.off()
+
+
+
+# standard seurat pipeline
+seurat.obj.malignant <- NormalizeData(seurat.obj.malignant)
+seurat.obj.malignant <- FindVariableFeatures(seurat.obj.malignant)
+
+if (denoise) {
+  seurat.obj.malignant <- ScaleData(seurat.obj.malignant, vars.to.regress = denoise.vars.to.regress)
+} else {
+  seurat.obj.malignant <- ScaleData(seurat.obj.malignant)
+}
+
+set.seed(123)
+seurat.obj.malignant <- RunPCA(seurat.obj.malignant, seed.use=42, approx=T)
+
+p <- ElbowPlot(seurat.obj.malignant, ndims=50)
+pdf(paste0(results.dir, output.dir, "qc/", sample.id, "_elbowplot.malignant.pdf"), height=6, width=8)
+print(p)
+dev.off()
+
+
+num.dims.malignant <- cluster.info.df %>% filter(CellBender == cellbender, Denoise == denoise.label, Filter == filter) %>% pull(`Number of dimensions for clustering malignant`)
+clustering.res.malignant <- cluster.info.df %>% filter(CellBender == cellbender, Denoise == denoise.label, Filter == filter) %>% pull(`Resolution for clustering malignant`)
+
+seurat.obj.malignant <- FindNeighbors(seurat.obj.malignant, dims=1:num.dims.malignant, nn.method = "rann")
+seurat.obj.malignant <- FindClusters(seurat.obj.malignant, resolution = clustering.res.malignant, cluster.name = "malignant_clusters", random.seed = 0)
+seurat.obj.malignant$malignant_clusters <- as.character(seurat.obj.malignant$malignant_clusters)
+seurat.obj.malignant <- RunUMAP(seurat.obj.malignant, dims=1:num.dims.malignant, seed.use=42)
+
+
+# plot UMAP of malignant cells
+p.clusters <- DimPlot(seurat.obj.malignant, group.by = 'malignant_clusters', shuffle=T, label=T)
+p.seurat.clusters <- DimPlot(seurat.obj.malignant, group.by = 'seurat_clusters.original', shuffle=T, label=T)
+p.patient <- DimPlot(seurat.obj.malignant, group.by = 'patient', shuffle=T)
+p.sample.id <- DimPlot(seurat.obj.malignant, group.by = 'sample.id', shuffle=T) + sample.ids.color.scale
+p.patient.section <- DimPlot(seurat.obj.malignant, group.by = 'patient.section', shuffle=T) + patient.sections.color.scale
+p.sample.desc <- DimPlot(seurat.obj.malignant, group.by = 'sample.desc', shuffle=T) + sample.descs.color.scale
+p1 <- DimPlot(seurat.obj.malignant, group.by = 'neftel_type', shuffle=T) + malignant.state.color.scale
+p2 <- DimPlot(seurat.obj.malignant, group.by = 'idh.mutant.state', shuffle=T) + malignant.state.color.scale
+p3 <- DimPlot(seurat.obj.malignant, group.by = 'Phase', shuffle=T)
+p4 <- DimPlot(seurat.obj.malignant, group.by = "low.quality.by.qc", shuffle=T, order=T) + ggtitle("Low-quality") + scale_color_manual(breaks=c(FALSE, TRUE), values=c("grey", "red"))
+p5 <- DimPlot(seurat.obj.malignant, group.by = "high.postmortem.noise", shuffle=T, order=T) + ggtitle("High postmortem noise") + scale_color_manual(breaks=c(FALSE, TRUE), values=c("grey", "red"))
+p6 <- FeaturePlot(seurat.obj.malignant, features = 'percent.mt', order=T)
+p7 <- FeaturePlot(seurat.obj.malignant, features = 'nCount_RNA', order=T)
+p8 <- FeaturePlot(seurat.obj.malignant, features = 'nFeature_RNA', order=T)
+p9 <- FeaturePlot(seurat.obj.malignant, features = 'postmortem.signature', order=T)
+p10 <- FeaturePlot(seurat.obj.malignant, features = 'postmortem.sensitive', order=T)
+p11 <- FeaturePlot(seurat.obj.malignant, features = 'heat.shock.signature', order=T)
+p12 <- FeaturePlot(seurat.obj.malignant, features = 'ac_sig', order=T)
+p13 <- FeaturePlot(seurat.obj.malignant, features = 'mes_sig', order=T)
+p14 <- FeaturePlot(seurat.obj.malignant, features = 'npc_sig', order=T)
+p15 <- FeaturePlot(seurat.obj.malignant, features = 'opc_sig', order=T)
+p16 <- FeaturePlot(seurat.obj.malignant, features = 'stemness', order=T)
+p17 <- FeaturePlot(seurat.obj.malignant, features = 'ac.score', order=T)
+p18 <- FeaturePlot(seurat.obj.malignant, features = 'oc.score', order=T)
+p19 <- FeaturePlot(seurat.obj.malignant, features = 'stemness.score', order=T)
+
+
+p <- p.clusters + p.seurat.clusters + p.patient + p.sample.id + p.patient.section + p.sample.desc +
+  p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9 + p10 + p11 + p12 + p13 + p14 + p15 + p16 + p17 + p18 + p19
+pdf(paste0(results.dir, output.dir, 'malignant/', sample.id, '.malignant.cells.UMAP.pdf'), width=30, height=20)
+print(p)
+dev.off()
+
+# DEGs by malignant cluster
+Idents(seurat.obj.malignant) <- "malignant_clusters"
+malignant.markers <- FindAllMarkers(seurat.obj.malignant, group.by = "malignant_clusters", only.pos = T)
+write.table(malignant.markers, paste0(results.dir, output.dir, "markers/", sample.id, "_malignant.markers.tsv"), sep="\t", quote=F, row.names=F, col.names=T)
+
+
+# save malignant metadata
+write.table(seurat.obj.malignant@meta.data, paste0(processed.data.dir, output.dir, 'seurat_objects/', sample.id, '.malignant.tsv'), sep = "\t", row.names = T, col.names = T)
+
+```
+
+
+
+# Add all cell types together
+```{r}
+## read in saved seurat object
+seurat.obj <- readRDS(paste0(processed.data.dir, output.dir, "seurat_objects/", sample.id, ".RDS"))
+
+
+# add neftel predictions to seurat object
+seurat.obj.malignant.metadata <- read.csv(paste0(processed.data.dir, output.dir, 'seurat_objects/', sample.id, '.malignant.tsv'), sep = "\t")
+malignant.metadata.df <- seurat.obj.malignant.metadata %>% 
+  dplyr::select(ac_sig.21, mes1_sig.22, mes2_sig.23, npc1_sig.24, npc2_sig.25, 
+                opc_sig.26, ac_sig, opc_sig, mes_sig, npc_sig, stemness,
+                neftel_x, neftel_y, neftel_type, 
+                stem.like1, AC.like.IDH.A2, OC.like.IDH.A3, AC.like.IDH.O4, OC.like.IDH.O5, 
+                ac.score, oc.score, stemness.score, lineage.score, lineage.score.plot, idh.mutant.state,
+                malignant.state, malignant_clusters)
+seurat.obj <- AddMetaData(seurat.obj, malignant.metadata.df)
+
+
+# add cell type predictions
+seurat.obj.cd45.neg.metadata <- read.csv(paste0(processed.data.dir, output.dir, 'seurat_objects/', sample.id, '_w_celltypes.non.malignant.cd45.neg.', cd45.neg.ref.use, '.tsv'), sep = "\t")
+seurat.obj.cd45.neg.df <- seurat.obj.cd45.neg.metadata %>% 
+  dplyr::select(predicted.annotation_l1, predicted.annotation_l1.score,
+         predicted.annotation_l2, predicted.annotation_l2.score,
+         predicted.annotation_l3, predicted.annotation_l3.score)
+seurat.obj <- AddMetaData(seurat.obj, seurat.obj.cd45.neg.metadata)
+
+seurat.obj.cd45.pos.metadata <- read.csv(paste0(processed.data.dir, output.dir, 'seurat_objects/', sample.id, '_w_celltypes.non.malignant.cd45.pos.tsv'), sep = "\t")
+seurat.obj.cd45.pos.df <- seurat.obj.cd45.pos.metadata %>% 
+  dplyr::select(predicted.annotation_l1, predicted.annotation_l1.score,
+         predicted.annotation_l2, predicted.annotation_l2.score,
+         predicted.annotation_l3, predicted.annotation_l3.score)
+colnames(seurat.obj.cd45.pos.metadata) <- paste0(colnames(seurat.obj.cd45.pos.metadata), "_cd45.pos")
+seurat.obj <- AddMetaData(seurat.obj, seurat.obj.cd45.pos.metadata)
+
+
+seurat.obj$predicted.annotation_l1 <- apply(seurat.obj@meta.data, 1, function(row) case_when(
+  !is.na(row["malignant_clusters"]) ~ "Malignant cluster",
+  !is.na(row["predicted.annotation_l1_cd45.pos"]) ~ row["predicted.annotation_l1_cd45.pos"],
+  TRUE ~ row["predicted.annotation_l1"]
+))
+seurat.obj$predicted.annotation_l2 <- apply(seurat.obj@meta.data, 1, function(row) case_when(
+  !is.na(row["malignant_clusters"]) ~ "Malignant cluster",
+  !is.na(row["predicted.annotation_l2_cd45.pos"]) ~ row["predicted.annotation_l2_cd45.pos"],
+  TRUE ~ row["predicted.annotation_l2"]
+))
+seurat.obj$predicted.annotation_l3 <- apply(seurat.obj@meta.data, 1, function(row) case_when(
+  !is.na(row["malignant_clusters"]) ~ "Malignant cluster",
+  !is.na(row["predicted.annotation_l3_cd45.pos"]) ~ row["predicted.annotation_l3_cd45.pos"],
+  TRUE ~ row["predicted.annotation_l3"]
+))
+seurat.obj$predicted.annotation_l2.w.neftel <- apply(seurat.obj@meta.data, 1, function(row) case_when(
+  !is.na(row["malignant_clusters"]) ~ row["malignant.state"],
+  TRUE ~ row["predicted.annotation_l2"]
+))
+
+
+
+seurat.obj$seurat_clusters_fine <- apply(seurat.obj@meta.data, 1, function(row) case_when(
+  !is.na(row['malignant_clusters']) ~ paste0("M_", row['malignant_clusters']),
+  !is.na(row['oligodendrocyte_clusters']) ~ paste0("O_", row['oligodendrocyte_clusters']),
+  TRUE ~ row['seurat_clusters']
+))
+seurat.obj$seurat_clusters_fine_plot <- apply(seurat.obj@meta.data, 1, function(row) case_when(
+  !is.na(row['malignant_clusters']) ~ paste0("M_", row['malignant_clusters']),
+  !is.na(row['oligodendrocyte_clusters']) ~ paste0("O_", row['oligodendrocyte_clusters']),
+  TRUE ~ NA
+))
+
+
+
+##### cell type prediction scores #####
+cell.types.l3 <- sort(unique(seurat.obj$predicted.annotation_l3)) # color scheme won't be consistent
+cell.types.l3.color.scale <- scale_color_manual(breaks = cell.types.l3, values = as.character(polychrome(length(cell.types.l3))))
+
+df <- seurat.obj@meta.data %>% filter(predicted.annotation_l1 != "Malignant cluster")
+df$seurat_clusters <- factor(df$seurat_clusters)
+p <- ggplot(df, aes(predicted.annotation_l1, predicted.annotation_l1.score, color=predicted.annotation_l1)) +
+  geom_boxplot(outlier.shape=NA) +
+  cell.types.anotation_l1.color.scale +
+  theme_bw()
+pdf(paste0(results.dir, output.dir, 'celltype_prediction/', cd45.neg.ref.use, '/', 'prediction_scores/', sample.id, '_seurat_clusters.vs.predicted.annotation_l1.score.by.predicted.annotation_l1.pdf'), width = 18, height = 6)
+print(p)
+dev.off()
+
+p <- ggplot(seurat.obj@meta.data %>% filter(predicted.annotation_l1 != "Malignant cluster"), aes(predicted.annotation_l2, predicted.annotation_l2.score, color=predicted.annotation_l2)) +
+  geom_boxplot(outlier.shape=NA) +
+  cell.types.anotation_l2.color.scale +
+  theme_bw()
+pdf(paste0(results.dir, output.dir, 'celltype_prediction/', cd45.neg.ref.use, '/', 'prediction_scores/', sample.id, '_seurat_clusters.vs.predicted.annotation_l2.score.by.predicted.annotation_l2.pdf'), width = 24, height = 6)
+print(p)
+dev.off()
+
+p <- ggplot(seurat.obj@meta.data %>% filter(predicted.annotation_l1 != "Malignant cluster"), aes(predicted.annotation_l3, predicted.annotation_l3.score, color=predicted.annotation_l3)) +
+  geom_boxplot(outlier.shape=NA) +
+  cell.types.l3.color.scale +
+  theme_bw()
+pdf(paste0(results.dir, output.dir, 'celltype_prediction/', cd45.neg.ref.use, '/', 'prediction_scores/', sample.id, '_seurat_clusters.vs.predicted.annotation_l3.score.by.predicted.annotation_l3.pdf'), width = 30, height = 6)
+print(p)
+dev.off()
+
+
+# add quality to cell type/state predictions
+seurat.obj$predicted.annotation_l1.w.qc <- apply(seurat.obj@meta.data, 1, function(row) ifelse(row['low.quality.by.qc'], 'Low quality', row['predicted.annotation_l1']))
+seurat.obj$predicted.annotation_l2.w.qc <- apply(seurat.obj@meta.data, 1, function(row) ifelse(row['low.quality.by.qc'], 'Low quality', row['predicted.annotation_l2']))
+seurat.obj$malignant.state.w.qc <- apply(seurat.obj@meta.data, 1, function(row) case_when(
+  is.na(row[["malignant.state"]]) ~ NA,
+  as.logical(row[["low.quality.by.qc"]]) ~ "Low quality",
+  TRUE ~ row[["malignant.state"]]
+))
+
+
+##### final UMAP with cell types #####
+if (dim(seurat.obj)[2] > 50000) {
+  do.raster <- T
+} else {
+  do.raster <- F
+}
+
+#gene.expression.color.gradient <- scale_colour_gradientn(limits=c(0, 3), colours = rev(brewer.pal(n = 11, name = "RdBu")))
+gene.expression.color.gradient <- scale_colour_gradientn(limits=c(0, 3), colours = brewer.pal(n = 9, name = "Reds"))
+min.cutoff.threshold <- 0
+max.cutoff.threshold <- 3
+
+p.clusters <- DimPlot(seurat.obj, group.by = "seurat_clusters", label=T, shuffle=F, raster=do.raster) + ggtitle("Cluster") + NoAxes()
+p.clusters.fine <- DimPlot(seurat.obj, group.by = "seurat_clusters_fine_plot", label=T, shuffle=T, raster=do.raster, repel=T, label.size = 3) + ggtitle("Cluster (fine)") + NoAxes()
+
+
+# function to add the number of cells per cell type/group in the legend. Returns a color scale with counts that can be added to a DimPlot
+get.count.labels <- function(metadata.col, mapping) {
+  cell.counts <- table(metadata.col)
+  cell.counts <- cell.counts[intersect(names(mapping), names(cell.counts))]
+  
+  labels.w.counts <- paste0(
+    names(cell.counts),
+    " (n=", as.integer(cell.counts), ")"
+  )
+  names(labels.w.counts) <- names(cell.counts)
+  color.scale.w.counts <- scale_color_manual(
+    labels = labels.w.counts,
+    breaks = names(labels.w.counts),
+    values = mapping[names(cell.counts)]
+  )
+  return(color.scale.w.counts)
+}
+
+cell.types.anotation_l2.w.quality.mapping <- cell.types.anotation_l2.w.quality.colors
+names(cell.types.anotation_l2.w.quality.mapping) <- cell.types.anotation_l2.w.quality
+
+p.celltype.l2.legend.labels <- get.count.labels(seurat.obj$celltype.by.cluster, cell.types.anotation_l2.w.quality.mapping)
+p.celltype.by.cluster <- DimPlot(seurat.obj, group.by = "celltype.by.cluster", label=T, shuffle=T, raster=do.raster) + ggtitle("Cell type by cluster") + NoAxes() + p.celltype.l2.legend.labels
+
+cell.types.anotation_l1.w.quality.mapping <- cell.types.anotation_l1.w.quality.colors
+names(cell.types.anotation_l1.w.quality.mapping) <- cell.types.anotation_l1.w.quality
+
+p.celltype.l1.legend.labels <- get.count.labels(seurat.obj$predicted.annotation_l1, cell.types.anotation_l1.w.quality.mapping)
+p.celltype.l1 <- DimPlot(seurat.obj, group.by = "predicted.annotation_l1", label=T, shuffle=T, raster=do.raster) + ggtitle("Cell type (broad)") + NoAxes() + p.celltype.l1.legend.labels
+
+p.celltype.l1.w.qc.legend.labels <- get.count.labels(seurat.obj$predicted.annotation_l1.w.qc, cell.types.anotation_l1.w.quality.mapping)
+p.celltype.l1.w.qc <- DimPlot(seurat.obj, group.by = "predicted.annotation_l1.w.qc", label=T, shuffle=T, raster=do.raster) + ggtitle("Cell type (broad)") + NoAxes() + p.celltype.l1.w.qc.legend.labels
+
+p.celltype.l2.legend.labels <- get.count.labels(seurat.obj$predicted.annotation_l2, cell.types.anotation_l2.w.quality.mapping)
+p.celltype.l2 <- DimPlot(seurat.obj, group.by = "predicted.annotation_l2", label=T, shuffle=T, raster=do.raster) + ggtitle("Cell type (fine)") + NoAxes() + p.celltype.l2.legend.labels
+
+p.celltype.l2.w.qc.legend.labels <- get.count.labels(seurat.obj$predicted.annotation_l2.w.qc, cell.types.anotation_l2.w.quality.mapping)
+p.celltype.l2.w.qc <- DimPlot(seurat.obj, group.by = "predicted.annotation_l2.w.qc", label=T, shuffle=T, raster=do.raster) + ggtitle("Cell type (fine)") + NoAxes() + p.celltype.l2.w.qc.legend.labels
+
+
+p.celltype.l3 <- DimPlot(seurat.obj, group.by = "predicted.annotation_l3", label=T, shuffle=T, raster=do.raster) + ggtitle("Cell type (fine)") + NoAxes() + cell.types.l3.color.scale
+
+p.neftel <- DimPlot(seurat.obj, group.by = "malignant.state", label=F, shuffle=T, raster=do.raster) + ggtitle("Malignant state") + NoAxes() + malignant.state.color.scale
+
+p.patient <- DimPlot(seurat.obj, group.by = "patient", label=F, shuffle=T, raster=do.raster) + ggtitle("Donor") + NoAxes()
+p.sample <- DimPlot(seurat.obj, group.by = "sample.id", label=F, shuffle=T, raster=do.raster) + ggtitle("Sample ID") + sample.ids.color.scale + NoAxes()
+p.patient.section <- DimPlot(seurat.obj, group.by = "patient.section", label=F, shuffle=T, raster=do.raster) + ggtitle("Patient + section") + patient.sections.color.scale + NoAxes()
+p.sample.desc <- DimPlot(seurat.obj, group.by = "sample.desc", label=F, shuffle=T, raster=F) + ggtitle("Sample description") + sample.descs.color.scale + NoAxes()
+p.tumor.adj <- DimPlot(seurat.obj, group.by = "tumor.adjacent", label=F, shuffle=T, raster=do.raster) + ggtitle("Tumor-adjacent") + scale_color_manual(breaks=c(FALSE, TRUE), values=c("grey", "red")) + NoAxes()
+p.method <- DimPlot(seurat.obj, group.by = "method", label=F, shuffle=T, raster=do.raster) + ggtitle("Method") + NoAxes()
+p.phase <- DimPlot(seurat.obj, group.by = "Phase", shuffle=T, raster=do.raster) + ggtitle("Predicted Cell Cycle Phase") + NoAxes()
+p.low.quality.qc <- DimPlot(seurat.obj, group.by = "low.quality.by.qc", order=T, raster=do.raster) + ggtitle("Low-quality") + scale_color_manual(breaks=c(FALSE, TRUE), values=c("grey", "red")) + NoAxes()
+p.high.postmortem.noise <- DimPlot(seurat.obj, group.by = "high.postmortem.noise", order=T, raster=do.raster) + ggtitle("High postmortem noise") + scale_color_manual(breaks=c(FALSE, TRUE), values=c("grey", "red")) + NoAxes()
+p.percent.mt <- FeaturePlot(seurat.obj, features = c("percent.mt"), order=T, raster=do.raster) + NoAxes()
+p.ncount.rna <- FeaturePlot(seurat.obj, features = c("nCount_RNA"), order=T, raster=do.raster) + NoAxes()
+p.nfeature.rna <- FeaturePlot(seurat.obj, features = c("nFeature_RNA"), order=T, raster=do.raster) + NoAxes()
+p.postmortem.noise <- FeaturePlot(seurat.obj, features = c("postmortem.signature"), order=T, raster=do.raster) + ggtitle("Postmortem noise") + NoAxes()
+p.heat.shock <- FeaturePlot(seurat.obj, features = c("heat.shock.signature"), order=T, raster=do.raster) + ggtitle("Heat shock") + NoAxes()
+p.postmortem.sensitive <- FeaturePlot(seurat.obj, features = c("postmortem.sensitive"), order=T, raster=do.raster) + ggtitle("Postmortem sensitive") + NoAxes()
+p.postmortem.glial <- FeaturePlot(seurat.obj, features = c("postmortem.glial"), order=T, raster=do.raster) + ggtitle("Postmortem glial") + NoAxes()
+p.oligo.like <- FeaturePlot(seurat.obj, features = c("oligo.like"), order=T, raster=do.raster) + ggtitle("Tumor-adjacent oligodendrocyte signature") + NoAxes()
+
+p <- p.clusters + p.clusters.fine + p.celltype.by.cluster + p.celltype.l1 + p.celltype.l1.w.qc + p.celltype.l2 + p.celltype.l2.w.qc + p.celltype.l3 + p.neftel +
+  p.patient + p.sample + p.patient.section + p.sample.desc + p.tumor.adj + p.method + 
+  p.phase + p.low.quality.qc + p.high.postmortem.noise +
+  p.percent.mt + p.ncount.rna + p.nfeature.rna + p.postmortem.noise + p.heat.shock + p.postmortem.sensitive + p.postmortem.glial + p.oligo.like
+  
+for (g in celltype.features) {
+  p.g <- FeaturePlot(seurat.obj, features = c(g), order=T, min.cutoff = min.cutoff.threshold, max.cutoff = max.cutoff.threshold, raster=do.raster, slot = "data") + gene.expression.color.gradient + NoAxes()
+  p <- p + p.g
+}
+
+pdf(paste0(results.dir, output.dir, 'umap/', sample.id, '.UMAP.w.celltype.', cd45.neg.ref.use, '.pdf'), width=50, height=40)
+print(p)
+dev.off()
+
+
+
+# QC by cluster and predicted cell type
+p1 <- VlnPlot(seurat.obj, pt.size=0, features = c("nFeature_RNA"), ncol = 1, group.by = 'seurat_clusters') + geom_hline(yintercept = nFeature_RNA.cutoff.low, color='red') + geom_hline(yintercept = nFeature_RNA.cutoff.high, color='red') + NoLegend()
+p2 <- VlnPlot(seurat.obj, pt.size=0, features = c("nCount_RNA"), ncol = 1, group.by = 'seurat_clusters') + geom_hline(yintercept = nCount_RNA.cutoff.low, color='red') + geom_hline(yintercept = nCount_RNA.cutoff.high, color='red') + NoLegend()
+p3 <- VlnPlot(seurat.obj, pt.size=0, features = c("percent.mt"), ncol = 1, group.by = 'seurat_clusters') + geom_hline(yintercept = percent.mt.cutoff, color='red') + geom_hline(yintercept = percent.mt.cutoff.filter.out, color='red') + NoLegend()
+p4 <- VlnPlot(seurat.obj, pt.size=0, features = c("postmortem.signature"), ncol = 1, group.by = 'seurat_clusters') + geom_hline(yintercept = post.mortem.noise.cutoff, color='red') + NoLegend()
+p5 <- VlnPlot(seurat.obj, pt.size=0, features = c("heat.shock.signature"), ncol = 1, group.by = 'seurat_clusters') + NoLegend()
+p6 <- VlnPlot(seurat.obj, pt.size=0, features = c("postmortem.sensitive"), ncol = 1, group.by = 'seurat_clusters') + NoLegend()
+p7 <- VlnPlot(seurat.obj, pt.size=0, features = c("postmortem.glial"), ncol = 1, group.by = 'seurat_clusters') + NoLegend()
+p <- p1 + p2 + p3 + p4 + p5 + p6 + p7
+pdf(paste0(results.dir, output.dir, 'qc/', sample.id, '_QC.by.cluster.pdf'), width=10, height=20)
+print(p)
+dev.off()
+
+p1 <- VlnPlot(seurat.obj, pt.size=0, features = c("nFeature_RNA"), ncol = 1, group.by = 'predicted.annotation_l2.w.neftel') + geom_hline(yintercept = nFeature_RNA.cutoff.low, color='red') + geom_hline(yintercept = nFeature_RNA.cutoff.high, color='red') + NoLegend() 
+p2 <- VlnPlot(seurat.obj, pt.size=0, features = c("nCount_RNA"), ncol = 1, group.by = 'predicted.annotation_l2.w.neftel') + geom_hline(yintercept = nCount_RNA.cutoff.low, color='red') + geom_hline(yintercept = nCount_RNA.cutoff.high, color='red') + NoLegend() 
+p3 <- VlnPlot(seurat.obj, pt.size=0, features = c("percent.mt"), ncol = 1, group.by = 'predicted.annotation_l2.w.neftel') + geom_hline(yintercept = percent.mt.cutoff, color='red') + geom_hline(yintercept = percent.mt.cutoff.filter.out, color='red') + NoLegend()
+p4 <- VlnPlot(seurat.obj, pt.size=0, features = c("postmortem.signature"), ncol = 1, group.by = 'predicted.annotation_l2.w.neftel') + geom_hline(yintercept = post.mortem.noise.cutoff, color='red') + NoLegend()
+p5 <- VlnPlot(seurat.obj, pt.size=0, features = c("heat.shock.signature"), ncol = 1, group.by = 'predicted.annotation_l2.w.neftel') + NoLegend()
+p6 <- VlnPlot(seurat.obj, pt.size=0, features = c("postmortem.sensitive"), ncol = 1, group.by = 'predicted.annotation_l2.w.neftel') + NoLegend()
+p7 <- VlnPlot(seurat.obj, pt.size=0, features = c("postmortem.glial"), ncol = 1, group.by = 'predicted.annotation_l2.w.neftel') + NoLegend()
+p <- p1 + p2 + p3 + p4 + p5 + p6 + p7
+pdf(paste0(results.dir, output.dir, 'qc/', sample.id, '_QC.by.celltype.pdf'), width=10, height=20)
+print(p)
+dev.off()
+
+
+saveRDS(seurat.obj, paste0(processed.data.dir, output.dir, 'seurat_objects/', sample.id, '_w_celltypes.', cd45.neg.ref.use, '.RDS'))
+```

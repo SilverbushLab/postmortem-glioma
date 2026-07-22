@@ -1,0 +1,723 @@
+---
+title: "Figure_4.RMD"
+output: html_document
+date: "2026-07-05"
+---
+
+
+
+# Setup
+```{r}
+root.dir <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Projects/Jackie_post-mortem/"
+figures.dir <- paste0(root.dir, "Figures/", "Figure 4/")
+supp.figures.dir <- paste0(root.dir, "Figures/", "Figure 4/", "Supplemental/")
+
+suppressMessages(suppressWarnings(source(paste0(root.dir, "Code/", 'helper_functions.R'))))
+
+processed.data.dir <- paste0(root.dir, "Results/", "my_data/", "autopsy/", "all_postmortem_samples_cellbender.FALSE_denoise.heat.shock.signature_postmortem.sensitive_postmortem.signature_filter.FALSE_batch.correction.None/")
+seurat.obj.oligos <- readRDS(paste0(processed.data.dir, "oligodendrocytes/", "all_postmortem_samples_oligodendrocytes.RDS"))
+seurat.obj.gbm.oligos <- readRDS(paste0(processed.data.dir, "oligodendrocytes/", "gbm/", "GBM_samples_oligodendrocytes.RDS"))
+
+denoise.vars.to.regress <- c("heat.shock.signature", "postmortem.sensitive", "postmortem.signature")
+set.seed(123)
+
+library(clusterProfiler)
+library(patchwork)
+
+
+
+# 
+# # save oligodendrocyte signatures to Excel
+# library(openxlsx)
+# gene_signatures <- oligo.gene.signatures[c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific")]
+# 
+# # 2. Find the maximum length among all signatures
+# max_len <- max(sapply(gene_signatures, length))
+# 
+# # 3. Pad shorter signatures with NA so they can bind into a data frame
+# padded_signatures <- lapply(gene_signatures, function(x) {
+#   c(x, rep(NA, max_len - length(x)))
+# })
+# 
+# # 4. Combine into a data frame (each list element becomes a column)
+# df_signatures <- as.data.frame(padded_signatures)
+# 
+# # 5. Export directly to an Excel file
+# write.xlsx(df_signatures, file = paste0(root.dir, "Figures/Tables/Table S6 reactive oligodendrocyte signatures raw.xlsx"), rowNames = FALSE)
+
+```
+
+
+
+# Main: UMAP and PCA of oligodendrocytes by location
+```{r}
+seurat.obj.gbm.oligos$location <- factor(seurat.obj.gbm.oligos$location, levels = sample.locations)
+sample.location.legend.labels <- get.count.labels(seurat.obj.gbm.oligos$location, sample.location.colors)
+p <- DimPlot(seurat.obj.gbm.oligos, group.by = "location", label=F, shuffle=T, raster=F) + 
+  ggtitle("Location") + 
+  sample.location.legend.labels +
+  umap.axes
+pdf(paste0(figures.dir, "GBM_samples_UMAP_by_location.pdf"), width = 10, height = 6)
+print(p)
+dev.off()
+
+p <- DimPlot(seurat.obj.gbm.oligos, group.by = "location", label=F, shuffle=T, raster=F, reduction = "pca") + 
+  ggtitle("Location") + 
+  sample.location.legend.labels
+pdf(paste0(figures.dir, "GBM_samples_pca_by_location.pdf"), width = 10, height = 6)
+print(p)
+dev.off()
+```
+
+
+
+# Supplemental: UMAP and PCA of oligodendrocytes by sample
+```{r}
+seurat.obj.gbm.oligos$sample.desc <- factor(seurat.obj.gbm.oligos$sample.desc, levels = sample.descs)
+sample.desc.legend.labels <- get.count.labels(seurat.obj.gbm.oligos$sample.desc, sample.descs.colors)
+p <- DimPlot(seurat.obj.gbm.oligos, group.by = "sample.desc", label=F, shuffle=T, raster=F) + 
+  ggtitle("Sample region") + 
+  sample.desc.legend.labels +
+  umap.axes
+pdf(paste0(supp.figures.dir, "GBM_samples_UMAP_by_sample.pdf"), width = 10, height = 6)
+print(p)
+dev.off()
+
+seurat.obj.gbm.oligos$method <- factor(seurat.obj.gbm.oligos$method, levels = sample.prep.methods)
+method.legend.labels <- get.count.labels(seurat.obj.gbm.oligos$method, sample.prep.method.colors)
+p <- DimPlot(seurat.obj.gbm.oligos, group.by = "method", label=F, shuffle=T, raster=F) + 
+  ggtitle("Method") +
+  method.legend.labels +
+  umap.axes
+pdf(paste0(supp.figures.dir, "GBM_samples_UMAP_by_method.pdf"), width = 10, height = 6)
+print(p)
+dev.off()
+
+p <- DimPlot(seurat.obj.gbm.oligos, group.by = "sample.desc", label=F, shuffle=T, raster=F, reduction = "pca") + 
+  ggtitle("Sample region") + 
+  sample.desc.legend.labels
+pdf(paste0(supp.figures.dir, "GBM_samples_pca_by_sample.pdf"), width = 10, height = 6)
+print(p)
+dev.off()
+
+p <- DimPlot(seurat.obj.gbm.oligos, group.by = "method", label=F, shuffle=T, raster=F, reduction = "pca") + 
+  ggtitle("Method") + 
+  method.legend.labels
+pdf(paste0(supp.figures.dir, "GBM_samples_pca_by_method.pdf"), width = 10, height = 6)
+print(p)
+dev.off()
+```
+
+
+
+# Supplemental: Oligo and OPC signatures
+```{r}
+p <- FeaturePlot(seurat.obj.gbm.oligos, features = c("CD74"), order = T) + 
+    umap.axes
+
+DotPlot(seurat.obj.gbm.oligos, features = c("CD74"), group.by = "sample.desc")
+
+
+plot.list <- list()
+for (f in c("MOG", "MBP", "PLP1", "SOX10", "PDGFRA", "CSPG4")) {
+  p <- FeaturePlot(seurat.obj.gbm.oligos, features = f, order = T) + 
+    umap.axes
+  plot.list[[f]] <- p
+}
+p <- plot_grid(plotlist = plot.list)
+pdf(paste0(supp.figures.dir, "GBM_samples_oligo_genes_featureplot.pdf"), width = 12, height = 6)
+print(p)
+dev.off()
+```
+
+
+
+# Demyelination and remyelination signatures
+```{r}
+library(RColorBrewer)
+
+res <- lm(acute.demyelination ~ apoptosis.signature, data = seurat.obj.gbm.oligos@meta.data)
+seurat.obj.gbm.oligos$acute.demyelination.res <- res$residuals
+
+res <- lm(acute.de.re.myelination ~ apoptosis.signature, data = seurat.obj.gbm.oligos@meta.data)
+seurat.obj.gbm.oligos$acute.de.re.myelination.res <- res$residuals
+
+
+# split Seurat object and comparisons by method
+seurat.obj.subset <- seurat.obj.gbm.oligos
+unique(seurat.obj.subset$sample.id)
+seurat.obj.subset.facs <- subset(seurat.obj.subset, subset = (method == "FACS"))
+seurat.obj.subset.facs$sample.desc <- factor(seurat.obj.subset.facs$sample.desc, levels = sample.descs)
+comparisons.facs <- list(c("GBM 1 Edge", "GBM 1 Distal"), c("GBM 1 Core", "GBM 1 Edge"), c("GBM 1 Core", "GBM 1 Distal"), c("GBM 2 Distal Inf.", "GBM 2 Distal"), c("GBM 2 Edge", "GBM 2 Distal"), c("GBM 2 Brainstem", "GBM 2 Distal"), c("GBM 2 Core", "GBM 2 Distal"), c("IDH-mut 1 Edge", "IDH-mut 1 Distal"))
+
+p <- do.boxplot(data = seurat.obj.subset.facs@meta.data, 
+           x.variable = "sample.desc",
+           y.variable = "acute.demyelination.res",
+           output.filepath = paste0(supp.figures.dir, "GBM_FACS_sample_vs_demyelination_apoptosis_regressed_denoised.pdf"),
+           ylab.label = paste0("Demyelination signature\nin oligodendrocytes"),
+           comparisons = comparisons.facs,
+           boxplot.fill.variable = "sample.desc",
+           fill.scale = sample.descs.fill.scale,
+           image.width = 18,
+           image.height = 8,
+           facet.by = "patient.desc",
+           vars.to.regress = denoise.vars.to.regress,  
+           step.increase = 0.05,
+           outlier.shape = NA,
+           y.adjust = c("GBM 1" = 0, "GBM 2" = -0.25, "IDH-mut 1" = 0),
+           alternative = "greater",
+           return.plot = TRUE)
+
+p <- do.boxplot(data = seurat.obj.subset.facs@meta.data, 
+           x.variable = "sample.desc",
+           y.variable = "acute.de.re.myelination.res",
+           output.filepath = paste0(supp.figures.dir, "GBM_FACS_sample_vs_remyelination_apoptosis_regressed_denoised.pdf"),
+           ylab.label = paste0("Remyelination signature\nin oligodendrocytes"),
+           comparisons = comparisons.facs,
+           boxplot.fill.variable = "sample.desc",
+           fill.scale = sample.descs.fill.scale,
+           image.width = 18,
+           image.height = 8,
+           facet.by = "patient.desc",
+           vars.to.regress = denoise.vars.to.regress,
+           step.increase = 0.05,
+           outlier.shape = NA,
+           y.adjust = c("GBM 1" = 0, "GBM 2" = 0, "IDH-mut 1" = 0),
+           alternative = "greater",
+           return.plot = TRUE)
+
+comparisons.facs <- list(c("Edge", "Distal"), c("Core", "Edge"), c("Core", "Distal"))
+seurat.obj.subset.facs.subset <- subset(seurat.obj.subset.facs, subset = location %in% c("Core", "Edge", "Distal"))
+p <- do.boxplot(data = seurat.obj.subset.facs.subset@meta.data, 
+           x.variable = "location",
+           y.variable = "acute.demyelination",
+           output.filepath = paste0(supp.figures.dir, "location_vs_demyelination.pdf"),
+           ylab.label = paste0("Demyelination signature\nin oligodendrocytes"),
+           comparisons = comparisons.facs,
+           boxplot.fill.variable = "location",
+           fill.scale = sample.location.fill.scale,
+           image.width = 8,
+           image.height = 6,
+           facet.by = NULL,
+           vars.to.regress = denoise.vars.to.regress,  
+           step.increase = 0.05,
+           outlier.shape = NA,
+           y.adjust = -0.25,
+           alternative = "greater",
+           return.plot = TRUE)
+
+p <- do.boxplot(data = seurat.obj.subset.facs.subset@meta.data, 
+           x.variable = "location",
+           y.variable = "acute.de.re.myelination",
+           output.filepath = paste0(supp.figures.dir, "location_vs_remyelination.pdf"),
+           ylab.label = paste0("Remyelination signature\nin oligodendrocytes"),
+           comparisons = comparisons.facs,
+           boxplot.fill.variable = "location",
+           fill.scale = sample.location.fill.scale,
+           image.width = 8,
+           image.height = 6,
+           facet.by = NULL,
+           vars.to.regress = denoise.vars.to.regress,  
+           step.increase = 0.05,
+           outlier.shape = NA,
+           y.adjust = -0.125,
+           alternative = "greater",
+           return.plot = TRUE)
+
+```
+
+
+
+# Main: Tumor-adjacent oligodendrocyte DEGs volcano plot 
+```{r}
+tumor.samples.use <- c("GBM 1 Core FACS", "GBM 1 Edge FACS", "GBM 2 Core FACS", "GBM 2 Edge FACS", "GBM 2 Brainstem FACS")
+
+## Volcano plot of DEGs
+markers.dir <- paste0(root.dir, "Figures/Figure 4/markers/Oligodendrocytes/")
+all.markers.df <- read.csv(paste0(markers.dir, "DEGs_matched_sample_vs_distal_denoise=TRUE.tsv"), sep = "\t")
+
+all.markers.df.filter <- all.markers.df %>% 
+  filter(p_val_adj < 0.05, sample %in% tumor.samples.use) %>%
+  group_by(gene) %>%
+  summarize(n.samples = n_distinct(sample), 
+            n.patients = n_distinct(patient),
+            median.avg_log2FC = median(avg_log2FC),
+            median.p_val_adj = median(p_val_adj),
+            samples.up = paste0(sample, collapse = ", ")) %>% 
+  arrange(desc(n.samples))
+summary.df <- all.markers.df.filter
+
+summary.df.filter <- summary.df %>% filter(n.samples >= 4) 
+
+
+# Volcano plot
+
+immune.interferon.genes <- c("B2M", "STAT3", "NLRC5", "HLA-A") #c("STAT1", "IFI16", "GBP2") 
+proteostasis.stress.genes <- c("PDK1", "ATF4", "ACO1") #c("ERO1A", "ATF3") # "EIF2AK2", "GARS",
+remodeling.genes <- c("ARHGAP24", "PHACTR1", "ACTG1", "ASAP1") #c("ASAP1", "EPS8", "CD44")
+trafficking.genes <- c("BACE2", "GALNT15", "TPST1", "COPA") #c("ANXA2", "SQSTM1", "B4GALT5")
+myelin.genes <- c("MBP", "PLP1", "MOG", "ASPA")
+other.genes.of.interest <- c("CD44", "VEGFA", "VIM", "HIF1A")
+
+summary.df$gene.category <- sapply(summary.df$gene, function(x) case_when(
+  x %in% immune.interferon.genes ~ "Immune & Interferon",
+  x %in% proteostasis.stress.genes ~ "Metabolic & Proteotoxic Stress",
+  x %in% remodeling.genes ~ "Cytoskeletal Remodeling",
+  x %in% trafficking.genes ~ "Trafficking & Glycosylation",
+  x %in% myelin.genes ~ "Myelin",
+  x %in% other.genes.of.interest ~ "Hypoxia & TME",
+  TRUE ~ "Other"
+))
+
+summary.df$gene.label <- apply(summary.df, 1, function(row) ifelse(row[["gene.category"]] != "Other", row[["gene"]], ""))
+
+gene.category.colors <- c(
+  "Immune & Interferon"        = "#D55E00", 
+  "Metabolic & Proteotoxic Stress"   = "#0072B2", 
+  "Cytoskeletal Remodeling" = "#CC79A7", 
+  "Trafficking & Glycosylation"        = "#009E73",
+  "Hypoxia & TME"                     = "#E69F00",
+  "Myelin"                            = "#000000", 
+  "Other"                             = "#999999"
+)
+
+gene.categories <- names(gene.category.colors)
+
+gene.categories.color.scale <- scale_color_manual(breaks = gene.categories, values = gene.category.colors)
+gene.categories.fill.scale <- scale_fill_manual(breaks = gene.categories, values = gene.category.colors)
+
+summary.df$gene.category <- factor(summary.df$gene.category, levels = gene.categories)
+summary.df <- summary.df %>% arrange(desc(gene.category), n.samples)
+
+p <- ggplot(summary.df, aes(median.avg_log2FC, -log10(median.p_val_adj), label = gene.label)) +
+  geom_point(aes(size = n.samples, fill = gene.category), alpha = 0.6, shape = 21) +
+  ylab("-log10 adjusted p-value") +
+  xlab("log2FC tumor-adjacent vs distal") +
+  gene.categories.fill.scale +
+  gene.categories.color.scale +
+  geom_text_repel(aes(color = gene.category), size = 5, max.overlaps = Inf) +
+  labs(fill = "Gene category") +
+  labs(size = "No. tumor samples") +
+  guides(color = "none") +
+  guides(fill = guide_legend(override.aes = list(size = 4))) 
+  
+pdf(paste0(figures.dir, "oligodendrocytes_tumor_adjacent_vs_distal_volcano_plot.pdf"), width = 12, height = 7)
+print(p)
+dev.off()
+```
+
+
+
+# Main: Tumor-adjacent oligodendrocyte DEGs GO plot
+```{r}
+for (deg.direction in c("up", "down")) {
+  
+  if (deg.direction == "up") {
+    genes <- summary.df.filter %>% filter(median.avg_log2FC > 0.5) %>% pull(gene)
+  } else {
+    genes <- summary.df.filter %>% filter(median.avg_log2FC < -0.5) %>% pull(gene)
+  }
+  go.enrich <- enrichGO(gene = genes,
+                      OrgDb = org.Hs.eg.db, 
+                      keyType = 'SYMBOL',
+                      ont = "BP",
+                      pAdjustMethod = "fdr",
+                      pvalueCutoff = 0.05)
+  
+  go.enrich.df <- data.frame(go.enrich)
+  go.enrich.df <- go.enrich.df %>% filter(Count >= 5, Count <= 30)
+  go.enrich.df <- go.enrich.df %>% arrange(desc(FoldEnrichment))
+  
+  go.enrich.top.df <- go.enrich.df %>% head(20)
+  go.enrich.top.df$Description_short <- str_trunc(go.enrich.top.df$Description, width = 80)
+  go.enrich.top.df$Description_short <- factor(go.enrich.top.df$Description_short, levels = rev(go.enrich.top.df$Description_short))
+  
+  go.enrich.top.df <- go.enrich.top.df %>%
+  dplyr::mutate(
+    gene.category = case_when(
+      str_detect(Description, "interferon") ~ "Immune & Interferon",
+      str_detect(Description, "folding|starvation|chaperone") ~ "Metabolic & Proteotoxic Stress",
+      str_detect(Description, "actin|Rho|Rac") ~ "Cytoskeletal Remodeling",
+      str_detect(Description, "vacuole|Golgi|plasma membrane|glycan|glycosphingolipid|endocytosis|synaptic vesicle") ~ "Trafficking & Glycosylation",
+      
+      # Default for anything that doesn't fit the above
+      TRUE ~ "Other"
+    )
+  )
+
+  go.enrich.top.df$gene.category <- factor(
+    go.enrich.top.df$gene.category,
+    levels = gene.categories
+  )
+  
+  # make sure the order matches the plot
+  label_colors <- gene.category.colors[
+    go.enrich.top.df$gene.category
+  ]
+  label_colors <- rev(label_colors) # need to reverse to match text
+  
+  p <- ggplot(
+      go.enrich.top.df,
+      aes(
+        x = FoldEnrichment,
+        y = Description_short,
+        size = Count,
+        color = qvalue
+      )
+    ) +
+    geom_point() +
+    scale_color_viridis_c(direction = -1) +
+    ylab("") +
+    xlab("Fold enrichment")
+  
+  if (deg.direction == "up") {
+    p <- p + 
+      theme(
+        axis.text.y = element_text(color = label_colors)
+      )
+  }
+  
+  pdf(paste0(figures.dir, "oligodendrocytes_tumor_adjacent_vs_distal_GO_plot_direction=", deg.direction, ".pdf"), width = 12, height = 6)
+  print(p)
+  dev.off()
+  
+  
+  write.table(go.enrich.top.df, paste0(figures.dir, "oligodendrocytes_tumor_adjacent_vs_distal_GO_plot_direction=", deg.direction, "_table.tsv"), sep = "\t")
+}
+```
+
+
+
+# Main: Reactive oligodendrocyte signatures in oligodendrocytes
+```{r}
+seurat.obj.subset <- seurat.obj.oligos
+seurat.obj.subset$sample.desc.method <- factor(seurat.obj.subset$sample.desc.method, levels = sample.descs.by.method)
+
+
+
+# split Seurat object and comparisons by method
+seurat.obj.subset.facs <- subset(seurat.obj.subset, subset = method == "FACS")
+seurat.obj.subset.facs$sample.desc <- factor(seurat.obj.subset.facs$sample.desc, levels = sample.descs)
+comparisons.facs <- list(c("GBM 1 Edge", "GBM 1 Distal"), c("GBM 1 Core", "GBM 1 Edge"), c("GBM 1 Core", "GBM 1 Distal"), c("GBM 2 Distal Inf.", "GBM 2 Distal"), c("GBM 2 Edge", "GBM 2 Distal"), c("GBM 2 Brainstem", "GBM 2 Distal"), c("GBM 2 Core", "GBM 2 Distal"), c("IDH-mut 1 Edge", "IDH-mut 1 Distal"))
+
+seurat.obj.subset.10x <- subset(seurat.obj.subset, subset = method == "10X")
+seurat.obj.subset.10x$sample.desc <- factor(seurat.obj.subset.10x$sample.desc, levels = sample.descs)
+comparisons.10x <- list(c("GBM 2 Edge", "GBM 2 Distal"))
+  
+seurat.obj.subset.invent <- subset(seurat.obj.subset, subset = method == "Invent")
+seurat.obj.subset.invent$sample.desc <- factor(seurat.obj.subset.invent$sample.desc, levels = sample.descs)
+comparisons.invent <- list(c("GBM 2 Edge", "GBM 2 Distal"))
+
+
+# reactive oligodendrocyte signature
+for (y.var in c("reactive.oligo.general", "reactive.oligo.non.tumor", "reactive.oligo.specific")) {
+  do.boxplot(data = seurat.obj.subset.facs@meta.data, 
+             x.variable = "sample.desc",
+             y.variable = y.var,
+             output.filepath = paste0(figures.dir, 'oligodendrocytes_sample_vs_', y.var, '_FACS.pdf'),
+             ylab.label = paste0("Reactive oligodendrocyte signature\nin oligodendrocytes"),
+             comparisons = comparisons.facs,
+             boxplot.fill.variable = "sample.desc", 
+             fill.scale = sample.descs.fill.scale,
+             image.width = 18,
+             image.height = 8,
+             facet.by = "patient.desc",
+             vars.to.regress = NULL,
+             alternative = "greater")
+  
+  do.boxplot(data = seurat.obj.subset.10x@meta.data, 
+             x.variable = "sample.desc",
+             y.variable = y.var,
+             output.filepath = paste0(figures.dir, 'oligodendrocytes_sample_vs_', y.var, '_10X.pdf'),
+             ylab.label = paste0("Reactive oligodendrocyte signature\nin oligodendrocytes"),
+             comparisons = comparisons.10x,
+             boxplot.fill.variable = "sample.desc",
+             fill.scale = sample.descs.fill.scale,
+             image.width = 4, 
+             image.height = 8,
+             vars.to.regress = NULL,
+             ggtitle.label = "GBM 2 (10X)",
+             alternative = "greater")
+  
+  do.boxplot(data = seurat.obj.subset.invent@meta.data, 
+             x.variable = "sample.desc",
+             y.variable = y.var,
+             output.filepath = paste0(figures.dir, 'oligodendrocytes_sample_vs_', y.var, '_Invent.pdf'),
+             ylab.label = paste0("Reactive oligodendrocyte signature\nin oligodendrocytes"),
+             comparisons = comparisons.invent,
+             boxplot.fill.variable = "sample.desc",
+             fill.scale = sample.descs.fill.scale,
+             image.width = 4,
+             image.height = 8,
+             vars.to.regress = NULL,
+             ggtitle.label = "GBM 2 (Invent)",
+             alternative = "greater")
+}
+
+
+do.boxplot(data = seurat.obj.subset.facs@meta.data %>% filter(patient == "P4"), 
+             x.variable = "sample.desc",
+             y.variable = y.var,
+             output.filepath = paste0(figures.dir, 'oligodendrocytes_sample_vs_reactive.oligo.signature_P4.pdf'),
+             ylab.label = paste0("Reactive oligodendrocyte signature\nin oligodendrocytes"),
+             comparisons = comparisons.facs,
+             boxplot.fill.variable = "sample.desc", 
+             fill.scale = sample.descs.fill.scale,
+             image.width = 6,
+             image.height = 8,
+             facet.by = "patient.desc",
+             vars.to.regress = NULL,
+             alternative = "greater")
+```
+
+
+
+# Main: Reactive oligodendrocyte signature in MS and TBI
+```{r}
+# currently in Code/Figure 4/combined_external_datasets_oligo_analysis.RMD
+```
+
+
+
+# Figure 5: Demyelination and remyelination signatures and myelin genes
+```{r}
+# demyelination signature
+do.boxplot(data = seurat.obj.subset.facs@meta.data, 
+           x.variable = "sample.desc",
+           y.variable = "acute.demyelination",
+           output.filepath = paste0(supp.figures.dir, 'oligodendrocytes_sample_vs_demyelination_signature_FACS.pdf'),
+           ylab.label = paste0("Demyelination signature\nin oligodendrocytes"),
+           comparisons = comparisons.facs,
+           boxplot.fill.variable = "sample.desc",
+           fill.scale = sample.descs.fill.scale,
+           image.width = 18,
+           image.height = 8,
+           facet.by = "patient.desc",
+           vars.to.regress = denoise.vars.to.regress,
+           step.increase = 0.05,
+           y.adjust = c("GBM 1" = 0, "GBM 2" = -0.1, "IDH-mut 1" = 0),
+           alternative = "greater")
+
+do.boxplot(data = seurat.obj.subset.10x@meta.data, 
+           x.variable = "sample.desc",
+           y.variable = "acute.demyelination",
+           output.filepath = paste0(supp.figures.dir, 'oligodendrocytes_sample_vs_demyelination_signature_10X.pdf'),
+           ylab.label = paste0("Demyelination signature\nin oligodendrocytes"),
+           comparisons = comparisons.10x,
+           boxplot.fill.variable = "sample.desc",
+           fill.scale = sample.descs.fill.scale,
+           image.width = 4, 
+           image.height = 8,
+           vars.to.regress = denoise.vars.to.regress,
+           y.adjust = 0,
+           ggtitle.label = "GBM 2 (10X)",
+           alternative = "greater")
+
+do.boxplot(data = seurat.obj.subset.invent@meta.data, 
+           x.variable = "sample.desc",
+           y.variable = "acute.demyelination",
+           output.filepath = paste0(supp.figures.dir, 'oligodendrocytes_sample_vs_demyelination_signature_Invent.pdf'),
+           ylab.label = paste0("Demyelination signature\nin oligodendrocytes"),
+           comparisons = comparisons.invent,
+           boxplot.fill.variable = "sample.desc",
+           fill.scale = sample.descs.fill.scale,
+           image.width = 4, 
+           image.height = 8,
+           vars.to.regress = denoise.vars.to.regress,
+           y.adjust = 0,
+           ggtitle.label = "GBM 2 (Invent)",
+           alternative = "greater")
+
+
+# remyelination signature
+do.boxplot(data = seurat.obj.subset.facs@meta.data, 
+           x.variable = "sample.desc",
+           y.variable = "acute.de.re.myelination",
+           output.filepath = paste0(supp.figures.dir, 'oligodendrocytes_sample_vs_remyelination_signature_FACS.pdf'),
+           ylab.label = paste0("Remyelination signature\nin oligodendrocytes"),
+           comparisons = comparisons.facs,
+           boxplot.fill.variable = "sample.desc",
+           fill.scale = sample.descs.fill.scale,
+           image.width = 18,
+           image.height = 8,
+           facet.by = "patient.desc",
+           vars.to.regress = denoise.vars.to.regress,
+           step.increase = 0.1,
+           y.adjust = c("GBM 1" = 0, "GBM 2" = 0, "IDH-mut 1" = 0),
+           alternative = "greater")
+
+do.boxplot(data = seurat.obj.subset.10x@meta.data, 
+           x.variable = "sample.desc",
+           y.variable = "acute.de.re.myelination",
+           output.filepath = paste0(supp.figures.dir, 'oligodendrocytes_sample_vs_remyelination_signature_10X.pdf'),
+           ylab.label = paste0("Remyelination signature\nin oligodendrocytes"),
+           comparisons = comparisons.10x,
+           boxplot.fill.variable = "sample.desc",
+           fill.scale = sample.descs.fill.scale,
+           image.width = 4, 
+           image.height = 8,
+           vars.to.regress = denoise.vars.to.regress,
+           y.adjust = 0,
+           ggtitle.label = "GBM 2 (10X)",
+           alternative = "greater")
+
+do.boxplot(data = seurat.obj.subset.invent@meta.data, 
+           x.variable = "sample.desc",
+           y.variable = "acute.de.re.myelination",
+           output.filepath = paste0(supp.figures.dir, 'oligodendrocytes_sample_vs_remyelination_signature_Invent.pdf'),
+           ylab.label = paste0("Remyelination signature\nin oligodendrocytes"),
+           comparisons = comparisons.invent,
+           boxplot.fill.variable = "sample.desc",
+           fill.scale = sample.descs.fill.scale,
+           image.width = 4, 
+           image.height = 8,
+           vars.to.regress = denoise.vars.to.regress,
+           y.adjust = 0,
+           ggtitle.label = "GBM 2 (Invent)",
+           alternative = "greater")
+
+
+
+# myelin genes
+do.boxplot(data = seurat.obj.subset.facs@meta.data, 
+           x.variable = "sample.desc",
+           y.variable = "myelin.genes",
+           output.filepath = paste0(supp.figures.dir, 'oligodendrocytes_sample_vs_myelin_genes_FACS.pdf'),
+           ylab.label = paste0("Myelin genes\nin oligodendrocytes"),
+           comparisons = comparisons.facs,
+           boxplot.fill.variable = "sample.desc",
+           fill.scale = sample.descs.fill.scale,
+           image.width = 18,
+           image.height = 8,
+           facet.by = "patient.desc",
+           vars.to.regress = denoise.vars.to.regress,
+           alternative = "less")
+
+do.boxplot(data = seurat.obj.subset.10x@meta.data, 
+           x.variable = "sample.desc",
+           y.variable = "myelin.genes",
+           output.filepath = paste0(supp.figures.dir, 'oligodendrocytes_sample_vs_myelin_genes_10X.pdf'),
+           ylab.label = paste0("Myelin genes\nin oligodendrocytes"),
+           comparisons = comparisons.10x,
+           boxplot.fill.variable = "sample.desc", 
+           fill.scale = sample.descs.fill.scale,
+           image.width = 4, 
+           image.height = 8,
+           vars.to.regress = denoise.vars.to.regress,
+           ggtitle.label = "GBM 2 (10X)",
+           alternative = "less")
+
+do.boxplot(data = seurat.obj.subset.invent@meta.data, 
+           x.variable = "sample.desc",
+           y.variable = "myelin.genes",
+           output.filepath = paste0(supp.figures.dir, 'oligodendrocytes_sample_vs_myelin_genes_Invent.pdf'),
+           ylab.label = paste0("Myelin genes\nin oligodendrocytes"),
+           comparisons = comparisons.invent,
+           boxplot.fill.variable = "sample.desc",
+           fill.scale = sample.descs.fill.scale,
+           image.width = 4, 
+           image.height = 8,
+           vars.to.regress = denoise.vars.to.regress,
+           ggtitle.label = "GBM 2 (Invent)",
+           alternative = "less")
+```
+
+
+
+# Figure 5: Demyelination and remyelination signatures, apoptosis regressed
+```{r}
+# demyelination signature
+do.boxplot(data = seurat.obj.subset.facs@meta.data, 
+           x.variable = "sample.desc",
+           y.variable = "acute.demyelination",
+           output.filepath = paste0(supp.figures.dir, 'oligodendrocytes_sample_vs_demyelination_signature_FACS_apoptosis_regressed.pdf'),
+           ylab.label = paste0("Demyelination signature\nin oligodendrocytes"),
+           comparisons = comparisons.facs,
+           boxplot.fill.variable = "sample.desc",
+           fill.scale = sample.descs.fill.scale,
+           image.width = 18,
+           image.height = 8,
+           facet.by = "patient.desc",
+           vars.to.regress = c(denoise.vars.to.regress, "apoptosis.signature"),
+           step.increase = 0.05,
+           y.adjust = c("GBM 1" = 0, "GBM 2" = -0.1, "IDH-mut 1" = 0),
+           alternative = "greater")
+
+do.boxplot(data = seurat.obj.subset.10x@meta.data, 
+           x.variable = "sample.desc",
+           y.variable = "acute.demyelination",
+           output.filepath = paste0(supp.figures.dir, 'oligodendrocytes_sample_vs_demyelination_signature_10X_apoptosis_regressed.pdf'),
+           ylab.label = paste0("Demyelination signature\nin oligodendrocytes"),
+           comparisons = comparisons.10x,
+           boxplot.fill.variable = "sample.desc",
+           fill.scale = sample.descs.fill.scale,
+           image.width = 4, 
+           image.height = 8,
+           vars.to.regress = c(denoise.vars.to.regress, "apoptosis.signature"),
+           y.adjust = 0,
+           ggtitle.label = "GBM 2 (10X)",
+           alternative = "greater")
+
+do.boxplot(data = seurat.obj.subset.invent@meta.data, 
+           x.variable = "sample.desc",
+           y.variable = "acute.demyelination",
+           output.filepath = paste0(supp.figures.dir, 'oligodendrocytes_sample_vs_demyelination_signature_Invent_apoptosis_regressed.pdf'),
+           ylab.label = paste0("Demyelination signature\nin oligodendrocytes"),
+           comparisons = comparisons.invent,
+           boxplot.fill.variable = "sample.desc",
+           fill.scale = sample.descs.fill.scale,
+           image.width = 4, 
+           image.height = 8,
+           vars.to.regress = c(denoise.vars.to.regress, "apoptosis.signature"),
+           y.adjust = 0,
+           ggtitle.label = "GBM 2 (Invent)",
+           alternative = "greater")
+
+
+# remyelination signature
+do.boxplot(data = seurat.obj.subset.facs@meta.data, 
+           x.variable = "sample.desc",
+           y.variable = "acute.de.re.myelination",
+           output.filepath = paste0(supp.figures.dir, 'oligodendrocytes_sample_vs_remyelination_signature_FACS_apoptosis_regressed.pdf'),
+           ylab.label = paste0("Remyelination signature\nin oligodendrocytes"),
+           comparisons = comparisons.facs,
+           boxplot.fill.variable = "sample.desc",
+           fill.scale = sample.descs.fill.scale,
+           image.width = 18,
+           image.height = 8,
+           facet.by = "patient.desc",
+           vars.to.regress = c(denoise.vars.to.regress, "apoptosis.signature"),
+           step.increase = 0.1,
+           y.adjust = c("GBM 1" = 0, "GBM 2" = 0, "IDH-mut 1" = 0),
+           alternative = "greater")
+
+do.boxplot(data = seurat.obj.subset.10x@meta.data, 
+           x.variable = "sample.desc",
+           y.variable = "acute.de.re.myelination",
+           output.filepath = paste0(supp.figures.dir, 'oligodendrocytes_sample_vs_remyelination_signature_10X_apoptosis_regressed.pdf'),
+           ylab.label = paste0("Remyelination signature\nin oligodendrocytes"),
+           comparisons = comparisons.10x,
+           boxplot.fill.variable = "sample.desc",
+           fill.scale = sample.descs.fill.scale,
+           image.width = 4, 
+           image.height = 8,
+           vars.to.regress = c(denoise.vars.to.regress, "apoptosis.signature"),
+           y.adjust = 0,
+           ggtitle.label = "GBM 2 (10X)",
+           alternative = "greater")
+
+do.boxplot(data = seurat.obj.subset.invent@meta.data, 
+           x.variable = "sample.desc",
+           y.variable = "acute.de.re.myelination",
+           output.filepath = paste0(supp.figures.dir, 'oligodendrocytes_sample_vs_remyelination_signature_Invent_apoptosis_regressed.pdf'),
+           ylab.label = paste0("Remyelination signature\nin oligodendrocytes"),
+           comparisons = comparisons.invent,
+           boxplot.fill.variable = "sample.desc",
+           fill.scale = sample.descs.fill.scale,
+           image.width = 4, 
+           image.height = 8,
+           vars.to.regress = c(denoise.vars.to.regress, "apoptosis.signature"),
+           y.adjust = 0,
+           ggtitle.label = "GBM 2 (Invent)",
+           alternative = "greater")
+```

@@ -1,0 +1,38 @@
+---
+title: "macnair_2024_MS_preprocessing.RMD"
+output: html_document
+date: "2026-02-04"
+---
+
+
+
+# Setup
+```{r}
+library(Seurat)
+
+root.dir <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Projects/Jackie_post-mortem/"
+data.dir <- paste0(root.dir, "ExternalData/")
+processed.data.dir <- paste0(root.dir, "ProcessedData/")
+results.dir <- paste0(root.dir, "Results/")
+```
+
+
+
+# Create Seurat object
+```{r}
+counts <- ReadMtx(mtx = paste0(data.dir, "Macnair_2024_MS/", "8338963/", "ms_lesions_snRNAseq_cleaned_counts_matrix_2023-09-12.mtx.gz"),
+                cells = paste0(data.dir, "Macnair_2024_MS/", "8338963/", "ms_lesions_snRNAseq_col_data_2023-09-12.txt"),
+                features = paste0(data.dir, "Macnair_2024_MS/", "8338963/", "ms_lesions_snRNAseq_row_data_2023-09-12.txt"),
+                cell.column = 3,
+                cell.sep = ",",
+                skip.cell = 1,
+                feature.column = 3,
+                feature.sep = ",",
+                skip.feature = 1)
+
+seurat.obj <- CreateSeuratObject(counts)
+
+metadata.df <- read.csv(paste0(data.dir, "Macnair_2024_MS/", "8338963/", "ms_lesions_snRNAseq_col_data_2023-09-12.txt"))
+seurat.obj <- AddMetaData(seurat.obj, metadata.df)
+saveRDS(seurat.obj, paste0(processed.data.dir, "Macnair_2024_MS/", "Mcnair_2024_MS.RDS"))
+```

@@ -1,0 +1,315 @@
+---
+title: "1_3_format_input_output_tensor_classifier"
+output: html_document
+date: "2026-04-24"
+---
+
+
+
+# Setup
+```{r}
+library(limma)
+
+root.dir <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Projects/Jackie_post-mortem/"
+suppressMessages(suppressWarnings(source(paste0(root.dir, "Code/", 'helper_functions.R'))))
+
+classifier.input.dir <- paste0(root.dir, "ProcessedData/", "Classifier/", "input/")
+classifier.output.dir <- paste0(root.dir, "ProcessedData/", "Classifier/", "output/")
+
+
+dataset.use <- "my_data" # "my_data" or "phgg" or "herring2022"
+method.use <- "all" # for my_data: all, FACS, 10X, or Invent
+
+if (dataset.use == "phgg") {
+  seurat.obj <- readRDS(paste0(root.dir, "ExternalData/", 'Sussman_2024/', 'SeuratObjsFromLevel3ByPatientFinal/', 'all.samples.merged.not.downsampled.seurat.obj.w.annotations.RDS'))
+  seurat.obj$annotation <- seurat.obj$annotation.l1
+  seurat.obj$annotation.fine <- seurat.obj$annotation.l2
+  
+} else if (dataset.use == "my_data") {
+  seurat.obj <- readRDS(paste0(root.dir, "ProcessedData/", "my_data/", "autopsy/", "all_postmortem_samples_cellbender.FALSE_denoise.FALSE_filter.FALSE_batch.correction.None/", "seurat_objects/", "all_postmortem_samples_w_celltypes.velmeshev2019.RDS"))
+  
+  #seurat.obj <- readRDS(paste0(root.dir, "ProcessedData/", "my_data/", "autopsy/", "all_postmortem_samples_cellbender.FALSE_denoise.heat.shock.signature_postmortem.sensitive_postmortem.signature_filter.FALSE_batch.correction.None/", "seurat_objects/", "all_postmortem_samples_w_celltypes.velmeshev2019.RDS"))
+  
+  seurat.obj$annotation <- sapply(seurat.obj$celltype.by.cluster, function(x) case_when(
+    x %in% c("Oligodendrocytes", "Astrocytes", "OPC") ~ "Glial",
+    x %in% c("Inhibitory neurons", "Excitatory neurons") ~ "Neurons",
+    x %in% c("Myeloid", "Lymphoid") ~ "Immune",
+    TRUE ~ x
+  ))
+  seurat.obj$annotation.fine <- seurat.obj$celltype.by.cluster
+     
+  #seurat.obj$annotation <- seurat.obj$predicted.annotation_l1
+  #seurat.obj$annotation.fine <- seurat.obj$predicted.annotation_l2
+  
+  if (method.use != "all") {
+    seurat.obj <- subset(seurat.obj, method == method.use)
+    dataset.use <- paste0(dataset.use, "_", method.use)
+  }
+  
+} else if (dataset.use == "herring2022") {
+  seurat.obj <- readRDS(paste0(root.dir, "ExternalData/", 'Herring_2022/', 'processed/', 'all.sampled.merged.downsampled.seurat.obj.RDS'))
+  seurat.obj$annotation <- sapply(seurat.obj$annotation_l1, function(x) case_when(
+    x == "No.metadata" ~ "Filtered out",
+    x == "Poor.Quality" ~ "Poor quality",
+    TRUE ~ x
+  ))
+  seurat.obj$annotation.fine <- sapply(seurat.obj$annotation_l2, function(x) case_when(
+    x == "No.metadata" ~ "Filtered out",
+    x == "Poor.Quality" ~ "Poor quality",
+    TRUE ~ x
+  ))
+  
+  # remove non-patient
+  seurat.obj <- subset(seurat.obj, subset = is.sample.organoid_ == FALSE)
+} else {
+  stop()
+}
+
+# remove malignant
+seurat.obj <- subset(seurat.obj, subset = annotation != "Malignant cluster") 
+
+
+# downsample
+set.seed(123)
+seurat.obj$downsample <- T
+Idents(seurat.obj) <- "downsample"
+seurat.obj <- subset(seurat.obj, downsample == TRUE, downsample = 200000)
+
+
+# remove very low quality
+seurat.obj$filter.out <- apply(seurat.obj@meta.data, 1, function(row) (as.numeric(row[['nCount_RNA']]) < nCount_RNA.cutoff.filter.out) | (as.numeric(row[['percent.mt']]) > percent.mt.cutoff.filter.out))
+seurat.obj <- subset(seurat.obj, subset = filter.out == FALSE)
+
+seurat.obj$low.quality.by.qc <- apply(seurat.obj@meta.data, 1, function(row) (as.numeric(row[['nCount_RNA']]) < nCount_RNA.cutoff.low) | (as.numeric(row[['nFeature_RNA']]) < nFeature_RNA.cutoff.low) | (as.numeric(row[['percent.mt']]) > percent.mt.cutoff))
+
+print(dim(seurat.obj))
+```
+
+
+
+# Format data for classifier
+```{r}
+format.for.classifier <- F
+
+if (format.for.classifier) {
+  variable.genes.df <- read.csv(paste0(root.dir, "ProcessedData/Sussman2024/tensor_decomposition/l1_top_10000_vf/input/", "variable.genes.tsv"), sep="\t")
+  variable.genes <- variable.genes.df$variable.genes
+  
+  metadata <- seurat.obj@meta.data
+  print(table(metadata$low.quality.by.qc))
+  
+  print(unique(metadata$annotation))
+  write.table(metadata, paste0(classifier.input.dir, dataset.use, "_metadata.tsv"), sep = "\t", row.names = T, col.names = T, quote = F)
+  
+  # use top variable features from dataset intersected with variable features used for 3D tensor decomposition
+  seurat.obj <- FindVariableFeatures(seurat.obj, nfeatures = 5000)
+  seurat.obj.variable.genes <- VariableFeatures(seurat.obj)
+  
+  if (dataset.use == "phgg") { # from the same dataset so no standardization needed
+    genes.use <- intersect(variable.genes, seurat.obj.variable.genes)
+    
+  } else {
+    # 1. Map both lists to official symbols to handle synonyms
+    standardized_list1 <- alias2SymbolTable(variable.genes, species = "Hs")
+    standardized_seurat <- alias2SymbolTable(seurat.obj.variable.genes, species = "Hs")
+    
+    # 2. Find the intersection of the "official" versions
+    common_official <- intersect(standardized_list1, standardized_seurat)
+    
+    # 3. Filter the Seurat list to keep original names that mapped to the intersection
+    genes.use <- seurat.obj.variable.genes[standardized_seurat %in% common_official]
+    
+    # Remove any NAs that might have been introduced during mapping
+    genes.use <- na.omit(genes.use)
+    print(length(genes.use))
+  }
+  
+  
+  #seurat.obj <- NormalizeData(seurat.obj)
+  seurat.obj <- NormalizeData(seurat.obj, scale.factor = 1000000)
+  
+  data <- FetchData(seurat.obj, vars = genes.use, layer = "data")
+  write.table(data, paste0(classifier.input.dir, dataset.use, "_data.tsv"), sep = "\t", row.names = T, col.names = T, quote = F)
+  
+  
+  # seurat.obj <- ScaleData(seurat.obj, feautres = genes.use)
+  # data <- FetchData(seurat.obj, vars = genes.use, layer = "scale.data")
+  # write.table(data, paste0(classifier.input.dir, dataset.use, "_scale_data.tsv"), sep = "\t", row.names = T, col.names = T, quote = F)
+  
+  stop()
+}
+```
+
+
+
+# Read in classifier output
+Start here after running classifier in Python
+```{r}
+set.seed(123)
+predictions.df <- read.csv(paste0(classifier.output.dir, dataset.use, "_predictions.tsv"), sep = "\t", row.names = 1)
+seurat.obj <- AddMetaData(seurat.obj, predictions.df)
+
+n.features.use <- 2000
+seurat.obj <- NormalizeData(seurat.obj)
+
+
+if (dataset.use == "phgg") {
+  n.dims.use <- 10
+} else if (dataset.use == "my_data") {
+  n.dims.use <- 14
+} else if (dataset.use == "my_data_FACS") {
+  n.dims.use <- 15
+} else if (dataset.use == "herring2022") {
+  n.dims.use <- 7
+}
+
+seurat.obj <- FindVariableFeatures(seurat.obj, nfeatures = n.features.use)
+
+for (denoise in c(F, T)) {
+  
+  if (denoise) {
+    seurat.obj <- add.module.score(seurat.obj, gene.signatures[c("heat.shock.signature", "postmortem.sensitive", "postmortem.signature")])
+    seurat.obj <- ScaleData(seurat.obj, vars.to.regress = c("heat.shock.signature", "postmortem.sensitive", "postmortem.signature"))
+  } else {
+    seurat.obj <- ScaleData(seurat.obj)
+  }
+  
+  set.seed(123)
+  seurat.obj <- RunPCA(seurat.obj, features = VariableFeatures(seurat.obj))
+  ElbowPlot(seurat.obj, ndims = 50)
+  
+  if (dataset.use == "herring2022") {
+    seurat.obj <- RunUMAP(seurat.obj, dims = 1:n.dims.use, min.dist = 0.3)
+  } else {
+    seurat.obj <- RunUMAP(seurat.obj, dims = 1:n.dims.use, min.dist = 0.1)
+  }
+  
+  cell.types.anotation_l1.w.quality.herring <- c(cell.types.anotation_l1.w.quality, "Poor quality", "Filtered out", "Unassigned", "Glial OPC")
+  cell.types.anotation_l1.w.quality.color.scale.herring <- scale_color_manual(breaks=cell.types.anotation_l1.w.quality.herring, values=c(cell.types.anotation_l1.w.quality.colors, "brown", "grey", "#EEEEEE", "#CC79A7"))
+  
+  cell.types.anotation_l2.w.quality.herring <- c(cell.types.anotation_l2.w.quality, "Poor quality", "Filtered out")
+  cell.types.anotation_l2.w.quality.color.scale.herring <- scale_color_manual(breaks=cell.types.anotation_l2.w.quality.herring, values=c(as.character(cell.types.anotation_l2.w.quality.colors), "brown", "grey"))
+  
+  p.low.quality <- DimPlot(seurat.obj, group.by = "low.quality.by.qc", label = F, shuffle = T) + umap.axes + scale_color_manual(values=c("grey", "red")) + ggtitle("Low quality")
+  p.labels.initial <- DimPlot(seurat.obj, group.by = "labels_initial", label = F, shuffle = T) + umap.axes + cell.types.anotation_l1.w.quality.color.scale.herring + ggtitle("Classifier predictions")
+  p.labels.final <- DimPlot(seurat.obj, group.by = "labels_final", label = F, shuffle = T) + umap.axes + cell.types.anotation_l1.w.quality.color.scale.herring + ggtitle("Classifier predictions")
+  
+  seurat.obj$annotation_l1_w_opc <- apply(seurat.obj@meta.data, 1, function(row) ifelse(row[["annotation.fine"]] == "OPC", "Glial OPC", row[["annotation"]]))
+  seurat.obj$annotation_l1_w_opc <- factor(seurat.obj$annotation_l1_w_opc, levels = c("Glial", "Glial OPC", "Immune", "Neurons", "Vascular", "Poor quality", "Filtered out"))
+  
+  p.annotation.l1 <- DimPlot(seurat.obj, group.by = "annotation_l1_w_opc", label = F, shuffle = T) + umap.axes + cell.types.anotation_l1.w.quality.color.scale.herring + ggtitle("Original annotations")
+  p.annotation.l2 <- DimPlot(seurat.obj, group.by = "annotation.fine", label = F, shuffle = T) + umap.axes + cell.types.anotation_l2.w.quality.color.scale.herring + ggtitle("Original annotations")
+  p.labels.final.pca <- DimPlot(seurat.obj, group.by = "labels_final", label = F, shuffle = T, reduction = "pca") + umap.axes + cell.types.anotation_l1.w.quality.color.scale.herring + ggtitle("Classifier predictions")
+  p.annotation.l2.pca <- DimPlot(seurat.obj, group.by = "annotation.fine", label = F, shuffle = T, reduction = "pca") + umap.axes + cell.types.anotation_l2.w.quality.color.scale.herring + ggtitle("Original annotations")
+  p <- p.low.quality + p.labels.initial + p.labels.final + p.annotation.l1 + p.annotation.l2 + p.labels.final.pca + p.annotation.l2.pca
+  
+  pdf(paste0(root.dir, "Results/tensor_decomposition/classifier/umap/", dataset.use, "_denoise=", denoise, "_umap_ndims=", n.dims.use, "_n.features.use=", n.features.use, ".pdf"), width = 18, height = 12)
+  print(p)
+  dev.off()
+  
+  
+  
+  
+  
+  
+  # identify low quality cells
+  if (dataset.use == "herring2022") {
+    seurat.obj$filtered.out <- seurat.obj$annotation_l1_w_opc == "Filtered out"
+    Idents(seurat.obj) <- "filtered.out"
+    seurat.obj$annotation_l1_w_opc_and_qc <- seurat.obj$annotation_l1_w_opc
+  } else {
+    Idents(seurat.obj) <- "low.quality.by.qc"
+    seurat.obj$annotation_l1_w_opc_and_qc <- apply(seurat.obj@meta.data, 1, function(row) 
+      ifelse(as.logical(row[["low.quality.by.qc"]]) == TRUE,
+      "Low quality",
+      row[["annotation_l1_w_opc"]]
+    ))
+  }
+  
+  
+  
+  low_quality_cells <- WhichCells(seurat.obj, idents = TRUE)
+  other_cells <- WhichCells(seurat.obj, idents = FALSE)
+  cell_order <- c(other_cells, low_quality_cells)
+  
+  cells_to_highlight <- low_quality_cells
+  
+  
+  # low quality cells on top
+  p.annotation.l1.w.qc <- DimPlot(seurat.obj, 
+                                  group.by = "annotation_l1_w_opc_and_qc", 
+                                  cells = cell_order,
+                                  label = F, 
+                                  shuffle = F,
+                                  raster = F) + 
+                           umap.axes + 
+                           cell.types.anotation_l1.w.quality.color.scale.herring + 
+                           ggtitle("Original annotations")
+  
+  
+  # 1. Create the base plot
+  # Note: We use the original annotations and specific cell order here
+  p.annotation.l1.w.qc <- DimPlot(
+      seurat.obj, 
+      group.by = "annotation_l1_w_opc_and_qc", 
+      cells = cell_order,
+      label = F, 
+      shuffle = F,
+      raster = F
+    ) + 
+    umap.axes + 
+    cell.types.anotation_l1.w.quality.color.scale.herring + 
+    ggtitle("Original annotations")
+  
+  # 2. Add the highlight layers
+  # This adds the black border first, then the colored center on top
+  p.annotation.l1.w.qc_final <- p.annotation.l1.w.qc + 
+    # Black stroke layer
+    geom_point(
+      data = p.annotation.l1.w.qc$data[cells_to_highlight, ], 
+      aes(x = umap_1, y = umap_2), 
+      color = "black", 
+      size = 1  # Adjust size for thicker/thinner border
+    ) +
+    # Front color layer
+    geom_point(
+      data = p.annotation.l1.w.qc$data[cells_to_highlight, ], 
+      aes(x = umap_1, y = umap_2, color = annotation_l1_w_opc_and_qc), 
+      size = 0.1
+    )
+  
+  
+  
+  
+  # base plot
+  p.prediction <- DimPlot(seurat.obj, group.by = "labels_final", shuffle = T, raster = F) + 
+       umap.axes + 
+       cell.types.anotation_l1.w.quality.color.scale.herring +
+       ggtitle("Classifier predictions")
+  
+  # black stroke layer
+  p.prediction_final <- p.prediction + 
+    geom_point(
+      data = p.prediction$data[cells_to_highlight, ], 
+      aes(x = umap_1, y = umap_2), 
+      color = "black", 
+      size = 1 # The "Border"
+    ) +
+  # front color layer
+    geom_point(
+      data = p.prediction$data[cells_to_highlight, ], 
+      aes(x = umap_1, y = umap_2, color = labels_final), 
+      size = 0.1 # The "Center"
+    )
+
+  
+  p <- p.annotation.l1.w.qc_final + p.prediction_final
+  pdf(paste0(root.dir, "Figures/", "Figure 2/", dataset.use, "_denoise=", denoise, "_umap_classifier_predictions.pdf"), width = 16, height = 6)
+  print(p)
+  dev.off()
+}
+
+FeaturePlot(seurat.obj, features = c("MBP", "MOG"), order = T)
+```
+
+

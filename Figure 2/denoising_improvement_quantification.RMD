@@ -1,0 +1,729 @@
+---
+title: "denoising_improvement_quantification.RMD"
+output: html_document
+date: "2026-06-25"
+---
+
+
+
+# Setup
+Change dataset.use to "my_data" for denoising metrics on this study's data or "phgg" for denoising metrics on the Sussman 2024 data
+```{r}
+dataset.use <- "phgg" # "my_data" or "phgg" or "herring2022"
+
+
+root.dir <- "/Users/pengja/PennNeurosurgery Dropbox/Jackie Peng/SilverbushLab/Projects/Jackie_post-mortem/"
+suppressWarnings(source(paste0(root.dir, "Code/", 'helper_functions.R')))
+data.dir <- paste0(root.dir, 'ExternalData/')
+results.dir <- paste0(root.dir, 'Results/')
+
+group.by <- "by_sample"
+
+if (dataset.use == "phgg") {
+  output.dir <- paste0(root.dir, "Results/denoising_metrics/sussman_2024/")
+  seurat.obj.merged <- readRDS(paste0(data.dir, 'Sussman_2024/', 'SeuratObjsFromLevel3ByPatientFinal/', 'all.samples.merged.not.downsampled.seurat.obj.w.annotations.RDS'))
+  
+  seurat.obj.merged$patient.id <- seurat.obj.merged$patient_id
+  seurat.obj.merged$group.by.col <- seurat.obj.merged$sample.id
+  seurat.obj.merged$predicted.annotation_l1.w.qc <- seurat.obj.merged$annotation.l1.w.qc
+  seurat.obj.merged$predicted.annotation_l2.w.qc <- seurat.obj.merged$annotation.l2.w.qc
+  seurat.obj.merged$annotation <- seurat.obj.merged$annotation.l1.w.qc
+  seurat.obj.merged$sample.plot <- seurat.obj.merged$patient.id
+  vars.to.iter <- sort(unique(seurat.obj.merged$group.by.col))
+  
+} else if (dataset.use == "my_data") {
+  output.dir <- paste0(root.dir, "Results/denoising_metrics/my_data/")
+  
+  seurat.obj.merged <- readRDS(paste0(root.dir, "ProcessedData/", "my_data/", "autopsy/", "all_postmortem_samples_cellbender.FALSE_denoise.FALSE_filter.FALSE_batch.correction.None/", "seurat_objects/", "all_postmortem_samples_w_celltypes.velmeshev2019.RDS"))
+  
+  seurat.obj.merged$patient.id <- seurat.obj.merged$patient
+  seurat.obj.merged$group.by.col <- seurat.obj.merged$sample.id
+  seurat.obj.merged$Timepoint <- "Postmortem"
+  seurat.obj.merged$timepoint <- "Postmortem"
+  seurat.obj.merged$annotation <- seurat.obj.merged$predicted.annotation_l1
+  seurat.obj.merged$sample.plot <- seurat.obj.merged$sample.id
+  vars.to.iter <- sort(unique(seurat.obj.merged$group.by.col))
+  
+}  else if (dataset.use == "herring2022") {
+  output.dir <- paste0(root.dir, "Results/denoising_metrics/herring_2022/")
+  
+  seurat.obj.merged <- readRDS(paste0(root.dir, "ExternalData/", 'Herring_2022/', 'processed/', 'all.sampled.merged.downsampled.seurat.obj.RDS'))
+ 
+  seurat.obj.merged <- subset(seurat.obj.merged, subset = filter.out == FALSE) # remove very low quality
+  
+  seurat.obj.merged$low.quality.by.qc <- apply(seurat.obj.merged@meta.data, 1, function(row) (as.numeric(row[['nCount_RNA']]) < nCount_RNA.cutoff.low) | (as.numeric(row[['nFeature_RNA']]) < nFeature_RNA.cutoff.low) | (as.numeric(row[['percent.mt']]) > percent.mt.cutoff))
+  
+  # remove non-patient
+  seurat.obj.merged <- subset(seurat.obj.merged, subset = is.sample.organoid_ == FALSE)
+
+  seurat.obj.merged$patient.id <- seurat.obj.merged$geo.sample.id_
+  seurat.obj.merged$sample.id <- seurat.obj.merged$library.id_
+  seurat.obj.merged$group.by.col <- seurat.obj.merged$sample.id
+  seurat.obj.merged$Timepoint <- "Postmortem"
+  seurat.obj.merged$timepoint <- "Postmortem"
+  seurat.obj.merged$annotation <- seurat.obj.merged$annotation_l1
+  seurat.obj.merged$sample.plot <- seurat.obj.merged$sample.id
+  vars.to.iter <- sort(unique(seurat.obj.merged$group.by.col))
+  
+} else {
+  stop()
+}
+
+output.dir <- paste0(output.dir, group.by, "/")
+
+
+sample.plot <- sort(unique(seurat.obj.merged$sample.plot))
+sample.plot.color.scale <- scale_color_manual(breaks = sample.plot, values = as.character(polychrome(length(sample.plot))))
+
+dir.create(paste0(output.dir))
+dir.create(paste0(output.dir, "seurat_objs/"))
+dir.create(paste0(output.dir, "cell_type/"))
+dir.create(paste0(output.dir, "mixing/"))
+dir.create(paste0(output.dir, "plots/"))
+dir.create(paste0(output.dir, "metrics/"))
+dir.create(paste0(output.dir, "final/"))
+dir.create(paste0(output.dir, "mixing/", "annotation/"))
+dir.create(paste0(output.dir, "mixing/", "low.quality.by.qc/"))
+dir.create(paste0(output.dir, "mixing/", "Timepoint/"))
+```
+
+
+
+# Final postmortem gene signatures
+```{r}
+
+if (dataset.use == "herring2022") {
+  celltype_signatures <- c(brain_signatures_all)
+} else {
+  celltype_signatures <- c(brain_signatures_all, gbm.signatures)
+}
+
+
+set.seed(123)
+gene.signatures[["random.genes.1"]] <- sample(rownames(seurat.obj.merged), 100)
+gene.signatures[["random.genes.2"]] <- sample(rownames(seurat.obj.merged), 100)
+gene.signatures[["random.genes.3"]] <- sample(rownames(seurat.obj.merged), 100)
+
+gene.signatures[["mt.genes"]] <- mt.genes
+print(gene.signatures)
+
+gene.signatures <- c(gene.signatures, celltype_signatures)
+```
+
+
+
+# Settings
+```{r}
+k.use <- 30
+n.dims.use <- 30
+use.saved.obj <- F
+
+denoise.labels <- list()
+denoise.labels[[1]] <- "FALSE"
+denoise.labels[[2]] <- "heat.shock.signature.9_postmortem.sensitive.factor_postmortem.signature.factor"
+denoise.labels[[3]] <- "heat.shock.signature_postmortem.sensitive_postmortem.signature"
+denoise.labels[[4]] <- "percent.mt"
+denoise.labels[[5]] <- "pm.degs.all_liv.degs.all"
+```
+
+
+
+# Metrics before and after denoising
+Can skip this chunk if already run and go to next chunk
+```{r, echo = T, results="hide"}
+seurat.obj.merged$low.quality.by.qc <- apply(seurat.obj.merged@meta.data, 1, function(row) (as.numeric(row[['nCount_RNA']]) < nCount_RNA.cutoff.low) | (as.numeric(row[['nFeature_RNA']]) < nFeature_RNA.cutoff.low) | (as.numeric(row[['percent.mt']]) > percent.mt.cutoff))
+
+
+jaccard <- function(a, b) {
+    intersection = length(intersect(a, b))
+    union = length(a) + length(b) - intersection
+    return (intersection/union)
+}
+
+if (!use.saved.obj) {
+  
+  seurat.obj.merged <- add.module.score(seurat.obj.merged, all.gene.signatures)
+  print(table(seurat.obj.merged$sample.id))
+  
+  seurat.obj.merged <- NormalizeData(seurat.obj.merged)
+  seurat.obj.merged <- FindVariableFeatures(seurat.obj.merged)
+}
+
+
+for (i in 1:length(denoise.labels)) {
+  denoise.label <- denoise.labels[[i]]
+  print(denoise.label)
+
+  save.filepath <- paste0(output.dir, "seurat_objs/", "seurat.obj_denoise=", denoise.label, ".RDS")
+  if (use.saved.obj && file.exists(save.filepath)) {
+      seurat.obj.merged <- readRDS(save.filepath)
+  } else {
+
+    if (denoise.label == "FALSE") {
+      denoise <- FALSE
+    } else {
+      denoise <- TRUE
+    }
+
+    if (denoise) {
+      denoise.vars.to.regress <- unlist(str_split(denoise.label, "_"))
+    }
+    
+    if (denoise) {
+      seurat.obj.merged <- ScaleData(seurat.obj.merged, features = VariableFeatures(seurat.obj.merged), vars.to.regress = denoise.vars.to.regress)
+    } else {
+      seurat.obj.merged <- ScaleData(seurat.obj.merged, features = VariableFeatures(seurat.obj.merged))
+    }
+    
+    set.seed(123)
+    seurat.obj.merged <- RunPCA(seurat.obj.merged, features = VariableFeatures(seurat.obj.merged), approx = T, seed.use = 42, verbose = F)
+    
+    saveRDS(seurat.obj.merged, save.filepath)
+  }
+  
+  
+  # evaluate by sample
+  mm.metrics.df <- data.frame()
+  sample_pc_jaccard <- list()
+  sample_driver_genes_list <- list()
+  
+  n.pcs.to.test <- 10
+  n.drivers.to.pull <- 50
+    
+  for (x in vars.to.iter) {
+    print(x)
+      
+    # subset to sample
+    seurat.obj <- subset(seurat.obj.merged, subset = group.by.col == x)
+    
+    for (pc_idx in 1:n.pcs.to.test) {
+      pc_name <- paste0("PC_", pc_idx)
+      
+      # get driver genes per sample
+      drivers <- get_sample_drivers(seurat.obj.merged, sample_id = x, pc = pc_name, n_genes = n.drivers.to.pull)
+      
+      # store driver genes
+      for (direction in c("positive_drivers", "negative_drivers")) {
+        sample_driver_genes_list[[length(sample_driver_genes_list) + 1]] <- data.frame(
+          sample = x,
+          PC = pc_idx,
+          direction = gsub("_drivers", "", direction),
+          gene = drivers[[direction]],
+          denoise.label = as.character(denoise.label)
+        )
+      }
+  
+      # calculate Jaccard
+      current_drivers_all <- unique(c(drivers$positive_drivers, drivers$negative_drivers))
+      for (sig_name in names(gene.signatures)) {
+        # Use your helper function here!
+        j_val <- jaccard(current_drivers_all, gene.signatures[[sig_name]])
+        
+        sample_pc_jaccard[[length(sample_pc_jaccard) + 1]] <- data.frame(
+          sample = x,
+          PC = pc_idx,
+          gene_signature = sig_name,
+          jaccard_value = j_val,
+          denoise.label = as.character(denoise.label)
+        )
+      }
+    }
+    
+    
+    # mixing metric of low-quality with high-quality
+    print("running mixing_metric_seurat")
+
+    for (grouping.var in c("low.quality.by.qc")) {
+       mm <- mixing_metric_seurat(
+        seurat.obj,
+        group.by = grouping.var,
+        metric = "seurat",
+        k = k.use,
+        dims = 1:n.dims.use
+      )
+      seurat.obj <- mm$seurat_object
+      rm(mm)
+      mm.df <- seurat.obj@meta.data %>% dplyr::select(group.by.col, sample.id, patient.id, Timepoint, mixing_seurat, low.quality.by.qc, annotation)
+      mm.df$cell.barcode <- rownames(mm.df)
+      mm.df$denoise <- denoise.label
+      mm.df$grouping.var <- grouping.var
+      mm.metrics.df <- rbind(mm.metrics.df, mm.df)
+    }
+  }
+  
+  # save results to metrics folder
+  write.table(mm.metrics.df, paste0(output.dir, "metrics/", "mm.metrics_k=", k.use, "_1to", n.dims.use, "_denoise=", denoise.label, ".tsv"), sep = "\t", row.names = F, quote = F)
+  
+  master_jaccard_df <- do.call(rbind, sample_pc_jaccard)
+  write.table(master_jaccard_df, 
+              paste0(output.dir, "metrics/", "pc_jaccard_denoise=", denoise.label, ".tsv"), 
+              sep = "\t", row.names = FALSE, quote = FALSE)
+
+  master_driver_genes_df <- do.call(rbind, sample_driver_genes_list)
+  write.table(master_driver_genes_df, 
+              paste0(output.dir, "metrics/", "driver_genes_list_denoise=", denoise.label, ".tsv"), 
+              sep = "\t", row.names = F, quote = F)
+  
+}
+
+```
+
+
+
+# Settings
+Start here after running all chunks above. You don't need to run the chunk directly above if it's already been run and the metrics have been computed.
+```{r}
+figures.dir <- paste0(root.dir, "Figures/", "Figure 2/")
+supp.figures.dir <- paste0(root.dir, "Figures/", "Figure 2/", "Supplemental/")
+```
+
+
+
+# Supplemental: Loss of complexity analysis
+```{r}
+df <- data.frame()
+for (i in 1:length(denoise.labels)) {
+  denoise.label <- denoise.labels[[i]]
+  print(denoise.label)
+
+  save.filepath <- paste0(output.dir, "seurat_objs/", "seurat.obj_denoise=", denoise.label, ".RDS")
+  seurat.obj.merged <- readRDS(save.filepath)
+  
+  # 1. Extract standard deviations (stdev)
+  pc_stdev <- seurat.obj.merged[["pca"]]@stdev
+  
+  # 2. Calculate variance
+  pc_variance <- pc_stdev^2
+  
+  # 3. Calculate percent variance explained
+  percent_variance <- (pc_variance / sum(pc_variance)) * 100
+  
+  # Create a data frame for easy viewing
+  pca_importance <- data.frame(
+    PC = paste0("PC_", 1:length(percent_variance)),
+    Variance = pc_variance,
+    Percent_Explained = percent_variance
+  )  
+  
+  pca_importance$denoise.label <- denoise.label
+  pca_importance$i <- 1:nrow(pca_importance)
+  df <- rbind(df, pca_importance)
+}
+
+df$denoise.label <- sapply(df$denoise.label, function(x) case_when(
+    x == "FALSE" ~ "No denoising", 
+    x == "heat.shock.signature_postmortem.sensitive_postmortem.signature" ~ "Postmortem signatures\n(this study, refined)",
+    x == "heat.shock.signature.9_postmortem.sensitive.factor_postmortem.signature.factor" ~ "Postmortem signatures\n(this study, top 100 from factor)",
+    x == "percent.mt" ~ "Percent mitochondrial reads", 
+    x == "pm.degs.all_liv.degs.all" ~ "PM (n=6771) and LIV DEGs (n=7250)",
+  ))
+
+df <- df %>%
+  group_by(denoise.label) %>%
+  arrange(i) %>% 
+  mutate(Cumulative_Explained = cumsum(Percent_Explained)) %>%
+  ungroup()
+denoising.methods.use <- c("No denoising", "Percent mitochondrial reads", "PM (n=6771) and LIV DEGs (n=7250)", "Postmortem signatures\n(this study, top 100 from factor)", "Postmortem signatures\n(this study, refined)")
+df$denoise.label <- factor(df$denoise.label, denoising.methods.use)
+
+dataset.name <- case_when(
+  dataset.use == "phgg" ~ "Sussman 2024",
+  dataset.use == "my_data" ~ "This study",
+  dataset.use == "herring2022" ~ "Herring 2022",
+  TRUE ~ NA
+)
+
+p <- ggplot(df %>% filter(i <= 30), aes(i, Cumulative_Explained, fill = denoise.label)) +
+  geom_bar(stat = "identity", position="dodge", color = "black") +
+  xlab("PC") +
+  ylab("Variance explained (cumulative %)") +
+  labs(fill = "Method") +
+  ggtitle(dataset.name)
+  
+pdf(paste0(supp.figures.dir, dataset.use, "_complexity_analysis.pdf"), width = 18, height = 8)
+print(p)
+dev.off()
+```
+
+
+
+# Main: Denoising improvement using Jaccard alignment to principal components and quality integration
+Comparing multiple methods
+```{r}
+baseline.label <- "FALSE"   # baseline denoising condition
+max.pc <- 5 # use top 5 PCs for analysis
+control.signatures <- c(
+    "random.genes.1",
+    "random.genes.2",
+    "random.genes.3"
+  )
+bio.signatures <- names(celltype_signatures)
+
+grouping.var.i <- "low.quality.by.qc"
+
+include.raw.factors <- F
+
+summary.df <- data.frame()
+
+# iterate through all datasets
+for (dataset.use in c("phgg", "my_data", "herring2022")) {
+  
+  if (dataset.use == "phgg") {
+    output.dir <- paste0(root.dir, "Results/denoising_metrics/sussman_2024/by_sample/")
+    seurat.obj.merged <- readRDS(paste0(data.dir, 'Sussman_2024/', 'SeuratObjsFromLevel3ByPatientFinal/', 'all.samples.merged.not.downsampled.seurat.obj.w.annotations.RDS'))
+    
+  } else if (dataset.use == "my_data") {
+    output.dir <- paste0(root.dir, "Results/denoising_metrics/my_data/by_sample/")
+    seurat.obj.merged <- readRDS(paste0(root.dir, "ProcessedData/", "my_data/", "autopsy/", "all_postmortem_samples_cellbender.FALSE_denoise.FALSE_filter.FALSE_batch.correction.None/", "seurat_objects/", "all_postmortem_samples_w_celltypes.velmeshev2019.RDS"))
+    seurat.obj.merged$Timepoint <- "Postmortem"
+    
+  } else if (dataset.use == "herring2022") {
+    output.dir <- paste0(root.dir, "Results/denoising_metrics/herring_2022/by_sample/")
+     seurat.obj.merged <- readRDS(paste0(root.dir, "ExternalData/", 'Herring_2022/', 'processed/', 'all.sampled.merged.downsampled.seurat.obj.RDS'))
+     seurat.obj.merged$Timepoint <- "Postmortem"
+     seurat.obj.merged$sample.id <- seurat.obj.merged$library.id_
+     
+  } else {
+    stop()
+  }
+  
+  metrics.dir <- paste0(output.dir, "metrics/")
+  
+  
+  
+  ##### Jaccard alignment to principal components #####
+  
+  jaccard.files <- list.files(
+    metrics.dir,
+    pattern = "^pc_jaccard_denoise=.*\\.tsv$",
+    full.names = TRUE
+  )
+  
+  jaccard.df <- map_dfr(
+    jaccard.files,
+    ~ read_tsv(.x, show_col_types = FALSE) %>%
+      mutate(denoise.label = as.character(denoise.label))
+  )
+  
+  if (!include.raw.factors) {
+    jaccard.df <- jaccard.df %>% filter(denoise.label != "heat.shock.signature.9_postmortem.sensitive.factor_postmortem.signature.factor")
+    denoising.methods.use <- c("No denoising", "Percent mitochondrial reads", "PM (n=6771) and LIV DEGs (n=7250)", "Postmortem signatures\n(this study, refined)")
+  } else {
+    denoising.methods.use <- c("No denoising", "Percent mitochondrial reads", "PM (n=6771) and LIV DEGs (n=7250)", "Postmortem signatures\n(this study, top 100 from factor)", "Postmortem signatures\n(this study, refined)")
+  }
+  
+  # keep PCs of interest
+  jaccard.df <- jaccard.df %>%
+    filter(PC <= max.pc)
+  
+  maxj.df <- jaccard.df %>%
+    group_by(denoise.label, sample, gene_signature) %>%
+    summarize(
+      max_jaccard = max(jaccard_value, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # compute metric
+  metric.per.sample <- maxj.df %>%
+    mutate(
+      sig_class = ifelse(
+        gene_signature %in% control.signatures,
+        "control",
+        "bio"
+      )
+    ) %>%
+    group_by(denoise.label, sample, sig_class) %>%
+    summarize(
+      mean_max_jaccard = mean(max_jaccard, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    pivot_wider(
+      names_from = sig_class,
+      values_from = mean_max_jaccard
+    ) %>%
+    mutate(
+      metric = bio - control
+    )
+  
+  sample.meta <- seurat.obj.merged@meta.data %>%
+    dplyr::select(sample.id, Timepoint) %>%
+    distinct()
+  
+  metric.plot.df <- metric.per.sample %>%
+    dplyr::rename(sample.id = sample) %>%
+    left_join(sample.meta, by = "sample.id")
+  
+  metric.plot.df <- metric.plot.df %>%
+    mutate(
+      Timepoint = factor(Timepoint, levels = c("Postmortem", "Surgical"))
+    )
+  
+  metric.plot.df$denoise.label <- sapply(metric.plot.df$denoise.label, function(x) case_when(
+    x == baseline.label ~ "No denoising", 
+    x == "heat.shock.signature_postmortem.sensitive_postmortem.signature" ~ "Postmortem signatures\n(this study, refined)",
+    x == "heat.shock.signature.9_postmortem.sensitive.factor_postmortem.signature.factor" ~ "Postmortem signatures\n(this study, top 100 from factor)",
+    x == "percent.mt" ~ "Percent mitochondrial reads", 
+    x == "pm.degs.all_liv.degs.all" ~ "PM (n=6771) and LIV DEGs (n=7250)",
+  ))
+  
+  metric.plot.df$denoise.label <- factor(metric.plot.df$denoise.label, levels = denoising.methods.use)
+  
+  metric.plot.df <- metric.plot.df %>% 
+    arrange(Timepoint, denoise.label)
+  
+  stat.test <- metric.plot.df %>%
+    group_by(Timepoint) %>%
+    wilcox_test(
+      metric ~ denoise.label,
+      ref.group = "No denoising",
+      paired = TRUE,
+      alternative = "less"
+    ) %>%
+    adjust_pvalue(method = "fdr") %>%
+    add_significance("p.adj") %>%
+    add_xy_position(x = "denoise.label", step.increase = 0.2)
+  stat.test$p.label <- format.p.value(stat.test$p.adj)
+  
+  
+  # PC alignment plot
+  # TODO add labels for method
+  p <- ggplot(
+    metric.plot.df,
+    aes(x = denoise.label, y = metric)
+  ) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_line(
+      aes(group = sample.id),
+      alpha = 0.6,
+      color = "grey"
+    ) +
+    geom_point(
+      aes(fill = denoise.label),
+      size = 2,
+      shape = 21
+    ) +
+    facet_wrap(~Timepoint) +
+    labs(
+      x = "",
+      y = "Cell type/state PC alignment"
+    ) +
+    theme(
+      legend.position = "none",
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    ) +
+    stat_pvalue_manual(
+      stat.test,
+      label = "p.label",
+      size = 6
+    )
+  
+  pdf(
+    paste0(
+      figures.dir,
+      dataset.use,
+      "_denoising_vs_cell_type_state_PC_alignment.pdf"
+    ),
+    width = 14,
+    height = 10
+  )
+  print(p)
+  dev.off()
+  
+  
+  stat.test$dataset <- dataset.use
+  stat.test$metric <- "PC alignment"
+  
+  summary.df <- rbind(summary.df, stat.test)
+  
+  
+  ##### Supplemental: plot PC overlap with signatures for each PC #####
+    
+  # for plotting surgical then postmortem
+  sample_order_map <- seurat.obj.merged@meta.data %>%
+    select(sample.id, Timepoint) %>%
+    distinct() %>%
+    arrange(Timepoint) 
+  
+  sample_labels <- setNames(
+    paste0(sample_order_map$sample.id, " (", sample_order_map$Timepoint, ")"),
+    sample_order_map$sample.id
+  )
+  
+  
+  jaccard_files <- list.files(metrics.dir, 
+                              pattern = "pc_jaccard_.*\\.tsv", 
+                              full.names = TRUE)
+  
+  jaccard_files <- jaccard_files[endsWith(jaccard_files, "pc_jaccard_denoise=FALSE.tsv") | endsWith(jaccard_files, "pc_jaccard_denoise=heat.shock.signature_postmortem.sensitive_postmortem.signature.tsv")] 
+  
+  master_jaccard_plot_df <- do.call(rbind, lapply(jaccard_files, read.table, header = TRUE, sep = "\t"))
+  
+  master_jaccard_plot_df$status <- ifelse(master_jaccard_plot_df$denoise.label == "FALSE", "Before denoising", "After denoising")
+  master_jaccard_plot_df$status <- factor(master_jaccard_plot_df$status, levels = c("Before denoising", "After denoising"))
+  master_jaccard_plot_df$sample <- factor(master_jaccard_plot_df$sample, levels = sample_order_map$sample.id)
+  
+  signatures.use <- c(names(celltype_signatures), "postmortem.sensitive", "postmortem.signature", "heat.shock.signature", "mt.genes")
+  master_jaccard_plot_df <- master_jaccard_plot_df %>% filter(gene_signature %in% signatures.use)
+  master_jaccard_plot_df$gene_signature <- factor(master_jaccard_plot_df$gene_signature, levels = signatures.use)
+  
+  for (pc.use in 1:10) {
+    p_jaccard <- ggplot(master_jaccard_plot_df %>% filter(PC == pc.use), 
+                        aes(x = gene_signature, y = sample, fill = jaccard_value)) +
+      geom_tile(color = "white") +
+      facet_wrap(~status) +
+      scale_fill_viridis_c(option = "magma", name = "Jaccard Index") + 
+      scale_y_discrete(labels = sample_labels) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      labs(title = paste0("PC", pc.use),
+           subtitle = "Overlap (Jaccard) of top genes in principal component and gene signatures",
+           x = "Signature",
+           y = "Sample (Timepoint)")
+  
+    pdf(paste0(supp.figures.dir, "denoising_jaccard_plots/", dataset.use, "_pc_", pc.use, "_jaccard_plot.pdf"), width = 20, height = 12)
+    print(p_jaccard)
+    dev.off()
+  }
+  
+  
+  
+  #### Quality integration metric ####
+  mm.metrics.df <- data.frame()
+  for (denoise.label in denoise.labels) {
+    print(denoise.label)
+    mm.metrics.i.df <- read.csv(paste0(output.dir, "metrics/", "mm.metrics_k=", k.use, "_1to", n.dims.use, "_denoise=", denoise.label, ".tsv"), sep = "\t")
+    mm.metrics.i.df <- mm.metrics.i.df %>% dplyr::filter(grouping.var == grouping.var.i)
+    mm.metrics.df <- rbind(mm.metrics.df, mm.metrics.i.df)
+  }
+  
+  if (!include.raw.factors) {
+    mm.metrics.df <- mm.metrics.df %>% filter(denoise != "heat.shock.signature.9_postmortem.sensitive.factor_postmortem.signature.factor")
+  }
+  
+  mm.metrics.df$Denoise <- sapply(mm.metrics.df$denoise, function(x) case_when(
+    x == baseline.label ~ "No denoising", 
+    x == "heat.shock.signature_postmortem.sensitive_postmortem.signature" ~ "Postmortem signatures\n(this study, refined)",
+    x == "heat.shock.signature.9_postmortem.sensitive.factor_postmortem.signature.factor" ~ "Postmortem signatures\n(this study, top 100 from factor)",
+    x == "percent.mt" ~ "Percent mitochondrial reads", 
+    x == "pm.degs.all_liv.degs.all" ~ "PM (n=6771) and LIV DEGs (n=7250)",
+  ))
+  
+  mm.metrics.df$Denoise <- factor(mm.metrics.df$Denoise, levels = denoising.methods.use)
+  mm.metrics.df$Timepoint <- factor(mm.metrics.df$Timepoint, levels = c("Postmortem", "Surgical"))
+  
+  for (quality.use in c("low", "high", "all")) {
+    
+    if (quality.use == "low") {
+      df <- mm.metrics.df %>% filter(low.quality.by.qc == TRUE)
+    } else if (quality.use == "high") {
+      df <- mm.metrics.df %>% filter(low.quality.by.qc == FALSE)
+    } else {
+      df <- mm.metrics.df
+    }
+    
+    mixing.summary.df <- df %>%
+      dplyr::group_by(Timepoint, patient.id, sample.id, Denoise) %>%
+      summarize(metric = mean(mixing_seurat)) %>%
+      ungroup() %>% 
+      arrange(Denoise, sample.id)
+    
+    stat.test <- mixing.summary.df %>%
+      group_by(Timepoint) %>%
+      wilcox_test(
+        metric ~ Denoise,
+        ref.group = "No denoising",
+        paired = TRUE,
+        alternative = "less"
+      ) %>%
+      adjust_pvalue(method = "fdr") %>%
+      add_significance("p.adj") %>%
+      add_xy_position(x = "Denoise", step.increase = 1)
+    stat.test$p.label <- format.p.value(stat.test$p.adj)
+    
+    p <- ggplot(
+        mixing.summary.df,
+        aes(x = Denoise, y = metric)
+      ) +
+      geom_boxplot(outlier.shape = NA) +
+      geom_line(aes(group = sample.id), alpha = 0.6, color = "grey") +
+      geom_point(
+        aes(fill = Denoise),
+        size = 2,
+        shape = 21
+      ) +
+      facet_wrap(~Timepoint) +
+      labs(
+        x = "",
+        y = "Quality integration metric",
+      ) +
+      theme(
+        legend.position = "none"
+      ) +
+      stat_pvalue_manual(
+        stat.test,
+        label = "p.label",
+        size = 6
+      ) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    
+    
+    if (quality.use == "low") {
+      pdf(paste0(figures.dir, dataset.use, "_denoising_vs_quality_integration_metric_quality.pdf"), width = 14, height = 10)
+      print(p)
+      dev.off()
+      
+      stat.test$dataset <- dataset.use
+      stat.test$metric <- "Quality integration"
+      
+      summary.df <- rbind(summary.df, stat.test)
+      
+    } else {
+      pdf(paste0(supp.figures.dir, dataset.use, "_denoising_vs_quality_integration_metric_quality.use=", quality.use, ".pdf"), width = 14, height = 10)
+      print(p)
+      dev.off()
+    }
+  }
+}
+```
+
+
+
+# Scatter plot summary of p-values
+```{r}
+summary.df$group2 <- factor(summary.df$group2, levels = c("No denoising", "Percent mitochondrial reads", "PM (n=6771) and LIV DEGs (n=7250)", "Postmortem signatures\n(this study, top 100 from factor)", "Postmortem signatures\n(this study, refined)"))
+summary.df$dataset.name <- sapply(summary.df$dataset, function(x) case_when(
+  x == "phgg" ~ "Sussman 2024",
+  x == "my_data" ~ "This study",
+  x == "herring2022" ~ "Herring 2022",
+  TRUE ~ NA
+))
+
+df <- summary.df %>% dplyr::select(Timepoint, group2, p.adj, metric, dataset.name) %>% pivot_wider(names_from = metric, values_from = p.adj)
+
+
+p <- ggplot(df %>% filter(group2 != "Postmortem signatures\n(this study, top 100 from factor)"), aes(-log10(`PC alignment`), -log10(`Quality integration`), color = group2, shape = dataset.name)) +
+  geom_point(size = 3) + 
+  facet_wrap(~Timepoint) +
+  labs(color = "Method", shape = "Dataset") +
+  xlab("PC alignment -log10 p value") +
+  ylab("Quality integration -log10 p value")
+pdf(paste0(figures.dir, "summary_PC_alignment_vs_quality_integration_metric_scatter.pdf"), width = 16, height = 6)
+print(p)
+dev.off()
+
+
+# with raw factors
+if (include.raw.factors) {
+  p <- ggplot(df, aes(-log10(`PC alignment`), -log10(`Quality integration`), color = group2, shape = dataset.name)) +
+    geom_point(size = 3) + 
+    facet_wrap(~Timepoint) +
+    labs(color = "Method", shape = "Dataset") +
+    xlab("PC alignment -log10 p value") +
+    ylab("Quality integration -log10 p value")
+  pdf(paste0(supp.figures.dir, "summary_PC_alignment_vs_quality_integration_metric_scatter_w_raw_factors.pdf"), width = 16, height = 6)
+  print(p)
+  dev.off()
+}
+```
+
+
+
