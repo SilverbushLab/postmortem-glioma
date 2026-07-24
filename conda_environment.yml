@@ -1,0 +1,11 @@
+name: /opt/anaconda3/envs/py3.9
+channels:
+  - conda-forge
+  - bioconda
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
+dependencies:
+  - python=3.9
+  - jupyterlab
+  - geopandas
+prefix: /opt/anaconda3/envs/py3.9
